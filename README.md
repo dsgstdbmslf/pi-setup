@@ -57,7 +57,8 @@ Avoid cloning this repo into `~/.pi/agent`. Copy individual files instead.
 ### Skills
 
 - `branch-flow/` — operating the Orca workspace ↔ GitHub branch flow (publish, ship,
-  merge, sync, status…); needs the `orca-branch-flow` tooling from the orca-setup repo
+  merge, sync, status…); needs the `orca-branch-flow` tooling from the orca-setup repo.
+  **Tightly coupled to Orca**, see [Branch flow and Orca](#branch-flow-and-orca)
 - `perplexity-research/` — web research through the Perplexity bridge in Orca's browser
   (adjust the `cli.py` path to your checkout)
 
@@ -73,6 +74,23 @@ Avoid cloning this repo into `~/.pi/agent`. Copy individual files instead.
 (`~/.pi/agent/extensions/`, marked `@orca-managed-pi-extension`) and the skills
 `orca-cli`, `orca-computer-use`, `orchestration` (`~/.agents/skills/`). They are kept for
 reference and diffing. **Do not copy them back**; Orca restores its own versions.
+
+## Branch flow and Orca
+
+The branch-flow skill, the `branch-flow.ts` extension and the underlying
+`branch_flow.py` tooling are currently **tightly coupled to Orca**: a workspace is an
+Orca worktree, and workspaces are created, found, listed and linked to PRs through the
+`orca` CLI.
+
+Without Orca only the git/GitHub part works: `git publish`, `git sync-parent`,
+`git parent --set`, the `pre-push` guard, automatic PR chains and `git abandon`.
+These do not work without Orca: `new-workspace`/`child`/`top`, `ship`, `restore`,
+`move`, `rename`, `remove`, `orphans`, the workspace tree in `status`, and the
+`reconcile` cron job (it silently does nothing, because it only walks Orca worktrees).
+
+A standalone, Orca-independent workflow (plain `git worktree` backend selected
+automatically when Orca is absent) is planned; until then, use this part only on an
+Orca server.
 
 ## Dependencies
 
