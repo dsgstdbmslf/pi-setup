@@ -43,34 +43,53 @@ Avoid cloning this repo into `~/.pi/agent`. Copy individual files instead.
 
 ## Contents
 
+Every item is tagged with how much it depends on Orca:
+
+- **[Orca-only]** — does nothing useful without Orca
+- **[Orca-partial]** — works without Orca, but some features need it
+- **[Independent]** — plain pi, works anywhere
+
 ### Extensions
 
-- `branch-flow.ts` — `/flow` and `/flow status [project]` panels (output of
-  `git flow-help` / `git flow-status`) without calling the model; auto-loads the
-  branch-flow skill in repositories with a GitHub remote
-- `code-fence-hide.ts` — renders fenced code blocks without the ``` lines (like Claude
-  Code); pair with `"markdown": { "codeBlockIndent": "" }`
-- `image-paste-markers.ts` — pasted screenshots show as `[Image #N]` and are attached to
-  the prompt as images
-- `orca-kitty-images.ts` — keeps inline Kitty images intact in Orca's terminal
+- `branch-flow.ts` **[Orca-partial]** — `/flow` and `/flow status [project]` panels
+  (output of `git flow-help` / `git flow-status`) without calling the model; auto-loads
+  the branch-flow skill in repositories with a GitHub remote. Needs the branch-flow
+  tooling, which is itself coupled to Orca (see [Branch flow and Orca](#branch-flow-and-orca))
+- `code-fence-hide.ts` **[Independent]** — renders fenced code blocks without the ```
+  lines (like Claude Code); pair with `"markdown": { "codeBlockIndent": "" }`
+- `image-paste-markers.ts` **[Orca-partial]** — pasted screenshots show as `[Image #N]`
+  and are attached to the prompt as images. Recognizes Orca's `/tmp/orca-paste-*` files
+  and pi's own `pi-clipboard-*` files, so pi's native paste works without Orca
+- `orca-kitty-images.ts` **[Orca-only]** — keeps inline Kitty images intact in Orca's
+  terminal; a no-op unless `TERM_PROGRAM=orca`
 
 ### Skills
 
-- `branch-flow/` — operating the Orca workspace ↔ GitHub branch flow (publish, ship,
-  merge, sync, status…); needs the `orca-branch-flow` tooling from the orca-setup repo.
-  **Tightly coupled to Orca**, see [Branch flow and Orca](#branch-flow-and-orca)
-- `perplexity-research/` — web research through the Perplexity bridge in Orca's browser
-  (adjust the `cli.py` path to your checkout)
+- `branch-flow/` **[Orca-only]** — operating the Orca workspace ↔ GitHub branch flow
+  (publish, ship, merge, sync, status…); needs the `orca-branch-flow` tooling from the
+  orca-setup repo. See [Branch flow and Orca](#branch-flow-and-orca)
+- `perplexity-research/` **[Orca-only]** — web research through Perplexity, driven in
+  Orca's embedded browser by the Perplexity bridge from the orca-setup repo
+  (`mcp/servers/perplexity`). The `cli.py` path points to an Orca workspace of that
+  repo; adjust it to your checkout
 
 ### Instructions
 
-- `instructions/AGENTS.md` — Orca server context and branch-flow rules; deployed as
-  `~/orca/AGENTS.md`, which pi loads for every project under `~/orca`
+- `instructions/AGENTS.md` **[Orca-only]** — Orca server context (headless server, Orca
+  browser and CLI, pasted images) and branch-flow rules; deployed as `~/orca/AGENTS.md`,
+  which pi loads for every project under `~/orca`
 
-### Orca-managed (reference only)
+### Settings
+
+- `settings.json` **[Independent]** — default provider/model, thinking levels, markdown,
+  packages
+- `npm/package.json` **[Independent]** — pi package `@indexyz/pi-skill` (`$skill` mentions)
+
+### Orca-managed (reference only) **[Orca-only]**
 
 `orca-managed/` holds files that Orca generates and updates itself: the pi extensions
-`orca-agent-status.ts`, `orca-prefill.ts`, `orca-titlebar-spinner.ts`
+`orca-agent-status.ts` (agent status for Orca), `orca-prefill.ts` (editor prefill on
+launch from Orca), `orca-titlebar-spinner.ts` (tab title spinner)
 (`~/.pi/agent/extensions/`, marked `@orca-managed-pi-extension`) and the skills
 `orca-cli`, `orca-computer-use`, `orchestration` (`~/.agents/skills/`). They are kept for
 reference and diffing. **Do not copy them back**; Orca restores its own versions.
