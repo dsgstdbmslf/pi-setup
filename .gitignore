@@ -30,3 +30,8 @@ __pycache__/
 Thumbs.db
 tmp/
 *.log
+
+# Local pi state never committed
+trust.json
+models-store.json
+*.bak*

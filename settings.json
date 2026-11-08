@@ -1,0 +1,19 @@
+{
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-5-5",
+  "defaultThinkingLevel": "medium",
+  "modelThinkingLevels": {
+    "anthropic/claude-sonnet-5-5": "medium",
+    "anthropic/claude-opus-5-5": "medium",
+    "openai-codex/gpt-6.1-sol": "medium"
+  },
+  "warnings": {
+    "anthropicExtraUsage": false
+  },
+  "markdown": {
+    "codeBlockIndent": ""
+  },
+  "packages": [
+    "npm:@indexyz/pi-skill@0.1.44"
+  ]
+}
