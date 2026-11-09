@@ -53,7 +53,7 @@ export function createTavily(pi: ExtensionAPI) {
 	const pool = tavilyPool();
 
 	pi.on("session_start", async () => {
-		void cleanupSaved();
+		void cleanupSaved().catch(() => {}); // already never rejects; this keeps it that way
 	});
 
 	/** POST to Tavily with key failover; keyless fallback where Tavily allows it. */

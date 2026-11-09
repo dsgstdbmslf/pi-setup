@@ -19,6 +19,22 @@ function errorText(data: unknown, fallback: string): string {
 	return typeof error === "string" && error ? error : fallback;
 }
 
+/** Replace every occurrence of the key; split/join so the key is never interpreted as a pattern. */
+function redact(text: string, key: string | null): string {
+	return key ? text.split(key).join("[redacted]") : text;
+}
+
+/**
+ * A fresh error without `cause`: fetch errors can quote the Authorization header (e.g. an invalid
+ * header value), and their message or cause chain would carry the whole key.
+ */
+function requestFailed(path: string, key: string | null, err: unknown): Error {
+	const message = err instanceof Error ? err.message : String(err);
+	const cause = (err as { cause?: { message?: unknown } } | null)?.cause?.message;
+	const detail = typeof cause === "string" && cause ? ` (${cause})` : "";
+	return new Error(`Tavily ${path}: request failed: ${redact(message + detail, key)}`);
+}
+
 /** One HTTP call with one key (or keyless when key is null). Network errors and aborts throw. */
 export async function call<T = any>(path: string, key: string | null, opts: CallOptions): Promise<Attempt<T>> {
 	const headers: Record<string, string> = { "content-type": "application/json" };
@@ -36,7 +52,8 @@ export async function call<T = any>(path: string, key: string | null, opts: Call
 		});
 	} catch (err) {
 		if (timeout.aborted && !opts.signal?.aborted) throw new Error(`Tavily ${path}: timed out after ${opts.timeoutMs / 1000}s`);
-		throw err;
+		if (opts.signal?.aborted) throw err; // the caller cancelled: keep the abort semantics
+		throw requestFailed(path, key, err);
 	}
 	const text = await resp.text();
 	let data: unknown;

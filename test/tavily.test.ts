@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -16,7 +16,7 @@ import {
 	withRotation,
 } from "../extensions/tavily/keys.ts";
 import { call, compact, credits, plain } from "../extensions/tavily/client.ts";
-import { cleanupSaved, plural, sanitize, saveFull } from "../extensions/tavily/output.ts";
+import { cleanupSaved, ensurePrivateDir, plural, sanitize, saveFull } from "../extensions/tavily/output.ts";
 
 async function setup(keys: unknown) {
 	const dir = await mkdtemp(join(tmpdir(), "ws-test-"));
@@ -56,7 +56,7 @@ test("loadKeys accepts strings and objects, skips disabled, empty and duplicates
 
 test("loadKeys: missing file, other service, bad JSON without leaking content", async () => {
 	const none = await setup(undefined);
-	assert.deepEqual(await loadKeys(none.keysFile, "tavily"), { entries: [], missing: true, insecure: false });
+	assert.deepEqual(await loadKeys(none.keysFile, "tavily"), { entries: [], missing: true, insecure: false, malformed: [] });
 	const other = await setup({ brave: ["k"] });
 	assert.equal((await loadKeys(other.keysFile, "tavily")).entries.length, 0);
 	await writeFile(other.keysFile, '{"tavily": ["tvly-secret-value"');
@@ -68,7 +68,6 @@ test("loadKeys: missing file, other service, bad JSON without leaking content", 
 test("loadKeys flags a key file readable by others", { skip: process.platform === "win32" }, async () => {
 	const { keysFile } = await setup({ tavily: ["k"] });
 	await writeFile(keysFile, '{"tavily":["k"]}', { mode: 0o644 });
-	const { chmod } = await import("node:fs/promises");
 	await chmod(keysFile, 0o644);
 	assert.equal((await loadKeys(keysFile, "tavily")).insecure, true);
 });
@@ -242,4 +241,179 @@ test("output helpers: sanitize, plural, saved files expire after a day", async (
 	await cleanupSaved(dir);
 	assert.deepEqual(await readdir(dir), [fresh.slice(dir.length + 1)]);
 	await cleanupSaved(join(dir, "missing"));
+});
+
+// ---------- review findings ----------
+
+test("loadKeys skips keys that are not valid header values and reports their labels", async () => {
+	const { keysFile } = await setup({
+		tavily: [
+			"tvly-good-0000001",
+			"tvly-new\nline",
+			{ key: "tvly-tab\tchar", label: "backup" },
+			"tvly-mid dle",
+			{ key: "tvly-ünicode", label: "uni" },
+			"tvly-good-0000002",
+		],
+	});
+	const { entries, malformed } = await loadKeys(keysFile, "tavily");
+	assert.deepEqual(entries.map((e) => e.key), ["tvly-good-0000001", "tvly-good-0000002"]);
+	assert.deepEqual(malformed, ["#2", "backup", "#4", "uni"]);
+	assert.ok(!JSON.stringify(malformed).includes("tvly-"), "labels only, never keys");
+	assert.deepEqual((await new KeyPool("tavily", keysFile, join(tmpdir(), "x-state.json")).snapshot()).malformed, malformed);
+});
+
+test("call redacts the key from fetch errors and drops the cause", async () => {
+	const key = "tvly-dummy-secret-0001";
+	const fetchImpl = (async () => {
+		throw new TypeError(`Headers.append: "Bearer ${key}" is an invalid header value.`, {
+			cause: new Error(`inner ${key}`),
+		});
+	}) as typeof fetch;
+	await assert.rejects(call("/search", key, { timeoutMs: 1000, fetchImpl }), (err: Error) => {
+		assert.ok(!err.message.includes(key));
+		assert.ok(!err.message.includes("tvly-dummy"));
+		assert.match(err.message, /^Tavily \/search: request failed: .*\[redacted\]/);
+		assert.equal(err.cause, undefined);
+		return true;
+	});
+});
+
+test("call keeps the abort error when the caller cancelled", async () => {
+	const ctrl = new AbortController();
+	ctrl.abort();
+	const fetchImpl = ((_u: string, init: RequestInit) => Promise.reject(init.signal?.reason)) as typeof fetch;
+	await assert.rejects(call("/search", "k", { timeoutMs: 1000, signal: ctrl.signal, fetchImpl }), { name: "AbortError" });
+});
+
+test("call with a real fetch and a control character in the key fails without leaking it", async () => {
+	await assert.rejects(call("/search", "tvly-abc\ndef", { timeoutMs: 1000 }), (err: Error) => {
+		assert.ok(!err.message.includes("tvly-abc"));
+		assert.equal(err.cause, undefined);
+		return true;
+	});
+});
+
+test("saved outputs are private: dir 0700, files 0600, existing dir tightened, symlink rejected", { skip: process.platform === "win32" }, async () => {
+	const old = process.umask(0o022);
+	try {
+		const base = await mkdtemp(join(tmpdir(), "ws-priv-"));
+		const dir = join(base, "out");
+		const file = await saveFull("x", dir);
+		assert.equal((await stat(dir)).mode & 0o777, 0o700);
+		assert.equal((await stat(file)).mode & 0o777, 0o600);
+
+		const loose = join(base, "loose");
+		await mkdir(loose, { mode: 0o755 });
+		await chmod(loose, 0o755);
+		await ensurePrivateDir(loose);
+		assert.equal((await stat(loose)).mode & 0o777, 0o700);
+
+		const target = join(base, "target");
+		await mkdir(target);
+		const link = join(base, "link");
+		await symlink(target, link);
+		await assert.rejects(saveFull("x", link), /not a private directory/);
+		assert.deepEqual(await readdir(target), []);
+	} finally {
+		process.umask(old);
+	}
+});
+
+test("cleanupSaved never rejects and removes only old saved files", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "ws-clean-"));
+	const old = new Date(Date.now() - 48 * 3600 * 1000);
+	const subdir = join(dir, "1-abcdef.md"); // even a directory with a saved name must survive
+	await mkdir(subdir);
+	await utimes(subdir, old, old);
+	await mkdir(join(dir, "olddir"));
+	await utimes(join(dir, "olddir"), old, old);
+	await writeFile(join(dir, "notes.txt"), "mine");
+	await utimes(join(dir, "notes.txt"), old, old);
+	await symlink(join(dir, "notes.txt"), join(dir, "2-abcdef.md"));
+	const saved = await saveFull("old", dir);
+	await utimes(saved, old, old);
+	assert.equal(await cleanupSaved(dir), 1);
+	assert.deepEqual((await readdir(dir)).sort(), ["1-abcdef.md", "2-abcdef.md", "notes.txt", "olddir"]);
+	assert.equal(await cleanupSaved(join(dir, "missing")), 0);
+});
+
+const markOf = (status: "exhausted" | "invalid", until: number | null = null) => ({ status, until, reason: "test" });
+const KEY_A = "tvly-aaaa-0000000";
+const KEY_B = "tvly-bbbb-0000000";
+const entryOf = (key: string, label = key) => ({ key, label, id: fingerprint(key) });
+
+async function leftovers(dir: string) {
+	return (await readdir(dir)).filter((n) => n.endsWith(".tmp") || n.endsWith(".lock"));
+}
+
+test("concurrent marks in one pool keep both marks and leave no tmp or lock files", async () => {
+	for (let i = 0; i < 20; i++) {
+		const { dir, pool, stateFile } = await setup({ tavily: [KEY_A, KEY_B] });
+		await Promise.all([pool.mark(entryOf(KEY_A), markOf("exhausted")), pool.mark(entryOf(KEY_B), markOf("invalid"))]);
+		const disk = JSON.parse(await readFile(stateFile, "utf8")).tavily;
+		assert.deepEqual(Object.keys(disk).sort(), [fingerprint(KEY_A), fingerprint(KEY_B)].sort());
+		assert.deepEqual(await leftovers(dir), []);
+	}
+});
+
+test("concurrent marks from different pools of one state file are both kept", async () => {
+	const { dir, keysFile, stateFile } = await setup({ tavily: [KEY_A, KEY_B] });
+	const p1 = new KeyPool("tavily", keysFile, stateFile);
+	const p2 = new KeyPool("tavily", keysFile, stateFile);
+	await Promise.all([p1.mark(entryOf(KEY_A), markOf("exhausted")), p2.mark(entryOf(KEY_B), markOf("invalid"))]);
+	assert.equal(Object.keys(JSON.parse(await readFile(stateFile, "utf8")).tavily).length, 2);
+	assert.deepEqual(await leftovers(dir), []);
+});
+
+test("a mark racing a clear of another key is kept", async () => {
+	const { dir, pool, stateFile } = await setup({ tavily: [KEY_A, KEY_B] });
+	await pool.mark(entryOf(KEY_B), markOf("invalid"));
+	await Promise.all([pool.mark(entryOf(KEY_A), markOf("exhausted")), pool.clear([fingerprint(KEY_B)])]);
+	assert.deepEqual(Object.keys(JSON.parse(await readFile(stateFile, "utf8")).tavily), [fingerprint(KEY_A)]);
+	assert.deepEqual(await leftovers(dir), []);
+});
+
+test("a stale lock file is broken", async () => {
+	const { dir, pool, stateFile } = await setup({ tavily: [KEY_A] });
+	const lock = `${stateFile}.lock`;
+	await writeFile(lock, "");
+	const old = new Date(Date.now() - 60_000);
+	await utimes(lock, old, old);
+	await pool.mark(entryOf(KEY_A), markOf("invalid"));
+	assert.equal(JSON.parse(await readFile(stateFile, "utf8")).tavily[fingerprint(KEY_A)].status, "invalid");
+	assert.deepEqual(await leftovers(dir), []);
+});
+
+test("failover continues with the next key when the mark cannot be saved", async () => {
+	const { pool } = await setup({ tavily: [KEY_A, KEY_B] });
+	pool.mark = async () => {
+		throw new Error("EACCES: disk says no");
+	};
+	const api = fake({ [KEY_A]: 432 });
+	const r = await withRotation(pool, api.run, { keyless: false });
+	assert.equal(r.via, "#2");
+	assert.deepEqual(api.calls, [KEY_A, KEY_B]);
+	assert.match(r.notes[0], /#1" exhausted \(432\); could not save the mark: EACCES/);
+	assert.ok(!r.notes[0].includes("tvly-"));
+});
+
+test("cooling marks of expired and removed keys are pruned, valid ones stay", async () => {
+	const { keysFile, stateFile } = await setup({ tavily: [KEY_A, KEY_B, "tvly-cccc-0000000"] });
+	let now = 1_000_000;
+	const pool = new KeyPool("tavily", keysFile, stateFile, () => now);
+	const bucket = (globalThis as any)[Symbol.for("pi-setup.tavily.cooling")].get(`${stateFile}\0tavily`) as Map<string, unknown>;
+	const limited = (until: number) => ({ status: "rate_limited" as const, until, reason: "429" });
+	await pool.mark(entryOf(KEY_A), limited(now + 5_000));
+	await pool.mark(entryOf(KEY_B), limited(now + 600_000));
+	await pool.mark(entryOf("tvly-cccc-0000000"), limited(now + 600_000));
+	assert.equal(bucket.size, 3);
+
+	now += 10_000; // A has expired
+	await pool.snapshot();
+	assert.deepEqual([...bucket.keys()].sort(), [fingerprint(KEY_B), fingerprint("tvly-cccc-0000000")].sort());
+
+	await writeFile(keysFile, JSON.stringify({ tavily: [KEY_A, KEY_B] })); // C removed
+	await pool.snapshot();
+	assert.deepEqual([...bucket.keys()], [fingerprint(KEY_B)]);
 });

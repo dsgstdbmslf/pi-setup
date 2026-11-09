@@ -17,7 +17,12 @@ export default function tavilyKeys(pi: ExtensionAPI) {
 		const snap = await pool.snapshot();
 		if (snap.missing) return `No key file. Run /search-keys init, then put your keys into ${pool.keysFile}.`;
 		const all = [...snap.available.map((entry) => ({ entry, mark: undefined })), ...snap.skipped];
-		if (all.length === 0) return `No tavily keys in ${pool.keysFile}. Tools that allow it use keyless mode.`;
+		const bad = snap.malformed.length
+			? `Warning: skipped ${snap.malformed.length} malformed key(s) (${snap.malformed.join(", ")}): keys may contain only visible ASCII characters.`
+			: "";
+		if (all.length === 0) {
+			return [`No tavily keys in ${pool.keysFile}. Tools that allow it use keyless mode.`, bad].filter(Boolean).join("\n");
+		}
 		const lines = [`tavily keys (${pool.keysFile}), used in file order:`];
 		const cleared: string[] = [];
 		for (const { entry, mark } of all) {
@@ -49,6 +54,7 @@ export default function tavilyKeys(pi: ExtensionAPI) {
 			await pool.clear(cleared);
 			lines.push(`Credits are available again for ${cleared.length} key(s) marked exhausted; marks cleared.`);
 		}
+		if (bad) lines.push(bad);
 		if (snap.insecure) lines.push(`Warning: ${pool.keysFile} is readable by other users; run chmod 600 on it.`);
 		return lines.join("\n");
 	}
