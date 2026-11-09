@@ -6,8 +6,15 @@ import { type Focusable, fuzzyFilter, Input, truncateToWidth } from "@earendil-w
 import type { Choice } from "./classify.ts";
 
 const MAX_VISIBLE = 10;
-/** Lines around the list: borders, title, subtitle, input, spacers, counter, hint. */
-const CHROME_LINES = 10;
+/** Optional lines around the input and the list, in the order they go when the terminal is short. */
+const CHROME: [part: string, lines: number][] = [
+	["subtitle", 2], // with the blank line below it
+	["spacers", 2],
+	["counter", 1],
+	["hint", 1],
+	["borders", 2],
+	["title", 1],
+];
 
 /** Fuzzy filter over `provider/id`, model name and kind; best matches first. */
 export function filterChoices(choices: Choice[], query: string): Choice[] {
@@ -37,18 +44,30 @@ export function pickClassifier(
 			// Everything is built at render time: one line per item (cut, never wrapped), the list fits
 			// the terminal height, and theme colors are always current.
 			const render = (width: number): string[] => {
-				const fit = (s: string) => truncateToWidth(s, width);
-				const border = theme.fg("border", "─".repeat(Math.max(1, width)));
-				const visible = Math.max(1, Math.min(MAX_VISIBLE, (tui.terminal?.rows ?? 24) - CHROME_LINES));
+				const w = Math.max(1, width);
+				const fit = (line: string) => truncateToWidth(line, w);
+				const rows = Math.max(1, tui.terminal?.rows ?? 24);
+				const inputLines = input.render(w).map(fit);
+				// Drop optional chrome until the input and at least one list row fit.
+				const shown = new Set(CHROME.map(([part]) => part));
+				let used = inputLines.length + CHROME.reduce((n, [, lines]) => n + lines, 0);
+				for (const [part, lines] of CHROME) {
+					if (used + 1 <= rows) break;
+					shown.delete(part);
+					used -= lines;
+				}
+				const has = (part: string) => shown.has(part);
+				const spacer = has("spacers") ? [""] : [];
+				const border = has("borders") ? [theme.fg("border", "─".repeat(w))] : [];
+				const visible = Math.max(1, Math.min(MAX_VISIBLE, rows - used));
 				const start = Math.max(0, Math.min(selected - Math.floor(visible / 2), filtered.length - visible));
 				const end = Math.min(start + visible, filtered.length);
 				const lines = [
-					border,
-					fit(theme.fg("accent", theme.bold("web_fetch classifier"))),
-					fit(theme.fg("muted", "Decides whether a URL may be sent to r.jina.ai. Saved globally.")),
-					"",
-					...input.render(width).map(fit),
-					"",
+					...border,
+					...(has("title") ? [fit(theme.fg("accent", theme.bold("web_fetch classifier")))] : []),
+					...(has("subtitle") ? [fit(theme.fg("muted", "Decides whether a URL may be sent to r.jina.ai. Saved globally.")), ...spacer] : []),
+					...inputLines,
+					...spacer,
 				];
 				for (let i = start; i < end; i++) {
 					const c = filtered[i];
@@ -63,9 +82,10 @@ export function pickClassifier(
 					);
 				}
 				if (filtered.length === 0) lines.push(fit(theme.fg("muted", "  No matching models")));
-				else if (start > 0 || end < filtered.length) lines.push(fit(theme.fg("muted", `  (${selected + 1}/${filtered.length})`)));
-				lines.push("", fit(theme.fg("dim", "  type to search · ↑↓ move · enter select · esc cancel")), border);
-				return lines;
+				else if (has("counter") && (start > 0 || end < filtered.length)) lines.push(fit(theme.fg("muted", `  (${selected + 1}/${filtered.length})`)));
+				if (has("hint")) lines.push(...spacer, fit(theme.fg("dim", "  type to search · ↑↓ move · enter select · esc cancel")));
+				lines.push(...border);
+				return lines.slice(0, rows);
 			};
 
 			const component: Focusable & {

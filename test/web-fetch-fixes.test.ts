@@ -441,6 +441,61 @@ test("R5: concurrent saves in the same millisecond all succeed and leave no temp
 	}
 });
 
+// ── R8: picker on short terminals ───────────────────────────────────
+
+function openPicker(terminal: { rows: number }, initialQuery = "") {
+	let comp: any;
+	const theme: any = { fg: (_: string, s: string) => s, bold: (s: string) => s };
+	const choices = [
+		{ value: AUTO, kind: "auto" as const },
+		...Array.from({ length: 12 }, (_, i) => ({ value: `provider-${i}/model-haiku-${i}`, kind: "chat" as const })),
+	];
+	const keys: Record<string, string> = { "tui.select.up": "\x1b[A", "tui.select.down": "\x1b[B", "tui.select.confirm": "\r", "tui.select.cancel": "\x1b" };
+	const result = pickClassifier(
+		{ ui: { custom: (factory: any) => new Promise((resolve) => (comp = factory({ terminal, requestRender() {} }, theme, { matches: (d: string, k: string) => keys[k] === d }, resolve))) } } as any,
+		choices,
+		AUTO,
+		initialQuery,
+	);
+	return { result, comp: () => comp };
+}
+
+function assertFits(lines: string[], rows: number, width: number) {
+	assert.ok(lines.length <= rows, `${lines.length} lines for ${rows} rows`);
+	for (const l of lines) assert.ok(visibleWidth(l) <= width, l);
+}
+
+test("R8: the picker drops chrome to fit short terminals, keeping the input and the selection", async () => {
+	for (const rows of [5, 8, 10, 15]) {
+		for (const width of [12, 80]) {
+			const p = openPicker({ rows }, "haiku");
+			const lines: string[] = p.comp().render(width);
+			assertFits(lines, rows, width);
+			assert.ok(lines.some((l) => l.includes("→")), `selection shown at ${rows}x${width}`);
+			if (width === 80) assert.ok(lines.some((l) => l.includes("haiku") && !l.includes("→")), "input shown");
+		}
+	}
+	assert.equal(openPicker({ rows: 8 }).comp().render(80).length, 8);
+	assertFits(openPicker({ rows: 1 }).comp().render(1), 1, 1);
+
+	// Resize an open picker downward.
+	const terminal = { rows: 40 };
+	const p = openPicker(terminal);
+	assert.ok(p.comp().render(80).length > 10);
+	terminal.rows = 8;
+	assertFits(p.comp().render(80), 8, 80);
+
+	// No matches, then navigation and confirm still work on a short terminal.
+	const q = openPicker({ rows: 8 });
+	for (const ch of "zzz") q.comp().handleInput(ch);
+	assert.match(q.comp().render(80).join("\n"), /No matching models/);
+	for (let i = 0; i < 3; i++) q.comp().handleInput("\x7f");
+	q.comp().handleInput("\x1b[B");
+	q.comp().handleInput("\x1b[B");
+	q.comp().handleInput("\r");
+	assert.equal(await q.result, "provider-1/model-haiku-1");
+});
+
 // ── R9 / R10: the registered tool ───────────────────────────────────
 
 const usage = { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0.001, output: 0.001, cacheRead: 0, cacheWrite: 0, total: 0.002 } };
