@@ -53,6 +53,13 @@ Do not install both ways at once, or the extension loads twice.
   the prompt as images. Recognizes pi's own `pi-clipboard-*` files and `<app>-paste-*`
   files that terminal apps save for pasted images
 
+- `ask-user-question.ts` — `ask_user_question` tool: the agent pauses and asks you one or
+  several questions (tabs + review step). Each is free text, single choice or multi-select,
+  with an "Other" custom answer (multi-line). Keys: ↑↓, Enter, Space, 1-9, ←/→, Esc;
+  Tab adds a comment to the highlighted option. Optional `defaultAnswer` per question
+  (used only without a UI) and `timeoutSeconds` (on timeout the run stops); the UI is English or Russian (system locale, or `PI_ASK_LANG=en|ru`).
+  Logic lives in `extensions/ask-user-question/`; tests: `npm test`
+
 ### Settings
 
 - `settings.json` — default provider/model, thinking levels, markdown, packages
