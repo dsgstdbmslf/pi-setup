@@ -83,6 +83,21 @@ Do not install both ways at once, or the extension loads twice.
   extensions of one pi process.
   Tools that allow it fall back to Tavily's rate-limited keyless mode when no key works.
 
+- `web-search.ts` — `web_search` tool on Tavily: title, date, URL and the most
+  relevant excerpts of each result, with filters by domain, date (`time_range`), topic
+  (general, news, finance) and exact phrases. Defaults are economical: 5 results,
+  `basic` depth (1 credit; `advanced` costs 2). Works without a key in Tavily's
+  rate-limited keyless mode. Needs `tavily-keys.ts` for `/search-keys` and the shared
+  `extensions/tavily/`; logic lives in `extensions/web-search/`
+
+- `web-fetch.ts` — page reading tools on Tavily: `web_extract` (clean markdown of 1-20
+  URLs, JavaScript-heavy pages included; with `query` only the passages relevant to it),
+  `web_map` (URLs of a site, no content) and `web_crawl` (markdown of the pages of a site
+  section). Defaults are small: `basic` depth, map 50 URLs, crawl 10 pages, one link level,
+  same domain only. `web_extract` works keyless; map and crawl need a key. Replaces the
+  deprecated `web_fetch`. Needs `tavily-keys.ts` and `extensions/tavily/`; logic lives in
+  `extensions/web-fetch/`
+
 ### Settings
 
 - `settings.json` — default provider/model, thinking levels, markdown, packages
