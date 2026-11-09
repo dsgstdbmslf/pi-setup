@@ -1,118 +1,74 @@
 # pi-setup
 
-My personal [pi](https://github.com/earendil-works/pi) configuration for an Orca remote
-server (headless Linux, used from the Orca ADE desktop app).
+My personal [pi](https://github.com/earendil-works/pi) configuration: extensions,
+settings and global instructions. It installs on a clean pi and needs nothing else.
 
 Forked from [amosblomqvist/pi-config](https://github.com/amosblomqvist/pi-config) and
 laid out the same way. The upstream extensions and skills were removed from this fork's
 tree; they remain in upstream and in this repository's Git history.
 
-This is **not** meant to be installed as one big package. Copy the pieces you want into
-`~/.pi/agent`.
-
 No credentials, sessions, or machine state are stored here (`auth.json`, `sessions/`,
 `trust.json`, `models-store.json` stay local).
 
-## Copy an extension
+## Install
 
-```bash
-cp extensions/code-fence-hide.ts ~/.pi/agent/extensions/
-```
+1. Extensions, as a pi package:
 
-Then restart pi or run `/reload`. Rollback: delete the file and `/reload`.
+   ```bash
+   pi install git:github.com/dsgstdbmslf/pi-setup
+   ```
 
-## Copy a skill
+   Pi clones the repository and loads every extension in `extensions/` (see
+   `package.json`). Update with `pi update`, remove with
+   `pi remove git:github.com/dsgstdbmslf/pi-setup`. To load only some extensions, use
+   the object form in settings (`"extensions": ["extensions/code-fence-hide.ts"]`) or
+   `pi config`.
 
-```bash
-cp -r skills/branch-flow ~/.pi/agent/skills/
-```
+2. Settings: merge the fields of `settings.json` into `~/.pi/agent/settings.json` by hand.
+   Do not overwrite the live file: pi writes runtime fields (such as
+   `lastChangelogVersion`) and the package list into it. The `packages` entry installs
+   `npm:@indexyz/pi-skill` on the next start; `npm/package.json` mirrors
+   `~/.pi/agent/npm/package.json` for reference.
+
+3. Global instructions:
+
+   ```bash
+   cp instructions/AGENTS.md ~/.pi/agent/AGENTS.md
+   ```
+
+   Pi loads them in every session. Merge by hand if the file already exists.
 
 Then restart pi or run `/reload`.
 
-## Settings
-
-`settings.json` holds the portable fields of `~/.pi/agent/settings.json` (default
-model/provider, thinking levels, markdown, packages). Merge them by hand; do not overwrite
-the live file (pi writes runtime fields such as `lastChangelogVersion` into it).
-`npm/package.json` mirrors `~/.pi/agent/npm/package.json` for pi packages
-(`pi install npm:@indexyz/pi-skill@0.1.44`).
-
-## Do not clone over your config
-
-Avoid cloning this repo into `~/.pi/agent`. Copy individual files instead.
+Single files work too: `cp extensions/code-fence-hide.ts ~/.pi/agent/extensions/`.
+Do not install both ways at once, or the extension loads twice.
 
 ## Contents
 
-Every item is tagged with how much it depends on Orca:
-
-- **[Orca-only]** — does nothing useful without Orca
-- **[Orca-partial]** — works without Orca, but some features need it
-- **[Independent]** — plain pi, works anywhere
-
 ### Extensions
 
-- `branch-flow.ts` **[Orca-partial]** — `/flow` and `/flow status [project]` panels
-  (output of `git flow-help` / `git flow-status`) without calling the model; auto-loads
-  the branch-flow skill in repositories with a GitHub remote. Needs the branch-flow
-  tooling, which is itself coupled to Orca (see [Branch flow and Orca](#branch-flow-and-orca))
-- `code-fence-hide.ts` **[Independent]** — renders fenced code blocks without the ```
-  lines (like Claude Code); pair with `"markdown": { "codeBlockIndent": "" }`
-- `image-paste-markers.ts` **[Orca-partial]** — pasted screenshots show as `[Image #N]`
-  and are attached to the prompt as images. Recognizes Orca's `/tmp/orca-paste-*` files
-  and pi's own `pi-clipboard-*` files, so pi's native paste works without Orca
-- `orca-kitty-images.ts` **[Orca-only]** — keeps inline Kitty images intact in Orca's
-  terminal; a no-op unless `TERM_PROGRAM=orca`
-
-### Skills
-
-- `branch-flow/` **[Orca-only]** — operating the Orca workspace ↔ GitHub branch flow
-  (publish, ship, merge, sync, status…); needs the `orca-branch-flow` tooling from the
-  orca-setup repo. See [Branch flow and Orca](#branch-flow-and-orca)
-- `perplexity-research/` **[Orca-only]** — web research through Perplexity, driven in
-  Orca's embedded browser by the Perplexity bridge from the orca-setup repo
-  (`mcp/servers/perplexity`). The `cli.py` path points to an Orca workspace of that
-  repo; adjust it to your checkout
-
-### Instructions
-
-- `instructions/AGENTS.md` **[Orca-only]** — Orca server context (headless server, Orca
-  browser and CLI, pasted images) and branch-flow rules; deployed as `~/orca/AGENTS.md`,
-  which pi loads for every project under `~/orca`
+- `code-fence-hide.ts` — renders fenced code blocks without the ``` lines (like Claude
+  Code); pair with `"markdown": { "codeBlockIndent": "" }` from `settings.json`
+- `image-paste-markers.ts` — pasted screenshots show as `[Image #N]` and are attached to
+  the prompt as images. Recognizes pi's own `pi-clipboard-*` files and `<app>-paste-*`
+  files that terminal apps save for pasted images
 
 ### Settings
 
-- `settings.json` **[Independent]** — default provider/model, thinking levels, markdown,
-  packages
-- `npm/package.json` **[Independent]** — pi package `@indexyz/pi-skill` (`$skill` mentions)
+- `settings.json` — default provider/model, thinking levels, markdown, packages
+- `npm/package.json` — pi package `@indexyz/pi-skill` (`$skill` mentions)
 
-### Orca-managed (reference only) **[Orca-only]**
+### Instructions
 
-`orca-managed/` holds files that Orca generates and updates itself: the pi extensions
-`orca-agent-status.ts` (agent status for Orca), `orca-prefill.ts` (editor prefill on
-launch from Orca), `orca-titlebar-spinner.ts` (tab title spinner)
-(`~/.pi/agent/extensions/`, marked `@orca-managed-pi-extension`) and the skills
-`orca-cli`, `orca-computer-use`, `orchestration` (`~/.agents/skills/`). They are kept for
-reference and diffing. **Do not copy them back**; Orca restores its own versions.
+- `instructions/AGENTS.md` — global git rules: no push, pull request or merge unless
+  asked; no force-push or history rewriting; never bypass hooks
 
-## Branch flow and Orca
+## Rollback
 
-The branch-flow skill, the `branch-flow.ts` extension and the underlying
-`branch_flow.py` tooling are currently **tightly coupled to Orca**: a workspace is an
-Orca worktree, and workspaces are created, found, listed and linked to PRs through the
-`orca` CLI.
-
-Without Orca only the git/GitHub part works: `git publish`, `git sync-parent`,
-`git parent --set`, the `pre-push` guard, automatic PR chains and `git abandon`.
-These do not work without Orca: `new-workspace`/`child`/`top`, `ship`, `restore`,
-`move`, `rename`, `remove`, `orphans`, the workspace tree in `status`, and the
-`reconcile` cron job (it silently does nothing, because it only walks Orca worktrees).
-
-A standalone, Orca-independent workflow (plain `git worktree` backend selected
-automatically when Orca is absent) is planned; until then, use this part only on an
-Orca server.
+`pi remove git:github.com/dsgstdbmslf/pi-setup`, delete `~/.pi/agent/AGENTS.md` (or
+restore your previous one), revert the merged settings fields, then `/reload`.
 
 ## Dependencies
 
 - pi (`@earendil-works/pi-coding-agent`) 1.5+
-- Orca ADE with `orca` CLI for the Orca-specific pieces
-- `git`, `gh`, Python 3 for branch-flow and perplexity-research
+- `git` (for `pi install git:...`)

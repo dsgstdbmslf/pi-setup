@@ -1,0 +1,15 @@
+{
+  "name": "pi-setup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Personal pi configuration: extensions, settings and global instructions",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions/*.ts"],
+    "changelogPath": ""
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
