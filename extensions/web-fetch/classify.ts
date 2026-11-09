@@ -3,6 +3,7 @@
 // complete "public" answer allows Jina; doubt, errors, a cut-off answer or no model refuse.
 // Note: the URLs (without fragment) go to the classifier model's provider, a second third party.
 
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
@@ -49,15 +50,15 @@ export async function loadChoice(file: string): Promise<string> {
 	return value?.trim() || AUTO;
 }
 
-/** Atomic write (temp file + rename). Concurrent saves from several sessions: the last one wins. */
+/** Atomic write (own temp file + rename). Concurrent saves: the last one to finish wins. */
 export async function saveChoice(file: string, choice: string): Promise<void> {
 	const config = await readConfig(file); // refuses to overwrite a broken file
 	if (choice === AUTO) delete config.classifier;
 	else config.classifier = choice;
 	await mkdir(dirname(file), { recursive: true });
-	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+	const tmp = `${file}.${randomUUID()}.tmp`;
 	try {
-		await writeFile(tmp, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+		await writeFile(tmp, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
 		await rename(tmp, file);
 	} finally {
 		await rm(tmp, { force: true });

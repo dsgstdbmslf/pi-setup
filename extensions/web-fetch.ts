@@ -98,26 +98,27 @@ export default function webFetch(pi: ExtensionAPI) {
 				usage = verdict.usage;
 				return verdict.reason;
 			};
-			let result: Awaited<ReturnType<typeof fetchAndExtract>>;
 			try {
-				result = await fetchAndExtract(params.url, { signal, jina: process.env.PI_WEB_FETCH_JINA !== "0", classify });
+				const result = await fetchAndExtract(params.url, { signal, jina: process.env.PI_WEB_FETCH_JINA !== "0", classify });
+				const via = result.via === "jina" ? " (via r.jina.ai)" : "";
+				const from = result.redirects ? `\nRedirected from: ${result.redirects[0]}` : "";
+				const full = sanitize(`# ${result.title}\nSource: ${result.url}${via}${from}\n\n${result.content}`);
+				const details: Details = { url: result.url, title: result.title, via: result.via, bytes: Buffer.byteLength(full) };
+				const p = preview(full, MAX_BYTES, MAX_LINES);
+				let text = p.text;
+				if (p.truncated) {
+					const file = await saveFullText(full);
+					details.fullOutputPath = file;
+					text += `\n\n[Truncated: ${p.shownLines} of ${p.totalLines} lines (${formatSize(p.shownBytes)} of ${formatSize(p.totalBytes)}). Full text: ${file}]`;
+				}
+				signal?.throwIfAborted();
+				return { content: [{ type: "text", text }], details, usage };
 			} catch (err) {
-				// Return the error instead of throwing, so the classifier's usage is still counted.
-				if (!(err instanceof FetchError) || !usage) throw err;
-				return { content: [{ type: "text", text: err.message }], details: undefined, isError: true, usage };
+				// Without a model call, let pi report the error. With one, return the error so its usage is still counted.
+				if (!usage) throw err;
+				const text = signal?.aborted ? "Operation aborted" : sanitize(message(err));
+				return { content: [{ type: "text", text }], details: undefined, isError: true, usage };
 			}
-			const via = result.via === "jina" ? " (via r.jina.ai)" : "";
-			const from = result.redirects ? `\nRedirected from: ${result.redirects[0]}` : "";
-			const full = `# ${result.title}\nSource: ${result.url}${via}${from}\n\n${result.content}`;
-			const details: Details = { url: result.url, title: result.title, via: result.via, bytes: Buffer.byteLength(full) };
-			const p = preview(full, MAX_BYTES, MAX_LINES);
-			let text = p.text;
-			if (p.truncated) {
-				const file = await saveFullText(full);
-				details.fullOutputPath = file;
-				text += `\n\n[Truncated: ${p.shownLines} of ${p.totalLines} lines (${formatSize(p.shownBytes)} of ${formatSize(p.totalBytes)}). Full text: ${file}]`;
-			}
-			return { content: [{ type: "text", text }], details, usage };
 		},
 
 		renderCall(args, theme) {

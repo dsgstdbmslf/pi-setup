@@ -696,6 +696,7 @@ function clean(result: FetchResult, via: FetchOutcome["via"]): FetchOutcome {
 	return {
 		...result,
 		url: sanitize(result.url),
+		redirects: result.redirects?.map(sanitize),
 		title: title.length > MAX_TITLE_CHARS ? `${title.slice(0, MAX_TITLE_CHARS - 1)}…` : title || "Untitled",
 		content: sanitize(result.content),
 		via,
@@ -781,7 +782,11 @@ export function preview(text: string, maxBytes: number, maxLines: number): Previ
 	const lines = text.split("\n");
 	let out = lines.length > maxLines ? lines.slice(0, maxLines).join("\n") : text;
 	const bytes = Buffer.from(out, "utf8");
-	if (bytes.byteLength > maxBytes) out = new TextDecoder().decode(bytes.subarray(0, maxBytes)).replace(/\uFFFD+$/, "");
+	if (bytes.byteLength > maxBytes) {
+		let end = maxBytes;
+		while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--; // back to the start of a split character
+		out = bytes.subarray(0, end).toString("utf8");
+	}
 	return {
 		text: out,
 		truncated: out.length < text.length,

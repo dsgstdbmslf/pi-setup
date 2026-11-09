@@ -397,3 +397,163 @@ test("R11: IPv4-mapped IPv6 addresses get the decision of their IPv4 address in 
 	assert.match((await privateReason("http://[::ffff:127.0.0.1]/", { resolve: pub }))!, /private IP/);
 	assert.match((await privateReason("http://[::ffff:c0a8:101]/", { resolve: pub }))!, /private IP/);
 });
+
+// ── R13: preview ────────────────────────────────────────────────────
+
+test("R13: preview keeps genuine U+FFFD and cuts multi-byte characters whole", () => {
+	assert.equal(preview("a\uFFFDrest", 4, 100).text, "a\uFFFD");
+	assert.equal(preview("aé", 2, 100).text, "a");
+	assert.equal(preview("a€", 3, 100).text, "a");
+	assert.equal(preview("a😀", 4, 100).text, "a");
+	assert.equal(preview("a😀b", 5, 100).text, "a😀");
+	const text = "aé€😀\uFFFDz".repeat(50);
+	for (let max = 0; max < 120; max++) {
+		const p = preview(text, max, 1000);
+		assert.ok(p.shownBytes <= max, String(max));
+		assert.ok(text.startsWith(p.text), String(max));
+		assert.equal(Buffer.byteLength(p.text), p.shownBytes);
+	}
+	assert.equal(preview("abcdef", 3, 100).text, "abc");
+	assert.equal(preview("a\nb\nc", 100, 2).text, "a\nb");
+});
+
+// ── R5: concurrent config saves ─────────────────────────────────────
+
+test("R5: concurrent saves in the same millisecond all succeed and leave no temp files", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "wf-r5-"));
+	const file = join(dir, "web-fetch.json");
+	await writeFile(file, '{"other": 1}');
+	const realNow = Date.now;
+	Date.now = () => 1_700_000_000_000;
+	try {
+		for (let round = 0; round < 5; round++) {
+			const choices = Array.from({ length: 20 }, (_, i) => `p/m${i}`);
+			await Promise.all(choices.map((c) => saveChoice(file, c)));
+			const saved = JSON.parse(await readFile(file, "utf8"));
+			assert.equal(saved.other, 1);
+			assert.ok(choices.includes(saved.classifier));
+			assert.deepEqual(await readdir(dir), ["web-fetch.json"]);
+		}
+		await saveChoice(file, AUTO);
+		assert.deepEqual(JSON.parse(await readFile(file, "utf8")), { other: 1 });
+	} finally {
+		Date.now = realNow;
+	}
+});
+
+// ── R9 / R10: the registered tool ───────────────────────────────────
+
+const usage = { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0.001, output: 0.001, cacheRead: 0, cacheWrite: 0, total: 0.002 } };
+
+/** Register the extension with a temp agent dir and TMPDIR; restores the environment afterwards. */
+async function withTool(fn: (tool: any, env: { tmp: string }) => Promise<void>) {
+	const saved = Object.fromEntries(["PI_CODING_AGENT_DIR", "TMPDIR", "PI_WEB_FETCH_CLASSIFIER", "PI_WEB_FETCH_JINA"].map((k) => [k, process.env[k]]));
+	const root = await mkdtemp(join(tmpdir(), "wf-tool-"));
+	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+	process.env.TMPDIR = join(root, "tmp");
+	delete process.env.PI_WEB_FETCH_CLASSIFIER;
+	delete process.env.PI_WEB_FETCH_JINA;
+	try {
+		const { default: webFetch } = await import("../extensions/web-fetch.ts");
+		let tool: any;
+		webFetch({ on() {}, registerCommand() {}, registerTool: (t: any) => (tool = t) } as any);
+		await fn(tool, { tmp: process.env.TMPDIR });
+	} finally {
+		for (const [k, v] of Object.entries(saved)) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	}
+}
+
+/** A session chat model that answers `reply` with usage. */
+function ctxReplying(reply: string) {
+	const registry = {
+		find: () => undefined,
+		findOfType: () => undefined,
+		getAvailable: () => [],
+		getAvailableOfType: async () => [],
+		streamSimple: () => ({ result: async () => ({ stopReason: "stop", usage, content: [{ type: "text", text: reply }] }) }),
+	};
+	return { modelRegistry: registry, model: { provider: "p", id: "m" } };
+}
+
+/** Mock fetch: the direct request gets 403; r.jina.ai gets `jina`. Never touches the network. */
+async function withFetch(jina: (signal?: AbortSignal) => Promise<Response>, fn: () => Promise<void>) {
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+		const url = String(input);
+		if (url.startsWith("https://r.jina.ai/")) return jina(init?.signal ?? undefined);
+		return new Response("blocked", { status: 403 });
+	}) as typeof fetch;
+	try {
+		await fn();
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+}
+
+const PUBLIC_URL = "http://93.184.216.34/page";
+const jinaPage = (content: string) => async () => new Response(`Title: T\n\nMarkdown Content:\n${content}`, { status: 200 });
+
+test("R10: redirect metadata and the tool text are free of control characters, in the preview and the saved file", async () => {
+	await withTool(async (tool) => {
+		const r = await tool.execute("id", { url: `${base}/to-bigtext?\x1b]52;c;aGk=\x07\u202e#x` }, undefined, undefined, ctxReplying("PUBLIC"));
+		const text: string = r.content[0].text;
+		assert.equal(r.isError, undefined);
+		assert.match(text, /Redirected from: http:\/\/127\.0\.0\.1:\d+\/to-bigtext\?/);
+		assert.doesNotMatch(text, /[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e]/);
+		assert.ok(r.details.fullOutputPath);
+		assert.doesNotMatch(await readFile(r.details.fullOutputPath, "utf8"), /[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e]/);
+	});
+});
+
+test("R9: usage of a finished model call survives every later outcome", async () => {
+	await withTool(async (tool, env) => {
+		// Classifier says PUBLIC, Jina fails.
+		await withFetch(async () => new Response("down", { status: 500 }), async () => {
+			const r = await tool.execute("id", { url: PUBLIC_URL }, undefined, undefined, ctxReplying("PUBLIC"));
+			assert.equal(r.isError, true);
+			assert.match(r.content[0].text, /Jina\) failed: HTTP 500/);
+			assert.deepEqual(r.usage, usage);
+		});
+		// Classifier refuses.
+		await withFetch(jinaPage("never"), async () => {
+			const r = await tool.execute("id", { url: PUBLIC_URL }, undefined, undefined, ctxReplying("PRIVATE"));
+			assert.equal(r.isError, true);
+			assert.match(r.content[0].text, /model judged the URL private/);
+			assert.deepEqual(r.usage, usage);
+		});
+		// Classifier says PUBLIC, then the user aborts during Jina.
+		const ac = new AbortController();
+		await withFetch(async () => {
+			ac.abort();
+			throw ac.signal.reason;
+		}, async () => {
+			const r = await tool.execute("id", { url: PUBLIC_URL }, ac.signal, undefined, ctxReplying("PUBLIC"));
+			assert.equal(r.isError, true);
+			assert.equal(r.content[0].text, "Operation aborted");
+			assert.deepEqual(r.usage, usage);
+		});
+		// Success.
+		await withFetch(jinaPage("short body"), async () => {
+			const r = await tool.execute("id", { url: PUBLIC_URL }, undefined, undefined, ctxReplying("PUBLIC"));
+			assert.notEqual(r.isError, true);
+			assert.match(r.content[0].text, /via r\.jina\.ai/);
+			assert.deepEqual(r.usage, usage);
+		});
+		// Success, but the full text cannot be saved (TMPDIR is a file).
+		await writeFile(env.tmp, "not a directory");
+		await withFetch(jinaPage("x\n".repeat(40_000)), async () => {
+			const r = await tool.execute("id", { url: PUBLIC_URL }, undefined, undefined, ctxReplying("PUBLIC"));
+			assert.equal(r.isError, true);
+			assert.deepEqual(r.usage, usage);
+		});
+	});
+});
+
+test("R9: without a model call, errors are thrown as before", async () => {
+	await withTool(async (tool) => {
+		await assert.rejects(tool.execute("id", { url: "file:///etc/passwd" }, undefined, undefined, ctxReplying("PUBLIC")), /Only http/);
+	});
+});
