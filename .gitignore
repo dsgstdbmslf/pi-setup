@@ -34,4 +34,5 @@ tmp/
 # Local pi state never committed
 trust.json
 models-store.json
+web-fetch.json
 *.bak*

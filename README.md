@@ -70,6 +70,16 @@ Do not install both ways at once, or the extension loads twice.
 - `instructions/AGENTS.md` — global git rules: no push, pull request or merge unless
   asked; no force-push or history rewriting; never bypass hooks
 
+### Deprecated
+
+`deprecated/` holds extensions that are no longer in active use, like upstream's. They
+still work, but pi does not load them from this repository (only `extensions/*.ts`);
+copy one by hand to use it. Kept for reference.
+
+- `deprecated/extensions/web-fetch/` — `web_fetch` tool: URL to markdown (HTML, PDF,
+  text) with a 12KB preview and a privacy-checked Jina fallback. Replaced by Tavily;
+  see its [README](deprecated/extensions/web-fetch/README.md) for install and details
+
 ## Rollback
 
 `pi remove git:github.com/dsgstdbmslf/pi-setup`, delete `~/.pi/agent/AGENTS.md` (or
