@@ -28,74 +28,35 @@ function errorText(data: unknown, fallback: string): string {
 	return typeof error === "string" && error ? error : fallback;
 }
 
-/** Replace every occurrence of the key; split/join so the key is never interpreted as a pattern. */
-function redact(text: string, key: string | null): string {
-	return key ? text.split(key).join("[redacted]") : text;
-}
+/** Shortest piece of the key that counts as an echo of it (checked on letters and digits only). */
+const KEY_WINDOW = 12;
 
-/** The exact key, plus anything that looks like a Tavily key or a bearer token. */
-export function scrubSecrets(text: string, key: string | null): string {
-	return redact(text, key)
-		.replace(/Bearer\s+[^\s"',;]+/gi, "Bearer [redacted]")
-		.replace(/tvly-[A-Za-z0-9_-]{6,}/g, "[redacted]");
-}
-
-const NAMED: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
-
-/** Drop `<...>` without a separator. Linear: an unterminated `<` ends the search, as no `>` follows. */
-function stripTags(text: string): string {
-	let out = "";
-	let i = 0;
-	for (;;) {
-		const open = text.indexOf("<", i);
-		const close = open < 0 ? -1 : text.indexOf(">", open);
-		if (close < 0) return out + text.slice(i);
-		out += text.slice(i, open);
-		i = close + 1;
+/**
+ * Server- or network-derived text that is safe to show or log, or null when it must be withheld.
+ * Allowlist: plain printable ASCII, no markup/entity/escape characters, no long token-like run,
+ * and no trace of the key or a bearer token, however it is split. The whole text is judged and
+ * only then cut. Every check is linear; nothing here tries to repair or decode the text.
+ */
+export function serverText(raw: string, key: string | null, max = MAX_ERROR_CHARS): string | null {
+	if (/[^\x20-\x7e\t\n\r]/.test(raw) || /[<>&\\]/.test(raw) || /[A-Za-z0-9_-]{20}/.test(raw)) return null;
+	const compact = raw.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+	if (compact.includes("tvly") || compact.includes("bearer")) return null;
+	const own = key ? key.replace(/[^A-Za-z0-9]/g, "").toLowerCase() : "";
+	if (own.length >= 8) {
+		const size = Math.min(KEY_WINDOW, own.length);
+		for (let i = 0; i + size <= own.length; i++) if (compact.includes(own.slice(i, i + size))) return null;
 	}
+	const line = raw.replace(/\s+/g, " ").trim();
+	return line.length > max ? `${line.slice(0, max).trimEnd()}...` : line;
 }
 
-function decodeEntities(text: string): string {
-	return text.replace(/&(?:#(\d{1,7})|#x([0-9a-f]{1,6})|([a-z]{2,4}));/gi, (all, dec?: string, hex?: string, name?: string) => {
-		if (name) return NAMED[name.toLowerCase()] ?? all;
-		const code = dec ? Number(dec) : parseInt(hex!, 16);
-		return code <= 0x10ffff ? String.fromCodePoint(code) : all;
-	});
-}
-
-/** The text as a reader would see it with markup, entities, whitespace and invisible characters gone. */
-function normalized(text: string): string {
-	const decoded = decodeEntities(decodeEntities(stripTags(text)));
-	return stripTags(decoded).replace(/[\x00-\x20\x7f\u00ad\u034f\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]/g, "");
-}
-
-/** True when a credential can be read out of the text once markup and spacing are ignored. */
-function containsSecret(text: string, key: string | null): boolean {
-	const flat = normalized(text);
-	return (!!key && flat.includes(key)) || /tvly-[A-Za-z0-9_-]{6,}/.test(flat) || /Bearer[A-Za-z0-9._~+\/-]{8,}/i.test(flat);
-}
-
-export const WITHHELD = "[server text withheld: it contained a credential]";
-
-/**
- * Untrusted text for display or disk. Contiguous secrets are replaced; if one is still readable
- * after that (split by tags, entities or spacing) the whole text is withheld rather than guessed at.
- */
-export function safeMessage(text: string, key: string | null): string {
-	const scrubbed = scrubSecrets(text, key);
-	return containsSecret(scrubbed, key) ? WITHHELD : scrubbed;
-}
-
-/**
- * One bounded line of untrusted text for an error message. Secrets are handled on the whole text
- * before the first cut, so a cut can never leave a key fragment; the early cut only keeps plain()
- * cheap on big bodies, and the result is checked once more.
- */
-export function clip(text: string, n: number, key: string | null): string {
-	const safe = safeMessage(text, key);
-	if (safe === WITHHELD) return safe;
-	const line = safeMessage(plain(safe.slice(0, n * 8)), key);
-	return line.length > n ? `${line.slice(0, n).replace(/[\ud800-\udbff]$/, "")}…` : line;
+/** What a failed status means, in our own words. Used instead of server text when that is withheld. */
+export function statusLabel(status: number): string {
+	if (status >= 500) return "server error";
+	return (
+		({ 400: "bad request", 401: "invalid API key", 403: "forbidden", 429: "rate limited", 432: "plan credit limit reached", 433: "pay-as-you-go limit reached" } as Record<number, string>)[status] ??
+		"HTTP error"
+	);
 }
 
 /**
@@ -106,7 +67,8 @@ function requestFailed(path: string, key: string | null, err: unknown): Error {
 	const message = err instanceof Error ? err.message : String(err);
 	const cause = (err as { cause?: { message?: unknown } } | null)?.cause?.message;
 	const detail = typeof cause === "string" && cause ? ` (${cause})` : "";
-	return new Error(`Tavily ${path}: request failed: ${clip(message + detail, MAX_ERROR_CHARS, key)}`);
+	const shown = serverText(message + detail, key);
+	return new Error(`Tavily ${path}: request failed${shown === null ? " (details withheld)" : shown ? `: ${shown}` : ""}`);
 }
 
 function formatLimit(bytes: number): string {
@@ -205,10 +167,15 @@ export async function call<T = any>(path: string, key: string | null, opts: Call
 		return { ok: true, value: data as T };
 	}
 	const retry = Number(resp.headers.get("retry-after"));
+	const label = statusLabel(resp.status);
+	const body = errorText(data, text);
+	// Without a usable body, the status line may say something; it passes the same allowlist.
+	const shown = serverText(body.trim() ? body : resp.statusText, key);
+	const detail = shown === null ? `${label} (server text withheld)` : shown || label;
 	return {
 		ok: false,
 		status: resp.status,
-		message: `Tavily ${path} ${resp.status}: ${clip(errorText(data, text || resp.statusText), MAX_ERROR_CHARS, key)}`,
+		message: `Tavily ${path} ${resp.status}: ${detail}`,
 		retryAfter: Number.isFinite(retry) && retry > 0 ? retry : undefined,
 	};
 }

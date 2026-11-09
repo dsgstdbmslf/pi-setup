@@ -4,7 +4,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { call, safeMessage } from "./tavily/client.ts";
+import { call, statusLabel } from "./tavily/client.ts";
 import { KEYS_FILE, mask, nextMonthUtc } from "./tavily/keys.ts";
 import { tavilyPool } from "./tavily/tool.ts";
 
@@ -43,9 +43,9 @@ export default function tavilyKeys(pi: ExtensionAPI) {
 				}
 			} else if (res.status === 401) {
 				info = "invalid key (401)";
-				if (mark?.status !== "invalid") await pool.mark(entry, { status: "invalid", until: null, reason: safeMessage(res.message, entry.key).slice(0, 200) });
+				if (mark?.status !== "invalid") await pool.mark(entry, { status: "invalid", until: null, reason: `401: ${statusLabel(401)}` });
 			} else {
-				info = `${mark ? `${mark.status}; ` : ""}usage check failed: ${safeMessage(res.message, entry.key)}`;
+				info = `${mark ? `${mark.status}; ` : ""}usage check failed: ${res.message}`;
 			}
 			lines.push(`- ${entry.label} ${mask(entry.key)}: ${info}`);
 		}
