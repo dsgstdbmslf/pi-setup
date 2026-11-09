@@ -20,9 +20,8 @@ export default function tavilyKeys(pi: ExtensionAPI) {
 		const bad = snap.malformed.length
 			? `Warning: skipped ${snap.malformed.length} malformed key(s) (${snap.malformed.join(", ")}): keys may contain only visible ASCII characters.`
 			: "";
-		if (all.length === 0) {
-			return [`No tavily keys in ${pool.keysFile}. Tools that allow it use keyless mode.`, bad].filter(Boolean).join("\n");
-		}
+		const warn = [bad, snap.stateWarning ? `Warning: ${snap.stateWarning}.` : ""].filter(Boolean);
+		if (all.length === 0) return [`No tavily keys in ${pool.keysFile}. Tools that allow it use keyless mode.`, ...warn].join("\n");
 		const lines = [`tavily keys (${pool.keysFile}), used in file order:`];
 		const cleared: string[] = [];
 		for (const { entry, mark } of all) {
@@ -54,7 +53,7 @@ export default function tavilyKeys(pi: ExtensionAPI) {
 			await pool.clear(cleared);
 			lines.push(`Credits are available again for ${cleared.length} key(s) marked exhausted; marks cleared.`);
 		}
-		if (bad) lines.push(bad);
+		lines.push(...warn);
 		if (snap.insecure) lines.push(`Warning: ${pool.keysFile} is readable by other users; run chmod 600 on it.`);
 		return lines.join("\n");
 	}

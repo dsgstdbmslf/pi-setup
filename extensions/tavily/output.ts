@@ -32,14 +32,30 @@ export function plural(n: number, word: string): string {
 	return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
-/** Create the directory for 0700 and refuse one that is a symlink, not ours, or not a directory (/tmp is shared). */
-export async function ensurePrivateDir(dir: string): Promise<void> {
-	await mkdir(dir, { recursive: true, mode: 0o700 });
-	const st = await lstat(dir);
+/**
+ * Check an existing directory: it must be a real directory (not a symlink) owned by us; loose
+ * permissions are tightened to 0700. Returns false when it does not exist. /tmp and ~/.pi can
+ * hold something pre-created by someone else, so never trust a path just because it is there.
+ */
+export async function checkPrivateDir(dir: string): Promise<boolean> {
+	let st;
+	try {
+		st = await lstat(dir);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw err;
+	}
 	if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`${dir} is not a private directory`);
-	if (process.platform === "win32") return;
+	if (process.platform === "win32") return true;
 	if (st.uid !== process.getuid?.()) throw new Error(`${dir} is not a private directory (owned by another user)`);
 	if (st.mode & 0o077) await chmod(dir, 0o700); // created earlier under a looser umask
+	return true;
+}
+
+/** Create the directory for 0700 and apply the checks of checkPrivateDir. */
+export async function ensurePrivateDir(dir: string): Promise<void> {
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	await checkPrivateDir(dir);
 }
 
 export async function saveFull(text: string, dir = OUT_DIR): Promise<string> {

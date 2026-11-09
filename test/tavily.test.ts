@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, readdir, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -509,4 +509,83 @@ test("cooling marks of expired and removed keys are pruned, valid ones stay", as
 	await writeFile(keysFile, JSON.stringify({ tavily: [KEY_A, KEY_B] })); // C removed
 	await pool.snapshot();
 	assert.deepEqual([...bucket.keys()], [fingerprint(KEY_B)]);
+});
+
+// ---------- state directory hardening ----------
+
+const POSIX = { skip: process.platform === "win32" };
+
+/** A dir outside the state root holding a valid mark for KEY_A, to detect writes or deletes through a symlink. */
+async function outsideWithMark(base: string) {
+	const outside = join(base, "outside");
+	await mkdir(outside);
+	const file = join(outside, `${fingerprint(KEY_A)}.json`);
+	await writeFile(file, JSON.stringify(markOf("invalid")));
+	return { outside, file };
+}
+
+test("pre-existing loose state directories are tightened by mark()", POSIX, async () => {
+	const { dir, pool, stateDir } = await setup({ tavily: [KEY_A] });
+	await mkdir(join(stateDir, "tavily"), { recursive: true, mode: 0o777 });
+	await chmod(stateDir, 0o755);
+	await chmod(join(stateDir, "tavily"), 0o777);
+	await pool.mark(entryOf(KEY_A), markOf("invalid"));
+	assert.equal((await stat(stateDir)).mode & 0o777, 0o700);
+	assert.equal((await stat(join(stateDir, "tavily"))).mode & 0o777, 0o700);
+	assert.equal((await stat(markFile(stateDir, KEY_A))).mode & 0o777, 0o600);
+});
+
+test("a symlinked service directory is refused for write, clear and read", POSIX, async () => {
+	const { dir, keysFile, stateDir, pool } = await setup({ tavily: [KEY_A, KEY_B] });
+	const { outside, file } = await outsideWithMark(dir);
+	await mkdir(stateDir, { mode: 0o700 });
+	await symlink(outside, join(stateDir, "tavily"));
+
+	await assert.rejects(pool.mark(entryOf(KEY_B), markOf("invalid")), /not a private directory/);
+	assert.deepEqual(await readdir(outside), [`${fingerprint(KEY_A)}.json`], "nothing written outside");
+	await assert.rejects(pool.clear(), /not a private directory/);
+	await assert.rejects(pool.clear([fingerprint(KEY_A)]), /not a private directory/);
+	assert.equal(JSON.parse(await readFile(file, "utf8")).status, "invalid", "outside mark untouched");
+
+	const snap = await pool.snapshot();
+	assert.equal(snap.available.length, 2, "marks behind a symlink are not trusted");
+	assert.match(snap.stateWarning ?? "", /not a private directory/);
+
+	// Failover keeps going and reports the lost mark.
+	const api = fake({ [KEY_A]: 432 });
+	const r = await withRotation(new KeyPool("tavily", keysFile, stateDir), api.run, { keyless: false });
+	assert.deepEqual(api.calls, [KEY_A, KEY_B]);
+	assert.match(r.notes[0], /could not save the mark: .*not a private directory/);
+});
+
+test("a symlinked state directory is refused the same way", POSIX, async () => {
+	const { dir, stateDir, pool } = await setup({ tavily: [KEY_A] });
+	const { outside } = await outsideWithMark(dir);
+	await symlink(outside, stateDir);
+	await assert.rejects(pool.mark(entryOf(KEY_A), markOf("exhausted")), /not a private directory/);
+	await assert.rejects(pool.clear(), /not a private directory/);
+	assert.deepEqual(await readdir(outside), [`${fingerprint(KEY_A)}.json`]);
+	const snap = await pool.snapshot();
+	assert.equal(snap.available.length, 1);
+	assert.ok(snap.stateWarning);
+});
+
+test("a symlinked mark file is not read", POSIX, async () => {
+	const { dir, pool, stateDir } = await setup({ tavily: [KEY_A] });
+	const { file } = await outsideWithMark(dir);
+	await mkdir(join(stateDir, "tavily"), { recursive: true, mode: 0o700 });
+	await symlink(file, markFile(stateDir, KEY_A));
+	const snap = await pool.snapshot();
+	assert.equal(snap.available.length, 1);
+	assert.equal(snap.stateWarning, undefined);
+});
+
+test("snapshot() and clear() create nothing; only mark() does", async () => {
+	const { pool, stateDir } = await setup({ tavily: [KEY_A] });
+	await pool.snapshot();
+	await pool.clear();
+	await pool.clear([fingerprint(KEY_A)]);
+	await assert.rejects(lstat(stateDir), { code: "ENOENT" });
+	await pool.mark(entryOf(KEY_A), markOf("invalid"));
+	assert.equal((await lstat(stateDir)).isDirectory(), true);
 });

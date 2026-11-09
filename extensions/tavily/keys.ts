@@ -5,8 +5,9 @@
 //        invalid), never the key. One file per key means no read-modify-write, so no lock is needed.
 
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { checkPrivateDir, ensurePrivateDir } from "./output.ts";
 
 export const KEYS_FILE = "api-keys.json";
 export const STATE_DIR = "api-keys-state";
@@ -129,6 +130,8 @@ export interface PoolSnapshot {
 	missing: boolean;
 	insecure: boolean;
 	malformed: string[];
+	/** The state directory could not be trusted (symlink, foreign owner); persistent marks are ignored. */
+	stateWarning?: string;
 }
 
 /** Keys of one service in file order, minus the ones marked unusable. */
@@ -161,26 +164,47 @@ export class KeyPool {
 		return join(this.serviceDir, `${id}.json`);
 	}
 
+	/**
+	 * Validate stateDir, then serviceDir. They live in ~/.pi/agent, but a pre-existing loose directory
+	 * or a symlink would move marks outside it (or expose them). Returns false when a directory is
+	 * missing and create is off; throws when one cannot be trusted.
+	 */
+	private async dirs(create: boolean): Promise<boolean> {
+		for (const dir of [this.stateDir, this.serviceDir]) {
+			if (create) await ensurePrivateDir(dir);
+			else if (!(await checkPrivateDir(dir))) return false;
+		}
+		return true;
+	}
+
 	/** Persistent marks by key id. Missing, unreadable or malformed files simply mean "not marked". */
-	private async readMarks(): Promise<Record<string, Mark>> {
-		const names = await readdir(this.serviceDir).catch(() => [] as string[]);
+	private async readMarks(): Promise<{ marks: Record<string, Mark>; warning?: string }> {
 		const marks: Record<string, Mark> = {};
+		try {
+			if (!(await this.dirs(false))) return { marks };
+		} catch (err) {
+			// Keep failover working; the caller reports it.
+			return { marks, warning: `${err instanceof Error ? err.message : String(err)}; saved key marks are ignored` };
+		}
+		const names = await readdir(this.serviceDir).catch(() => [] as string[]);
 		for (const name of names) {
 			if (!MARK_FILE_RE.test(name)) continue;
 			try {
-				const mark = JSON.parse(await readFile(join(this.serviceDir, name), "utf8"));
+				const file = join(this.serviceDir, name);
+				if (!(await lstat(file)).isFile()) continue; // a symlinked mark file is not read
+				const mark = JSON.parse(await readFile(file, "utf8"));
 				if (isMark(mark)) marks[name.slice(0, -5)] = mark;
 			} catch {
 				// corrupt or removed meanwhile
 			}
 		}
-		return marks;
+		return { marks };
 	}
 
 	/** Write to a temp file and rename: readers see the old or the new mark, never a partial one. */
 	private async writeMark(id: string, mark: Mark): Promise<void> {
 		const file = this.markPath(id);
-		await mkdir(this.serviceDir, { recursive: true, mode: 0o700 });
+		await this.dirs(true);
 		const tmp = join(this.serviceDir, `.${id}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
 		try {
 			await writeFile(tmp, `${JSON.stringify(mark)}\n`, { mode: 0o600, flag: "wx" });
@@ -193,7 +217,7 @@ export class KeyPool {
 
 	async snapshot(): Promise<PoolSnapshot> {
 		const { entries, missing, insecure, malformed } = await loadKeys(this.keysFile, this.service);
-		const marks = await this.readMarks();
+		const { marks, warning: stateWarning } = await this.readMarks();
 		const t = this.now();
 		// Forget expired marks and keys that are gone. Every pool of a bucket reads the same key file.
 		// The bucket Map itself stays in the registry: live pools hold it and share it across extensions.
@@ -206,7 +230,7 @@ export class KeyPool {
 			if (mark) skipped.push({ entry, mark });
 			else available.push(entry);
 		}
-		return { available, skipped, missing, insecure, malformed };
+		return { available, skipped, missing, insecure, malformed, ...(stateWarning && { stateWarning }) };
 	}
 
 	async mark(entry: KeyEntry, mark: Mark): Promise<void> {
@@ -227,6 +251,8 @@ export class KeyPool {
 	async clear(ids?: string[]): Promise<void> {
 		if (ids) ids.forEach((id) => this.cooling.delete(id));
 		else this.cooling.clear();
+		// A validation error propagates: never delete through a symlink.
+		if (!(await this.dirs(false))) return;
 		const files = ids
 			? ids.filter((id) => ID_RE.test(id)).map((id) => this.markPath(id))
 			: (await readdir(this.serviceDir).catch(() => [] as string[])).filter((n) => MARK_FILE_RE.test(n)).map((n) => join(this.serviceDir, n));
