@@ -1,6 +1,10 @@
 # Secrets - keep local only
 auth.json
 **/auth.json
+api-keys.json
+**/api-keys.json
+api-keys-state/
+**/api-keys-state/
 .env
 .env.*
 
