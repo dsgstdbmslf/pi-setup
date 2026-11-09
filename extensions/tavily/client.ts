@@ -40,14 +40,61 @@ export function scrubSecrets(text: string, key: string | null): string {
 		.replace(/tvly-[A-Za-z0-9_-]{6,}/g, "[redacted]");
 }
 
+const NAMED: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+
+/** Drop `<...>` without a separator. Linear: an unterminated `<` ends the search, as no `>` follows. */
+function stripTags(text: string): string {
+	let out = "";
+	let i = 0;
+	for (;;) {
+		const open = text.indexOf("<", i);
+		const close = open < 0 ? -1 : text.indexOf(">", open);
+		if (close < 0) return out + text.slice(i);
+		out += text.slice(i, open);
+		i = close + 1;
+	}
+}
+
+function decodeEntities(text: string): string {
+	return text.replace(/&(?:#(\d{1,7})|#x([0-9a-f]{1,6})|([a-z]{2,4}));/gi, (all, dec?: string, hex?: string, name?: string) => {
+		if (name) return NAMED[name.toLowerCase()] ?? all;
+		const code = dec ? Number(dec) : parseInt(hex!, 16);
+		return code <= 0x10ffff ? String.fromCodePoint(code) : all;
+	});
+}
+
+/** The text as a reader would see it with markup, entities, whitespace and invisible characters gone. */
+function normalized(text: string): string {
+	const decoded = decodeEntities(decodeEntities(stripTags(text)));
+	return stripTags(decoded).replace(/[\x00-\x20\x7f\u00ad\u034f\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]/g, "");
+}
+
+/** True when a credential can be read out of the text once markup and spacing are ignored. */
+function containsSecret(text: string, key: string | null): boolean {
+	const flat = normalized(text);
+	return (!!key && flat.includes(key)) || /tvly-[A-Za-z0-9_-]{6,}/.test(flat) || /Bearer[A-Za-z0-9._~+\/-]{8,}/i.test(flat);
+}
+
+export const WITHHELD = "[server text withheld: it contained a credential]";
+
 /**
- * One bounded line of untrusted text for an error message. Secrets are scrubbed before the first
- * cut, so a cut can never split a key into a fragment the scrub would miss; again after tag
- * stripping, which could rebuild or split one. The early cut keeps plain() cheap on big bodies.
+ * Untrusted text for display or disk. Contiguous secrets are replaced; if one is still readable
+ * after that (split by tags, entities or spacing) the whole text is withheld rather than guessed at.
+ */
+export function safeMessage(text: string, key: string | null): string {
+	const scrubbed = scrubSecrets(text, key);
+	return containsSecret(scrubbed, key) ? WITHHELD : scrubbed;
+}
+
+/**
+ * One bounded line of untrusted text for an error message. Secrets are handled on the whole text
+ * before the first cut, so a cut can never leave a key fragment; the early cut only keeps plain()
+ * cheap on big bodies, and the result is checked once more.
  */
 export function clip(text: string, n: number, key: string | null): string {
-	const head = scrubSecrets(text, key).slice(0, n * 8);
-	const line = scrubSecrets(plain(head), key);
+	const safe = safeMessage(text, key);
+	if (safe === WITHHELD) return safe;
+	const line = safeMessage(plain(safe.slice(0, n * 8)), key);
 	return line.length > n ? `${line.slice(0, n).replace(/[\ud800-\udbff]$/, "")}…` : line;
 }
 

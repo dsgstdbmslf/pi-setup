@@ -7,7 +7,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { lstat, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { scrubSecrets } from "./client.ts";
+import { safeMessage } from "./client.ts";
 import { checkPrivateDir, ensurePrivateDir } from "./output.ts";
 
 export const KEYS_FILE = "api-keys.json";
@@ -319,8 +319,8 @@ export async function withRotation<T>(
 	for (const entry of snap.available) {
 		const res = await run(entry.key);
 		if (res.ok) return { value: res.value, key: entry.key, via: entry.label, notes };
-		// run() is expected to redact already; this guards what is thrown and what lands on disk.
-		const message = scrubSecrets(res.message, entry.key);
+		// run() is expected to redact already; this guards what is thrown and what lands on disk (fail closed).
+		const message = safeMessage(res.message, entry.key);
 		const status = verdictFor(res.status);
 		if (!status) throw new ApiError(message, res.status);
 		const until =
@@ -343,7 +343,7 @@ export async function withRotation<T>(
 		);
 	}
 	const res = await run(null);
-	if (!res.ok) throw new ApiError(`${scrubSecrets(res.message, null)} (keyless mode: ${why})`, res.status);
+	if (!res.ok) throw new ApiError(`${safeMessage(res.message, null)} (keyless mode: ${why})`, res.status);
 	note(`${pool.service}: ${why}, used keyless mode`);
 	return { value: res.value, key: null, via: "keyless", notes };
 }

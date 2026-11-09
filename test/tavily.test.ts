@@ -18,7 +18,7 @@ import {
 	verdictFor,
 	withRotation,
 } from "../extensions/tavily/keys.ts";
-import { MAX_ERROR_CHARS, call, compact, credits, plain, scrubSecrets } from "../extensions/tavily/client.ts";
+import { MAX_ERROR_CHARS, WITHHELD, call, clip, compact, credits, plain, safeMessage, scrubSecrets } from "../extensions/tavily/client.ts";
 import { cleanupSaved, ensurePrivateDir, plural, sanitize, saveFull } from "../extensions/tavily/output.ts";
 
 const markFile = (stateDir: string, key: string) => join(stateDir, "tavily", `${fingerprint(key)}.json`);
@@ -792,4 +792,106 @@ test("a body that is null is empty; the reader is released after a normal read",
 	const fetchImpl = (async () => (resp = new Response('{"ok":1}'))) as typeof fetch;
 	await call("/map", "k", { timeoutMs: 1000, fetchImpl });
 	assert.equal(resp.body?.locked, false);
+});
+
+// ---------- credentials split by markup, entities or spacing ----------
+
+const SPLIT_KEY = "tvly-review-FAKE-ONLY-1234567890";
+const flat = (text: string) => text.replace(/<[^>]*>/g, "").replace(/[\s\u200b-\u200f\u2060\ufeff]/g, "");
+/** The key split after "tvly-re" in ways contiguous matching can not see. */
+const SPLITS: Record<string, string> = {
+	"empty tag": `${SPLIT_KEY.slice(0, 7)}<b></b>${SPLIT_KEY.slice(7)}`,
+	"tag with attributes": `${SPLIT_KEY.slice(0, 7)}<span class="x">${SPLIT_KEY.slice(7)}`,
+	"decimal entity": `tvly-re&#118;iew${SPLIT_KEY.slice(11)}`,
+	"hex entity": `tvly-re&#x76;iew${SPLIT_KEY.slice(11)}`,
+	"zero-width space": `${SPLIT_KEY.slice(0, 7)}\u200b${SPLIT_KEY.slice(7)}`,
+	"space": `${SPLIT_KEY.slice(0, 7)} ${SPLIT_KEY.slice(7)}`,
+	"newline": `${SPLIT_KEY.slice(0, 7)}\n${SPLIT_KEY.slice(7)}`,
+	"split bearer": `Bear<i></i>er ${"abcdefghij"}`,
+};
+
+test("clip and safeMessage withhold text that hides a split credential", () => {
+	for (const [name, split] of Object.entries(SPLITS)) {
+		const text = `Invalid key ${split} for you`;
+		for (const out of [clip(text, 300, SPLIT_KEY), safeMessage(text, SPLIT_KEY), clip(text, 300, null)]) {
+			assert.equal(out, WITHHELD, name);
+			assert.ok(!flat(out).includes(SPLIT_KEY));
+		}
+	}
+	assert.ok(!flat(clip("x".repeat(1000) + SPLITS["empty tag"], 300, SPLIT_KEY)).includes(SPLIT_KEY), "split key beyond the cut head");
+});
+
+test("ordinary error text is unchanged by the fail-closed check", () => {
+	for (const text of ["Usage limit exceeded", "Bearer authentication is required", "bad <b>request</b> &amp; more"]) {
+		assert.equal(safeMessage(text, SPLIT_KEY), scrubSecrets(text, SPLIT_KEY));
+	}
+	assert.equal(clip("Usage limit exceeded", 300, SPLIT_KEY), "Usage limit exceeded");
+	assert.equal(clip("bad <b>request</b> &amp; more", 300, null), "bad request & more");
+	assert.equal(clip(`key ${SPLIT_KEY} here`, 300, SPLIT_KEY), "key [redacted] here", "a contiguous key is still just replaced");
+});
+
+test("call withholds a split credential in JSON detail.error, detail and plain 400/401/432 bodies", async () => {
+	for (const status of [400, 401, 432]) {
+		for (const [name, split] of Object.entries(SPLITS)) {
+			const bodies: [string, string][] = [
+				[JSON.stringify({ detail: { error: `Invalid key ${split}` } }), "application/json"],
+				[JSON.stringify({ detail: `Invalid key ${split}` }), "application/json"],
+				[`Invalid key ${split}`, "text/plain"],
+			];
+			for (const [body, type] of bodies) {
+				const r = await call("/extract", SPLIT_KEY, { timeoutMs: 1000, fetchImpl: respond(body, { status, headers: { "content-type": type } }) });
+				assert.ok(!r.ok);
+				assert.equal(r.message, `Tavily /extract ${status}: ${WITHHELD}`, `${status} ${name}`);
+			}
+		}
+	}
+});
+
+test("withRotation never throws or persists a split credential (keyed and keyless)", async () => {
+	for (const [name, split] of Object.entries(SPLITS)) {
+		const { pool, stateDir } = await setup({ tavily: [SPLIT_KEY, KEY_B] });
+		// real call() path, and a run() that skips redaction entirely
+		const viaCall = (status: number) => (key: string | null) =>
+			call("/search", key, { timeoutMs: 1000, fetchImpl: respond(`Invalid key ${split}`, { status }) });
+		const raw = (status: number) => async (key: string | null): Promise<Attempt<string>> =>
+			key === KEY_B ? { ok: true, value: "b" } : { ok: false, status, message: `Tavily /search ${status}: Invalid key ${split}` };
+		for (const make of [viaCall, raw]) {
+			for (const status of [401, 432]) {
+				await pool.clear();
+				const run = (key: string | null) => (key === KEY_B ? Promise.resolve<Attempt<string>>({ ok: true, value: "b" }) : make(status)(key));
+				assert.equal((await withRotation(pool, run, { keyless: false })).value, "b");
+				const mark = await readMark(stateDir, SPLIT_KEY);
+				assert.ok(mark.reason.startsWith(`${status}: `) && mark.reason.endsWith(WITHHELD), mark.reason);
+				assert.ok(!flat(mark.reason).includes(SPLIT_KEY), `${name}: ${mark.reason}`);
+			}
+			await pool.clear();
+			await assert.rejects(withRotation(pool, (k) => make(400)(k), { keyless: false }), (err: ApiError) => {
+				assert.equal(err.status, 400);
+				assert.ok(!flat(err.message).includes(SPLIT_KEY), `${name}: ${err.message}`);
+				assert.ok(err.message.includes(WITHHELD));
+				return true;
+			});
+		}
+		const keyless = await setup(undefined);
+		await assert.rejects(withRotation(keyless.pool, (k) => viaCall(500)(k), { keyless: true }), (err: ApiError) => {
+			assert.ok(err.message.includes(WITHHELD) && err.message.includes("keyless mode"));
+			return true;
+		});
+	}
+});
+
+test("a split credential needs no known key: Tavily-looking tokens are withheld too", () => {
+	assert.equal(safeMessage("old key tvly-abcd<b></b>efghij", null), WITHHELD);
+	assert.equal(safeMessage("Authorization: Bearer abcdefghij", null), "Authorization: Bearer [redacted]");
+});
+
+test("redaction runs in linear time on 64 KiB of hostile input", () => {
+	const size = 64 * 1024;
+	const inputs = ["<".repeat(size), "<<>".repeat(size / 3), "tvly-".repeat(size / 5), "&#".repeat(size / 2), "&#1234567;".repeat(size / 10), "Bearer ".repeat(size / 7), " ".repeat(size), "<a ".repeat(size / 3)];
+	for (const input of inputs) {
+		const t = Date.now();
+		clip(input, 300, SPLIT_KEY);
+		safeMessage(input, SPLIT_KEY);
+		assert.ok(Date.now() - t < 200, `${input.slice(0, 8)}: ${Date.now() - t} ms`);
+	}
 });
