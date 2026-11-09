@@ -74,4 +74,4 @@ Free-form requests ("finish everything under Pi setup", "why has X no PR?", "в�
 как Bug 1 в bugs") are allowed:
 map them to these options, list the steps you will take, then do them.
 
-Details: `docs/runbooks/branch-flow.md` in the orca-setup project.
+Details: `docs/branch-flow.md` in the pi-setup repository (with the tool, `tools/branch-flow/branch_flow.py`).

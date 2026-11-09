@@ -67,12 +67,20 @@ Every item is tagged with how much it depends on Orca:
 
 - `branch-flow/` **[Orca-only]** — stacked PRs for Orca workspaces on request
   (publish, ship, merge, sync, status…), called only with `/skill:branch-flow`; needs the
-  `orca-branch-flow` tooling from the orca-setup repo. See
-  [Branch flow and Orca](#branch-flow-and-orca)
+  branch-flow tool from `tools/branch-flow/`. See [Branch flow and Orca](#branch-flow-and-orca)
 - `perplexity-research/` **[Orca-only]** — web research through Perplexity, driven in
   Orca's embedded browser by the Perplexity bridge from the orca-setup repo
   (`mcp/servers/perplexity`). The `cli.py` path points to an Orca workspace of that
   repo; adjust it to your checkout
+
+### Tools
+
+- `tools/branch-flow/branch_flow.py` **[Orca-partial]** — the branch-flow tool behind the
+  skill and `/flow`: `git publish`, `git ship`, `git sync-parent`, `git flow-status`,
+  `git flow-help` and the other `git-*` commands, plus the `pre-push` guard. Tests:
+  `tests/test_branch_flow.py`; runbook: [docs/branch-flow.md](docs/branch-flow.md).
+  Install: `python3 tools/branch-flow/branch_flow.py install`, then
+  `python3 ~/.local/share/orca-branch-flow/branch_flow.py install-repo <project>` per repository
 
 ### Instructions
 
@@ -100,7 +108,8 @@ reference and diffing. **Do not copy them back**; Orca restores its own versions
 
 Branch flow no longer changes how Orca works: Orca names workspaces and branches and picks
 the base as usual, and nothing is pushed or PR'd automatically. The skill, the
-`branch-flow.ts` panels and the `branch_flow.py` tooling only build stacked draft PRs
+`branch-flow.ts` panels and the `tools/branch-flow/branch_flow.py` tool (all in this
+repository) only build stacked draft PRs
 (child → parent → main) when the owner asks. A `pre-push` guard refuses force-pushes and
 branch deletion.
 
