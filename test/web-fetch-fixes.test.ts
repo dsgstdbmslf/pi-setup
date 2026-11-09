@@ -343,6 +343,48 @@ test("R12: every redirect target passes the same URL checks before it is fetched
 	await assert.rejects(fetchDirect(`${base}/chain/${MAX_REDIRECTS + 1}`), /Too many redirects/);
 });
 
+// ── R6: content types and budgets ───────────────────────────────────
+
+test("R6: missing-type HTML with a BOM is converted; a missing-type PDF gets the PDF budget", async () => {
+	const html = await fetchDirect(`${base}/bom-html`);
+	assert.equal(html.title, "Hello page");
+	assert.match(html.content, /Readable paragraph/);
+	assert.doesNotMatch(html.content, /<p>/);
+	const pdf = await fetchDirect(`${base}/nomime-pdf`);
+	assert.match(pdf.content, /^Pages: 1\n\nBig line$/);
+});
+
+test("R6: oversized generic text stops at 5MB; known and generic non-PDF binaries are refused unread", async () => {
+	await assert.rejects(fetchDirect(`${base}/nomime-big`), (e: FetchError) => !e.fallback && /too large \(over 5MB\)/.test(e.message));
+	for (const [path, type] of [["/image.pdf", "image/png"], ["/octet-text", "application/octet-stream"]]) {
+		await assert.rejects(fetchDirect(`${base}${path}`), (e: FetchError) => !e.fallback && e.message === `Unsupported content type: ${type}`);
+		for (let i = 0; i < 50 && !closed[path]; i++) await tick(10);
+		assert.equal(closed[path], true, `${path} body cancelled`);
+	}
+});
+
+// ── R7: Jina header ─────────────────────────────────────────────────
+
+test("R7: the Jina header is read line by line, with every warning", () => {
+	const normal = parseJina("Title: T\n\nURL Source: https://a.com/f\n\nMarkdown Content:\nbody", "https://a.com/");
+	assert.deepEqual(normal, { url: "https://a.com/f", title: "T", content: "body" });
+	const twoWarnings = "Title: T\nWarning: This page maybe requiring CAPTCHA\nWarning: Target URL returned error 403: Forbidden\n\nMarkdown Content:\nbody";
+	assert.throws(() => parseJina(twoWarnings, "u"), (e: FetchError) => e.status === 403);
+	assert.throws(() => parseJina("Warning: Target URL returned error 404: Not Found\nMarkdown Content:\nx", "u"), (e: FetchError) => e.status === 404);
+	const kept = parseJina("Title: T\nWarning: one\nWarning: two\n\nMarkdown Content:\nbody", "u");
+	assert.equal(kept.content, "> Warning from r.jina.ai: one\n> Warning from r.jina.ai: two\n\nbody");
+	const tricky = parseJina("Title: Why Markdown Content: matters\n\nMarkdown Content:\nreal body", "u");
+	assert.equal(tricky.title, "Why Markdown Content: matters");
+	assert.equal(tricky.content, "real body");
+	const crlf = parseJina("Title: T\r\nURL Source: https://a.com/c\r\n\r\nMarkdown Content:\r\nline1\r\nline2", "u");
+	assert.equal(crlf.url, "https://a.com/c");
+	assert.equal(crlf.title, "T");
+	assert.match(crlf.content, /^line1\r?\nline2$/);
+	assert.throws(() => parseJina("Title: T Markdown Content: x", "u"), /unexpected response format/);
+	assert.throws(() => parseJina("Title: T\n\nMarkdown Content:\nLoading...", "u"), /no readable content/);
+	assert.equal(parseJina("Markdown Content:\nok", "https://a.com/page").content, "ok");
+});
+
 // ── R11: IPv4-mapped IPv6 ───────────────────────────────────────────
 
 test("R11: IPv4-mapped IPv6 addresses get the decision of their IPv4 address in every spelling", async () => {

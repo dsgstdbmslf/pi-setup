@@ -116,27 +116,52 @@ export function checkUrl(url: string): URL {
 
 // ── Reading the body with a hard size limit ─────────────────────────
 
-/** Read a response body, aborting as soon as it exceeds `maxBytes` (Content-Length may be absent or wrong). */
-export async function readLimited(response: Response, maxBytes: number): Promise<Uint8Array> {
+const SNIFF_BYTES = 1024;
+
+/**
+ * Read a response body, aborting as soon as it exceeds the limit (Content-Length may be absent
+ * or wrong). `limit` may be a function of the first SNIFF_BYTES bytes; it may also throw to refuse.
+ */
+export async function readLimited(response: Response, limit: number | ((head: Uint8Array) => number)): Promise<Uint8Array> {
 	const declared = Number(response.headers.get("content-length"));
-	if (declared > maxBytes) {
+	const tooLarge = (max: number) => declared > max && new FetchError(`Response too large (${formatMB(declared)}, limit ${formatMB(max)})`, false);
+	let max = typeof limit === "number" ? limit : undefined;
+	const early = max !== undefined && tooLarge(max);
+	if (early) {
 		await cancelBody(response);
-		throw new FetchError(`Response too large (${formatMB(declared)}, limit ${formatMB(maxBytes)})`, false);
+		throw early;
 	}
-	if (!response.body) return new Uint8Array();
+	if (!response.body) {
+		if (typeof limit === "function") limit(new Uint8Array());
+		return new Uint8Array();
+	}
 	const reader = response.body.getReader();
 	const chunks: Uint8Array[] = [];
 	let total = 0;
-	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) break;
-		total += value.byteLength;
-		if (total > maxBytes) {
-			await reader.cancel().catch(() => {});
-			throw new FetchError(`Response too large (over ${formatMB(maxBytes)})`, false);
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (value) {
+				chunks.push(value);
+				total += value.byteLength;
+			}
+			if (max === undefined && (done || total >= SNIFF_BYTES)) {
+				max = (limit as (head: Uint8Array) => number)(concat(chunks, total));
+				const late = tooLarge(max);
+				if (late) throw late;
+			}
+			if (max !== undefined && total > max) throw new FetchError(`Response too large (over ${formatMB(max)})`, false);
+			if (done) break;
 		}
-		chunks.push(value);
+	} catch (err) {
+		await reader.cancel().catch(() => {});
+		throw err;
 	}
+	return concat(chunks, total);
+}
+
+function concat(chunks: Uint8Array[], total: number): Uint8Array {
+	if (chunks.length === 1) return chunks[0];
 	const out = new Uint8Array(total);
 	let pos = 0;
 	for (const c of chunks) {
@@ -186,16 +211,10 @@ function isTextMime(mime: string): boolean {
 /** Generic types that may hide a PDF; anything else that is not text is refused. */
 const GENERIC_MIME = new Set(["application/octet-stream", "binary/octet-stream", "application/download", "application/x-download", "application/force-download"]);
 
-export function looksLikePDF(bytes: Uint8Array): boolean {
-	return latin1Head(bytes, 1024).includes("%PDF-");
-}
+const PDF_MIME = new Set(["application/pdf", "application/x-pdf"]);
 
-function hasPdfSuffix(url: string): boolean {
-	try {
-		return new URL(url).pathname.toLowerCase().endsWith(".pdf");
-	} catch {
-		return false;
-	}
+export function looksLikePDF(bytes: Uint8Array): boolean {
+	return latin1Head(bytes, SNIFF_BYTES).includes("%PDF-");
 }
 
 // ── Content extraction ──────────────────────────────────────────────
@@ -441,20 +460,25 @@ async function readResponse(response: Response, chain: string[], signal?: AbortS
 	}
 	const contentType = response.headers.get("content-type") ?? "";
 	const mime = mimeOf(contentType);
-	// The declared type wins; the `.pdf` suffix and `%PDF-` magic only help for generic or missing types.
-	if (mime === "application/pdf" || mime === "application/x-pdf") {
-		return pdfToText(await readLimited(response, MAX_PDF_BYTES), finalUrl, signal);
-	}
-	const textual = !mime || isTextMime(mime);
-	const maybePdf = !mime || GENERIC_MIME.has(mime) || (!textual && hasPdfSuffix(finalUrl));
-	if (!textual && !maybePdf) {
+	// Declared PDF or text is trusted; a known other type is refused unread; a missing or generic
+	// type is sniffed from its first bytes (a PDF gets the PDF budget, generic non-PDF is refused).
+	const generic = !mime || GENERIC_MIME.has(mime);
+	if (!generic && !PDF_MIME.has(mime) && !isTextMime(mime)) {
 		await cancelBody(response);
 		throw new FetchError(`Unsupported content type: ${mime}`, false);
 	}
-	const bytes = await readLimited(response, maybePdf && (!textual || hasPdfSuffix(finalUrl)) ? MAX_PDF_BYTES : MAX_RESPONSE_BYTES);
-	if (maybePdf && looksLikePDF(bytes)) return pdfToText(bytes, finalUrl, signal);
-	if (!textual) throw new FetchError(`Unsupported content type: ${mime}`, false);
-	const html = mime.includes("html") || (!mime && /^\s*<(!doctype html|html)/i.test(latin1Head(bytes, 512)));
+	const bytes = await readLimited(
+		response,
+		!generic
+			? PDF_MIME.has(mime) ? MAX_PDF_BYTES : MAX_RESPONSE_BYTES
+			: (head) => {
+					if (looksLikePDF(head)) return MAX_PDF_BYTES;
+					if (mime) throw new FetchError(`Unsupported content type: ${mime}`, false);
+					return MAX_RESPONSE_BYTES;
+				},
+	);
+	if (PDF_MIME.has(mime) || (generic && looksLikePDF(bytes))) return pdfToText(bytes, finalUrl, signal);
+	const html = mime ? mime.includes("html") : /^\s*<(!doctype html|html)/i.test(decodeText(bytes.subarray(0, SNIFF_BYTES), ""));
 	const text = decodeText(bytes, contentType, html);
 	if (html) return htmlToMarkdown(text, finalUrl);
 	return { url: finalUrl, title: headingTitle(text) ?? urlTitle(finalUrl), content: text };
@@ -462,24 +486,33 @@ async function readResponse(response: Response, chain: string[], signal?: AbortS
 
 // ── Jina Reader fallback ────────────────────────────────────────────
 
-/** Parse r.jina.ai's text format: `Title:`, `URL Source:`, optional `Warning:`, then `Markdown Content:`. */
+/**
+ * Parse r.jina.ai's text format: header lines (`Title:`, `URL Source:`, any `Warning:`), then a
+ * line starting with `Markdown Content:` and the content.
+ */
 export function parseJina(body: string, url: string): FetchResult {
-	const marker = "Markdown Content:";
-	const start = body.indexOf(marker);
-	if (start < 0) throw new FetchError("unexpected response format", false);
-	const header = body.slice(0, start);
-	const field = (name: string) => new RegExp(`^${name}:[ \\t]*(.*)$`, "m").exec(header)?.[1].trim() || undefined;
-	const warning = field("Warning");
-	// Jina answers 200 even when the target failed; the target status is only in the warning.
-	const upstream = /returned error (\d{3})/i.exec(warning ?? "")?.[1];
-	if (upstream) throw new FetchError(`target returned HTTP ${upstream}`, false, Number(upstream));
-	const content = body.slice(start + marker.length).trim();
+	const marker = /^Markdown Content:/m.exec(body);
+	if (!marker) throw new FetchError("unexpected response format", false);
+	const fields: [string, string][] = [];
+	for (const line of body.slice(0, marker.index).split(/\r?\n/)) {
+		const m = /^([A-Za-z][\w -]*):[ \t]*(.*)$/.exec(line);
+		if (m && m[2].trim()) fields.push([m[1], m[2].trim()]);
+	}
+	const field = (name: string) => fields.find(([k]) => k === name)?.[1];
+	const warnings = fields.flatMap(([k, v]) => (k === "Warning" ? [v] : []));
+	// Jina answers 200 even when the target failed; the target status is only in a warning.
+	for (const warning of warnings) {
+		const upstream = /returned error (\d{3})/i.exec(warning)?.[1];
+		if (upstream) throw new FetchError(`target returned HTTP ${upstream}`, false, Number(upstream));
+	}
+	const content = body.slice(marker.index + marker[0].length).trim();
 	if (!content || /^(Loading\.\.\.|Please enable JavaScript)/i.test(content)) throw new FetchError("no readable content", false);
 	const source = field("URL Source");
+	const notes = warnings.map((w) => `> Warning from r.jina.ai: ${w}\n`).join("");
 	return {
 		url: source && /^https?:\/\//i.test(source) ? source : url,
 		title: field("Title") ?? headingTitle(content) ?? urlTitle(url),
-		content: warning ? `> Warning from r.jina.ai: ${warning}\n\n${content}` : content,
+		content: notes ? `${notes}\n${content}` : content,
 	};
 }
 
