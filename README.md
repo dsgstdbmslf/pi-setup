@@ -60,6 +60,28 @@ Do not install both ways at once, or the extension loads twice.
   (used only without a UI) and `timeoutSeconds` (on timeout the run stops); the UI is English or Russian (system locale, or `PI_ASK_LANG=en|ru`).
   Logic lives in `extensions/ask-user-question/`; tests: `npm test`
 
+- `tavily-keys.ts` — `/search-keys` command for the [Tavily](https://tavily.com) API
+  keys used by the web extensions: `/search-keys` (status) checks each key and its
+  remaining credits and clears marks of keys that have credits again, `reset` forgets
+  all marks, `init` creates the key file. Shared code for the web extensions lives in
+  `extensions/tavily/` (pi loads only `extensions/*.ts`, so it is not an extension by
+  itself; copy the folder too when installing single files): key pool with failover,
+  REST client, output capped at 32 KB with the full text saved to a temp file.
+
+  API keys live in `~/.pi/agent/api-keys.json`, outside the package, so `pi update`
+  never touches them. The file is shared by services (`{ "tavily": [...] }`); see
+  `api-keys.example.json`. Create it with `/search-keys init` (mode 600), then add
+  your keys from <https://app.tavily.com>. Never commit the real file: `.gitignore`
+  excludes `api-keys.json`.
+
+  Keys are used in file order. A key that runs out of credits (HTTP 432/433) is
+  skipped until the 1st of next month (UTC), an invalid key (401) until it changes,
+  a rate-limited key (429) until `Retry-After`; the request is retried at once with
+  the next key. Other errors fail without switching. Marks are kept in
+  `~/.pi/agent/api-keys-state.json` by key fingerprint, never the key; rate-limit
+  marks stay in memory and are shared by all web extensions of one pi process.
+  Tools that allow it fall back to Tavily's rate-limited keyless mode when no key works.
+
 ### Settings
 
 - `settings.json` — default provider/model, thinking levels, markdown, packages

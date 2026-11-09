@@ -1,0 +1,261 @@
+// Shared API key store with failover. No pi imports, so tests run without node_modules.
+//
+// Keys:  ~/.pi/agent/api-keys.json   { "<service>": ["key", { "key": "...", "label": "...", "disabled": true }] }
+// State: ~/.pi/agent/api-keys-state.json   which keys are exhausted or invalid, by fingerprint (never the key).
+
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+
+export const KEYS_FILE = "api-keys.json";
+export const STATE_FILE = "api-keys-state.json";
+
+export interface KeyEntry {
+	key: string;
+	label: string;
+	/** Fingerprint used in the state file and UI instead of the key itself. */
+	id: string;
+}
+
+export type MarkStatus = "exhausted" | "invalid" | "rate_limited";
+
+export interface Mark {
+	status: MarkStatus;
+	/** Epoch ms when the mark expires; null = until the key changes or is reset. */
+	until: number | null;
+	reason: string;
+}
+
+type State = Record<string, Record<string, Mark>>;
+
+export class KeyFileError extends Error {}
+
+export function fingerprint(key: string): string {
+	return createHash("sha256").update(key).digest("hex").slice(0, 12);
+}
+
+export function mask(key: string): string {
+	return key.length > 12 ? `${key.slice(0, 5)}…${key.slice(-4)}` : "…";
+}
+
+/** First day of the next month (UTC): when monthly credits are expected to reset. */
+export function nextMonthUtc(now: number): number {
+	const d = new Date(now);
+	return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+}
+
+export interface LoadedKeys {
+	entries: KeyEntry[];
+	/** The key file does not exist. */
+	missing: boolean;
+	/** The key file is readable by group or others. */
+	insecure: boolean;
+}
+
+export async function loadKeys(file: string, service: string): Promise<LoadedKeys> {
+	let text: string;
+	let insecure = false;
+	try {
+		text = await readFile(file, "utf8");
+		insecure = process.platform !== "win32" && ((await stat(file)).mode & 0o077) !== 0;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { entries: [], missing: true, insecure };
+		throw new KeyFileError(`Cannot read ${file}: ${(err as Error).message}`);
+	}
+	let data: unknown;
+	try {
+		data = JSON.parse(text);
+	} catch (err) {
+		// The parser message can quote file content, so keep only the position.
+		const where = /position \d+/.exec((err as Error).message)?.[0];
+		throw new KeyFileError(`${file} is not valid JSON${where ? ` (${where})` : ""}`);
+	}
+	const list = (data as Record<string, unknown> | null)?.[service];
+	if (list === undefined) return { entries: [], missing: false, insecure };
+	if (!Array.isArray(list)) throw new KeyFileError(`${file}: "${service}" must be an array of keys`);
+	const entries: KeyEntry[] = [];
+	const seen = new Set<string>();
+	list.forEach((item, i) => {
+		const obj = typeof item === "string" ? { key: item } : (item as { key?: unknown; label?: unknown; disabled?: unknown });
+		if (!obj || typeof obj.key !== "string" || obj.disabled === true) return;
+		const key = obj.key.trim();
+		if (!key || seen.has(key)) return;
+		seen.add(key);
+		const label = typeof obj.label === "string" && obj.label.trim() ? obj.label.trim() : `#${i + 1}`;
+		entries.push({ key, label, id: fingerprint(key) });
+	});
+	return { entries, missing: false, insecure };
+}
+
+async function readState(file: string): Promise<State> {
+	try {
+		const data = JSON.parse(await readFile(file, "utf8"));
+		return data && typeof data === "object" ? data : {};
+	} catch {
+		return {}; // missing or corrupt state only means "nothing marked"
+	}
+}
+
+async function writeState(file: string, state: State): Promise<void> {
+	await mkdir(dirname(file), { recursive: true });
+	const tmp = `${file}.${process.pid}.tmp`;
+	await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+	await rename(tmp, file);
+}
+
+/**
+ * Rate-limit marks in memory, shared by every KeyPool with the same state file and service.
+ * Pi loads each extension with its own module cache, so a module-level Map would not be
+ * shared between web-search, web-fetch and web-research; globalThis is.
+ */
+const COOLING = Symbol.for("pi-setup.tavily.cooling");
+
+function sharedCooling(stateFile: string, service: string): Map<string, Mark> {
+	const registry: Map<string, Map<string, Mark>> = ((globalThis as any)[COOLING] ??= new Map());
+	const id = `${stateFile}\0${service}`;
+	let map = registry.get(id);
+	if (!map) registry.set(id, (map = new Map()));
+	return map;
+}
+
+export interface PoolSnapshot {
+	available: KeyEntry[];
+	skipped: { entry: KeyEntry; mark: Mark }[];
+	missing: boolean;
+	insecure: boolean;
+}
+
+/** Keys of one service in file order, minus the ones marked unusable. */
+export class KeyPool {
+	/** Rate limits are short-lived, so they stay in memory (shared across extensions). */
+	private cooling: Map<string, Mark>;
+
+	readonly service: string;
+	readonly keysFile: string;
+	readonly stateFile: string;
+	private now: () => number;
+
+	constructor(service: string, keysFile: string, stateFile: string, now: () => number = Date.now) {
+		this.service = service;
+		this.keysFile = keysFile;
+		this.stateFile = stateFile;
+		this.now = now;
+		this.cooling = sharedCooling(stateFile, service);
+	}
+
+	async snapshot(): Promise<PoolSnapshot> {
+		const { entries, missing, insecure } = await loadKeys(this.keysFile, this.service);
+		const marks = (await readState(this.stateFile))[this.service] ?? {};
+		const t = this.now();
+		const available: KeyEntry[] = [];
+		const skipped: PoolSnapshot["skipped"] = [];
+		for (const entry of entries) {
+			const mark = [marks[entry.id], this.cooling.get(entry.id)].find((m) => m && (m.until === null || m.until > t));
+			if (mark) skipped.push({ entry, mark });
+			else available.push(entry);
+		}
+		return { available, skipped, missing, insecure };
+	}
+
+	async mark(entry: KeyEntry, mark: Mark): Promise<void> {
+		if (mark.status === "rate_limited") {
+			this.cooling.set(entry.id, mark);
+			return;
+		}
+		// Re-read before writing so several pi processes do not drop each other's marks.
+		const state = await readState(this.stateFile);
+		(state[this.service] ??= {})[entry.id] = mark;
+		await writeState(this.stateFile, state);
+	}
+
+	/** Clear marks for the given key ids, or all marks of this service. */
+	async clear(ids?: string[]): Promise<void> {
+		const state = await readState(this.stateFile);
+		const marks = state[this.service];
+		if (ids) ids.forEach((id) => this.cooling.delete(id));
+		else this.cooling.clear();
+		if (!marks) return;
+		for (const id of ids ?? Object.keys(marks)) delete marks[id];
+		if (Object.keys(marks).length === 0) delete state[this.service];
+		await writeState(this.stateFile, state);
+	}
+}
+
+// ---------- failover ----------
+
+export type Attempt<T> =
+	| { ok: true; value: T }
+	| { ok: false; status: number; message: string; retryAfter?: number };
+
+/** How a failed HTTP status affects the key. null: the request itself failed; do not switch keys. */
+export function verdictFor(status: number): MarkStatus | null {
+	if (status === 401) return "invalid";
+	if (status === 432 || status === 433) return "exhausted";
+	if (status === 429) return "rate_limited";
+	return null;
+}
+
+export class ApiError extends Error {
+	readonly status?: number;
+	constructor(message: string, status?: number) {
+		super(message);
+		this.status = status;
+	}
+}
+
+export interface RotationResult<T> {
+	value: T;
+	/** The key that succeeded; null in keyless mode. Never put it in tool output. */
+	key: string | null;
+	via: string;
+	/** Human-readable notes about switched keys and fallbacks. */
+	notes: string[];
+}
+
+export interface RotationOptions {
+	/** Fall back to a request without a key when no key works. */
+	keyless: boolean;
+	/** Called for every key switch, e.g. to notify the user. */
+	onNote?: (note: string) => void;
+	now?: () => number;
+}
+
+/**
+ * Try the available keys in order. Exhausted (432/433), invalid (401) and rate-limited (429)
+ * keys are marked and the next key is tried; any other failure is returned as is.
+ */
+export async function withRotation<T>(
+	pool: KeyPool,
+	run: (key: string | null) => Promise<Attempt<T>>,
+	opts: RotationOptions,
+): Promise<RotationResult<T>> {
+	const now = opts.now ?? Date.now;
+	const notes: string[] = [];
+	const note = (text: string) => {
+		notes.push(text);
+		opts.onNote?.(text);
+	};
+	const snap = await pool.snapshot();
+	for (const entry of snap.available) {
+		const res = await run(entry.key);
+		if (res.ok) return { value: res.value, key: entry.key, via: entry.label, notes };
+		const status = verdictFor(res.status);
+		if (!status) throw new ApiError(res.message, res.status);
+		const until =
+			status === "exhausted" ? nextMonthUtc(now()) : status === "rate_limited" ? now() + (res.retryAfter ?? 60) * 1000 : null;
+		await pool.mark(entry, { status, until, reason: `${res.status}: ${res.message}`.slice(0, 200) });
+		note(`${pool.service} key "${entry.label}" ${status.replace("_", "-")} (${res.status})`);
+	}
+
+	const total = snap.available.length + snap.skipped.length;
+	const why = snap.missing ? "no key file" : total === 0 ? "no keys configured" : "no usable keys";
+	if (!opts.keyless) {
+		throw new ApiError(
+			`${pool.service}: ${why}. Add keys to ${pool.keysFile} or check them with /search-keys.`,
+		);
+	}
+	const res = await run(null);
+	if (!res.ok) throw new ApiError(`${res.message} (keyless mode: ${why})`, res.status);
+	note(`${pool.service}: ${why}, used keyless mode`);
+	return { value: res.value, key: null, via: "keyless", notes };
+}

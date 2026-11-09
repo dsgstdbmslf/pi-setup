@@ -1,0 +1,7 @@
+{
+  "tavily": [
+    { "key": "tvly-YOUR_FIRST_KEY", "label": "main" },
+    { "key": "tvly-YOUR_SECOND_KEY", "label": "backup" },
+    { "key": "tvly-SPARE_KEY", "label": "spare", "disabled": true }
+  ]
+}
