@@ -8,14 +8,9 @@
  *
  * Read-only: it only runs `git flow-status` and `git flow-help` (orca-branch-flow).
  *
- * Skill auto-load: the branch-flow skill ships with `disable-model-invocation: true`, so it
- * is reachable everywhere through /skill:branch-flow but never listed for the agent. Before
- * each run this extension checks whether the working directory is a git repository with a
- * GitHub remote; only then it adds the skill's instructions (SKILL.md without frontmatter)
- * to the system prompt as the <branch_flow_skill> section. Local repositories (no GitHub
- * remote) and non-git folders do not get the section.
+ * The branch-flow skill is not loaded into the agent's context: the owner calls it with
+ * /skill:branch-flow when stacked PRs are wanted.
  */
-import { readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 
@@ -26,52 +21,14 @@ interface Panel {
 }
 
 const ENTRY = "branch-flow-panel";
-const SKILL = "branch-flow";
-const SECTION = "branch_flow_skill";
-const GITHUB_URL = /(^|[@/.])github\.com[:/]/i;
-
-function skillBody(filePath: string): string | undefined {
-	try {
-		const text = readFileSync(filePath, "utf-8").replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
-		if (!text) return undefined;
-		return [
-			`This repository has a GitHub remote, so pi loaded the ${SKILL} skill (${filePath}) automatically.`,
-			"Follow it for branch flow questions and operations; loading it authorizes no action by itself.",
-			"",
-			text,
-		].join("\n");
-	} catch {
-		return undefined;
-	}
-}
-
-async function hasGitHubRemote(pi: ExtensionAPI, cwd: string): Promise<boolean> {
-	try {
-		const res = await pi.exec("git", ["config", "--get-regexp", "^remote\\..*\\.(push)?url$"], { cwd, timeout: 5000 });
-		if (res.code !== 0) return false;
-		return res.stdout.split("\n").some((line) => GITHUB_URL.test(line.split(/\s+/)[1] ?? ""));
-	} catch {
-		return false;
-	}
-}
 
 export default function (pi: ExtensionAPI) {
-	pi.on("before_agent_start", async (event, ctx) => {
-		const { sections, skills } = event.systemPromptOptions;
-		delete sections[SECTION];
-		const skill = skills?.find((s) => s.name === SKILL);
-		if (!skill) return;
-		if (!(await hasGitHubRemote(pi, event.systemPromptOptions.cwd || ctx.cwd))) return;
-		const body = skillBody(skill.filePath);
-		if (body) sections[SECTION] = body;
-	});
-
 	pi.registerEntryRenderer<Panel>(ENTRY, (entry, _options, theme) => {
 		const data = entry.data ?? { title: "branch flow", body: "", failed: true };
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		box.addChild(new Text(theme.fg(data.failed ? "error" : "accent", theme.bold(data.title)), 0, 0));
 		const lines = data.body.split("\n").map((line) => {
-			if (/^(Требует внимания|С агентом|Журналы|Branch flow)/.test(line)) return theme.bold(line);
+			if (/^(Требует внимания|С агентом|Stacked PRs)/.test(line)) return theme.bold(line);
 			if (/^- /.test(line)) return theme.fg("warning", line);
 			return line;
 		});
@@ -80,11 +37,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("flow", {
-		description: "Branch flow: status of this project or menu (no model call)",
+		description: "Stacked PRs: status of this project or menu (no model call)",
 		getArgumentCompletions: (prefix) => {
 			const items = [
 				{ value: "status", label: "status", description: "дерево workspace, веток и PR текущего проекта (status <проект> — другого)" },
-				{ value: "help", label: "help", description: "все команды branch flow и операции /skill:branch-flow с описанием" },
+				{ value: "help", label: "help", description: "команды stacked PRs и операции /skill:branch-flow с описанием" },
 			].filter((x) => x.value.startsWith(prefix));
 			return items.length ? items : null;
 		},

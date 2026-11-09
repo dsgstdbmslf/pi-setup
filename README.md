@@ -52,9 +52,9 @@ Every item is tagged with how much it depends on Orca:
 ### Extensions
 
 - `branch-flow.ts` **[Orca-partial]** — `/flow` and `/flow status [project]` panels
-  (output of `git flow-help` / `git flow-status`) without calling the model; auto-loads
-  the branch-flow skill in repositories with a GitHub remote. Needs the branch-flow
-  tooling, which is itself coupled to Orca (see [Branch flow and Orca](#branch-flow-and-orca))
+  (output of `git flow-help` / `git flow-status`) without calling the model. Needs the
+  branch-flow tooling (see [Branch flow and Orca](#branch-flow-and-orca)); it does not
+  load the skill into the agent's context
 - `code-fence-hide.ts` **[Independent]** — renders fenced code blocks without the ```
   lines (like Claude Code); pair with `"markdown": { "codeBlockIndent": "" }`
 - `image-paste-markers.ts` **[Orca-partial]** — pasted screenshots show as `[Image #N]`
@@ -65,9 +65,10 @@ Every item is tagged with how much it depends on Orca:
 
 ### Skills
 
-- `branch-flow/` **[Orca-only]** — operating the Orca workspace ↔ GitHub branch flow
-  (publish, ship, merge, sync, status…); needs the `orca-branch-flow` tooling from the
-  orca-setup repo. See [Branch flow and Orca](#branch-flow-and-orca)
+- `branch-flow/` **[Orca-only]** — stacked PRs for Orca workspaces on request
+  (publish, ship, merge, sync, status…), called only with `/skill:branch-flow`; needs the
+  `orca-branch-flow` tooling from the orca-setup repo. See
+  [Branch flow and Orca](#branch-flow-and-orca)
 - `perplexity-research/` **[Orca-only]** — web research through Perplexity, driven in
   Orca's embedded browser by the Perplexity bridge from the orca-setup repo
   (`mcp/servers/perplexity`). The `cli.py` path points to an Orca workspace of that
@@ -76,7 +77,8 @@ Every item is tagged with how much it depends on Orca:
 ### Instructions
 
 - `instructions/AGENTS.md` **[Orca-only]** — Orca server context (headless server, Orca
-  browser and CLI, pasted images) and branch-flow rules; deployed as `~/orca/AGENTS.md`,
+  browser and CLI, pasted images) and git rules (no push/PR without the owner's request,
+  stacked PRs through the branch-flow commands); deployed as `~/orca/AGENTS.md`,
   which pi loads for every project under `~/orca`
 
 ### Settings
@@ -96,20 +98,16 @@ reference and diffing. **Do not copy them back**; Orca restores its own versions
 
 ## Branch flow and Orca
 
-The branch-flow skill, the `branch-flow.ts` extension and the underlying
-`branch_flow.py` tooling are currently **tightly coupled to Orca**: a workspace is an
-Orca worktree, and workspaces are created, found, listed and linked to PRs through the
-`orca` CLI.
+Branch flow no longer changes how Orca works: Orca names workspaces and branches and picks
+the base as usual, and nothing is pushed or PR'd automatically. The skill, the
+`branch-flow.ts` panels and the `branch_flow.py` tooling only build stacked draft PRs
+(child → parent → main) when the owner asks. A `pre-push` guard refuses force-pushes and
+branch deletion.
 
 Without Orca only the git/GitHub part works: `git publish`, `git sync-parent`,
-`git parent --set`, the `pre-push` guard, automatic PR chains and `git abandon`.
-These do not work without Orca: `new-workspace`/`child`/`top`, `ship`, `restore`,
-`move`, `rename`, `remove`, `orphans`, the workspace tree in `status`, and the
-`reconcile` cron job (it silently does nothing, because it only walks Orca worktrees).
-
-A standalone, Orca-independent workflow (plain `git worktree` backend selected
-automatically when Orca is absent) is planned; until then, use this part only on an
-Orca server.
+`git parent --set`, the `pre-push` guard and `git abandon`. These need Orca:
+`new-workspace`/`child`/`top`, `ship`, `restore`, `move`, `rename`, `remove`, `orphans`,
+the workspace tree in `status`, and `reconcile` (it walks Orca worktrees).
 
 ## Dependencies
 
