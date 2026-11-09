@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { crawlBody, extractBody, formatCrawl, formatExtract, formatMap, mapBody } from "../extensions/web-fetch/fetch.ts";
+import { MAX_PAGE_CHARS, crawlBody, extractBody, formatCrawl, formatExtract, formatMap, mapBody } from "../extensions/web-fetch/fetch.ts";
 
 test("extractBody: whole pages by default, chunks only with a query", () => {
 	assert.deepEqual(extractBody({ urls: ["https://a"] }), {
@@ -61,4 +61,17 @@ test("formatMap and formatCrawl", () => {
 	const c = formatCrawl({ base_url: "x.dev", results: [{ url: "https://x.dev/a", raw_content: "A" }] });
 	assert.equal(c.text, "1 page from x.dev\n\n## https://x.dev/a\n\nA");
 	assert.deepEqual(formatCrawl(undefined), { text: "No pages crawled.", count: 0 });
+});
+
+test("formatExtract and formatCrawl cut a very long page and mark it", () => {
+	const marker = `\n\n[page truncated at ${MAX_PAGE_CHARS} chars]`;
+	const long = "a".repeat(MAX_PAGE_CHARS + 5000);
+	const e = formatExtract({ results: [{ url: "https://a", raw_content: long }, { url: "https://b", raw_content: "b".repeat(MAX_PAGE_CHARS) }] });
+	assert.equal(e.text, `## https://a\n\n${"a".repeat(MAX_PAGE_CHARS)}${marker}\n\n---\n\n## https://b\n\n${"b".repeat(MAX_PAGE_CHARS)}`);
+	const c = formatCrawl({ base_url: "x.dev", results: [{ url: "https://x.dev/a", raw_content: long }] });
+	assert.ok(c.text.endsWith(marker));
+	assert.equal(c.text.length, "1 page from x.dev\n\n## https://x.dev/a\n\n".length + MAX_PAGE_CHARS + marker.length);
+	// never ends on half a surrogate pair
+	const emoji = formatExtract({ results: [{ url: "u", raw_content: `${"a".repeat(MAX_PAGE_CHARS - 1)}😀😀` }] });
+	assert.ok(!/[\ud800-\udbff]\n\n\[page/.test(emoji.text));
 });

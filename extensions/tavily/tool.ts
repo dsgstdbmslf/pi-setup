@@ -44,6 +44,8 @@ export interface RequestOptions {
 	/** Fall back to Tavily's keyless mode when no key works (search and extract only). */
 	keyless: boolean;
 	timeoutMs: number;
+	/** Response body cap in bytes; default MAX_RESPONSE_BYTES. */
+	maxBytes?: number;
 	signal?: AbortSignal;
 	ctx: ExtensionContext;
 }
@@ -58,7 +60,7 @@ export function createTavily(pi: ExtensionAPI) {
 
 	/** POST to Tavily with key failover; keyless fallback where Tavily allows it. */
 	function request(path: string, body: unknown, opts: RequestOptions) {
-		return withRotation(pool, (key) => call(path, key, { body, signal: opts.signal, timeoutMs: opts.timeoutMs }), {
+		return withRotation(pool, (key) => call(path, key, { body, signal: opts.signal, timeoutMs: opts.timeoutMs, maxBytes: opts.maxBytes }), {
 			keyless: opts.keyless,
 			onNote: (note) => opts.ctx.hasUI && opts.ctx.ui.notify(note, "warning"),
 		});

@@ -82,6 +82,9 @@ Do not install both ways at once, or the extension loads twice.
   never the key); rate-limit marks stay in memory and are shared by all web
   extensions of one pi process.
   Tools that allow it fall back to Tavily's rate-limited keyless mode when no key works.
+  Responses over 8 MiB (after decompression) are refused and the read is cancelled; error
+  texts are redacted (the key, `tvly-…` and `Bearer …` tokens) and shortened to 300 characters,
+  and a very long page is cut at 200,000 characters.
 
 - `web-search.ts` — `web_search` tool on Tavily: title, date, URL and the most
   relevant excerpts of each result, with filters by domain, date (`time_range`), topic

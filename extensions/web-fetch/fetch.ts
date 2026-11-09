@@ -66,8 +66,17 @@ function failures(data: any): string {
 	return failed.length ? `\n\nFailed:\n${failed.map((f) => `- ${f.url}: ${plain(f.error) || "error"}`).join("\n")}` : "";
 }
 
+/** One page is cut here, so memory and the saved full text stay bounded within the response budget. */
+export const MAX_PAGE_CHARS = 200_000;
+
+function pageText(raw: unknown): string {
+	const text = String(raw ?? "").trim();
+	if (text.length <= MAX_PAGE_CHARS) return text || "(empty)";
+	return `${text.slice(0, MAX_PAGE_CHARS).replace(/[\ud800-\udbff]$/, "")}\n\n[page truncated at ${MAX_PAGE_CHARS} chars]`;
+}
+
 function pages(results: any[]): string {
-	return results.map((r) => `## ${r.url}\n\n${String(r.raw_content ?? "").trim() || "(empty)"}`).join("\n\n---\n\n");
+	return results.map((r) => `## ${r.url}\n\n${pageText(r.raw_content)}`).join("\n\n---\n\n");
 }
 
 export function formatExtract(data: any): { text: string; count: number; failed: number } {

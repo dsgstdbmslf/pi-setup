@@ -18,7 +18,7 @@ import {
 	verdictFor,
 	withRotation,
 } from "../extensions/tavily/keys.ts";
-import { call, compact, credits, plain } from "../extensions/tavily/client.ts";
+import { MAX_ERROR_CHARS, call, compact, credits, plain, scrubSecrets } from "../extensions/tavily/client.ts";
 import { cleanupSaved, ensurePrivateDir, plural, sanitize, saveFull } from "../extensions/tavily/output.ts";
 
 const markFile = (stateDir: string, key: string) => join(stateDir, "tavily", `${fingerprint(key)}.json`);
@@ -588,4 +588,208 @@ test("snapshot() and clear() create nothing; only mark() does", async () => {
 	await assert.rejects(lstat(stateDir), { code: "ENOENT" });
 	await pool.mark(entryOf(KEY_A), markOf("invalid"));
 	assert.equal((await lstat(stateDir)).isDirectory(), true);
+});
+
+// ---------- error redaction, error cap, response budget ----------
+
+const SECRET = "tvly-dummy-secret-0001";
+const respond = (body: BodyInit | null, init: ResponseInit) => (async () => new Response(body, init)) as typeof fetch;
+const MIB = 1024 * 1024;
+
+test("call redacts the key from HTTP error text: JSON detail.error, detail string, plain body", async () => {
+	const json = { "content-type": "application/json" };
+	const bodies: [string, ResponseInit][] = [
+		[JSON.stringify({ detail: { error: `bad key ${SECRET}` } }), { status: 400, headers: json }],
+		[JSON.stringify({ detail: `bad key ${SECRET}` }), { status: 400, headers: json }],
+		[`bad key ${SECRET}`, { status: 400, headers: { "content-type": "text/plain" } }],
+		[`<b>bad</b> key ${SECRET}`, { status: 400, statusText: `echo ${SECRET}` }],
+	];
+	for (const [body, init] of bodies) {
+		const r = await call("/extract", SECRET, { timeoutMs: 1000, fetchImpl: respond(body, init) });
+		assert.ok(!r.ok);
+		assert.ok(!r.message.includes(SECRET), r.message);
+		assert.ok(!r.message.includes("tvly-dummy"), r.message);
+		assert.match(r.message, /^Tavily \/extract 400: .*\[redacted\]/);
+	}
+	// the statusText source
+	const r = await call("/extract", SECRET, { timeoutMs: 1000, fetchImpl: respond("", { status: 400, statusText: `echo ${SECRET}` }) });
+	assert.ok(!r.ok && !r.message.includes(SECRET) && r.message.includes("[redacted]"));
+});
+
+test("scrubSecrets removes bearer tokens and unrelated Tavily-looking keys", () => {
+	const out = scrubSecrets("auth Bearer abc.def failed; other tvly-xxxxxxxx and tvly-dev-1_2-3, short tvly-ab", null);
+	assert.ok(!out.includes("abc.def") && !out.includes("xxxxxxxx") && !out.includes("tvly-dev"), out);
+	assert.match(out, /Bearer \[redacted\] failed/);
+	assert.ok(out.includes("tvly-ab"), "too short to be a key");
+	assert.equal(scrubSecrets("a.b.c a.b.c", "a.b.c"), "[redacted] [redacted]", "the key is never a pattern");
+	assert.equal(scrubSecrets("x+y", "(x+y"), "x+y");
+});
+
+test("a cut can not leave a key fragment: the key is scrubbed before truncation", async () => {
+	const padding = "x".repeat(MAX_ERROR_CHARS - 5);
+	const body = JSON.stringify({ detail: { error: `${padding}${SECRET}` } });
+	const r = await call("/extract", SECRET, { timeoutMs: 1000, fetchImpl: respond(body, { status: 400 }) });
+	assert.ok(!r.ok);
+	assert.ok(!r.message.includes("tvly"), r.message);
+});
+
+test("withRotation never persists or throws a key, even if run() forgot to redact", async () => {
+	const { pool, stateDir } = await setup({ tavily: [SECRET, KEY_B] });
+	const leaky = (statuses: Record<string, number>) => async (key: string | null): Promise<Attempt<string>> => {
+		const status = statuses[key ?? "keyless"] ?? 200;
+		return status === 200
+			? { ok: true, value: `via ${key}` }
+			: { ok: false, status, message: `Tavily /search ${status}: key ${key} Bearer ${key} other tvly-abcdefgh` };
+	};
+	for (const status of [401, 432]) {
+		await pool.clear();
+		const r = await withRotation(pool, leaky({ [SECRET]: status }), { keyless: false });
+		assert.equal(r.via, "#2");
+		const mark = await readMark(stateDir, SECRET);
+		assert.ok(mark.reason.startsWith(`${status}: `));
+		assert.ok(!mark.reason.includes("tvly") && !mark.reason.includes(SECRET), mark.reason);
+		assert.match(mark.reason, /\[redacted\]/);
+	}
+	await pool.clear();
+	await assert.rejects(withRotation(pool, leaky({ [SECRET]: 400 }), { keyless: false }), (err: ApiError) => {
+		assert.equal(err.status, 400);
+		assert.ok(!err.message.includes("tvly"), err.message);
+		return true;
+	});
+	// keyless path
+	const keyless = await setup(undefined);
+	await assert.rejects(withRotation(keyless.pool, leaky({ keyless: 500 }), { keyless: true }), (err: ApiError) => {
+		assert.ok(!err.message.includes("tvly") && /keyless mode/.test(err.message));
+		return true;
+	});
+});
+
+test("HTTP error messages are bounded: 1 MiB JSON detail and 1 MiB text body, 400 and 500", async () => {
+	const huge = "y".repeat(MIB);
+	for (const status of [400, 500]) {
+		const bodies = [
+			JSON.stringify({ detail: { error: huge } }),
+			huge,
+			JSON.stringify({ detail: huge }),
+			`<p>${huge}</p>`,
+		];
+		for (const body of bodies) {
+			const r = await call("/extract", "tvly-k", { timeoutMs: 1000, fetchImpl: respond(body, { status }) });
+			assert.ok(!r.ok);
+			assert.ok(r.message.length <= 400, `${r.message.length}`);
+			assert.ok(r.message.startsWith(`Tavily /extract ${status}: `));
+			assert.ok(r.message.endsWith("…"));
+		}
+	}
+	// a quadratic-looking body is still cheap
+	const t = Date.now();
+	await call("/extract", null, { timeoutMs: 1000, fetchImpl: respond("<".repeat(60_000), { status: 400 }) });
+	assert.ok(Date.now() - t < 1000);
+});
+
+test("network error messages are bounded too", async () => {
+	const fetchImpl = (async () => {
+		throw new TypeError("z".repeat(MIB), { cause: new Error("c".repeat(MIB)) });
+	}) as typeof fetch;
+	await assert.rejects(call("/search", "tvly-k", { timeoutMs: 1000, fetchImpl }), (err: Error) => err.message.length <= 400);
+});
+
+/** A body stream that yields `chunks` and records pull/cancel. */
+function stream(chunks: Uint8Array[], opts: { hang?: boolean } = {}) {
+	const state = { pulls: 0, cancelled: false };
+	let i = 0;
+	const body = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			state.pulls++;
+			if (i < chunks.length) controller.enqueue(chunks[i++]);
+			else if (!opts.hang) controller.close();
+			else return new Promise(() => {});
+		},
+		cancel() {
+			state.cancelled = true;
+		},
+	});
+	return { body, state };
+}
+const enc = new TextEncoder();
+
+test("call refuses a response over maxBytes and cancels the stream", async () => {
+	const chunk = enc.encode("x".repeat(400));
+	const { body, state } = stream(Array(100).fill(chunk));
+	await assert.rejects(
+		call("/crawl", "tvly-k", { timeoutMs: 1000, maxBytes: 1024, fetchImpl: respond(body, { status: 200 }) }),
+		/Tavily \/crawl: response exceeds 1 KiB; narrow the request/,
+	);
+	assert.equal(state.cancelled, true);
+	assert.ok(state.pulls < 10, `stopped reading early (${state.pulls} pulls)`);
+});
+
+test("an oversized overflow is an error, not a failed attempt: keys are not rotated", async () => {
+	const { pool, stateDir } = await setup({ tavily: [KEY_A, KEY_B] });
+	const calls: (string | null)[] = [];
+	const run = (key: string | null) => {
+		calls.push(key);
+		return call("/crawl", key, { timeoutMs: 1000, maxBytes: 100, fetchImpl: respond("x".repeat(500), { status: 200 }) });
+	};
+	await assert.rejects(withRotation(pool, run, { keyless: true }), /response exceeds/);
+	assert.deepEqual(calls, [KEY_A]);
+	assert.deepEqual(await stateFiles(stateDir), []);
+});
+
+test("a declared Content-Length over the limit fails before reading", async () => {
+	const { body, state } = stream([enc.encode("{}")]);
+	await assert.rejects(
+		call("/map", "tvly-k", { timeoutMs: 1000, maxBytes: 1024, fetchImpl: respond(body, { status: 200, headers: { "content-length": "5000" } }) }),
+		/response exceeds/,
+	);
+	assert.ok(state.pulls <= 1, `${state.pulls} pulls`);
+	assert.equal(state.cancelled, true);
+});
+
+test("a multi-chunk body with a multibyte character split across chunks parses", async () => {
+	const bytes = enc.encode(JSON.stringify({ results: ["héllo wörld ✓ 日本語 😀"] }));
+	const chunks: Uint8Array[] = [];
+	for (let i = 0; i < bytes.length; i += 3) chunks.push(bytes.subarray(i, i + 3)); // splits every multibyte char
+	const { body } = stream(chunks);
+	const r = await call("/map", "tvly-k", { timeoutMs: 1000, maxBytes: bytes.length, fetchImpl: respond(body, { status: 200 }) });
+	assert.deepEqual(r, { ok: true, value: { results: ["héllo wörld ✓ 日本語 😀"] } });
+});
+
+test("a huge non-2xx body gives a bounded failed attempt, not an error", async () => {
+	const chunk = enc.encode('{"detail":{"error":"' + "e".repeat(8000));
+	const { body, state } = stream([chunk, ...Array(50).fill(chunk)]);
+	const r = await call("/extract", "tvly-k", { timeoutMs: 1000, fetchImpl: respond(body, { status: 432, headers: { "retry-after": "7" } }) });
+	assert.ok(!r.ok);
+	assert.equal(r.status, 432);
+	assert.equal(r.retryAfter, 7);
+	assert.ok(r.message.length <= 400);
+	assert.equal(state.cancelled, true);
+	assert.ok(state.pulls < 20, `${state.pulls} pulls`);
+	assert.equal(verdictFor(r.status), "exhausted");
+});
+
+test("a timeout while reading the body reports the timeout", async () => {
+	const keepAlive = setTimeout(() => {}, 5000);
+	const { body, state } = stream([enc.encode('{"a":')], { hang: true });
+	await assert.rejects(call("/map", "k", { timeoutMs: 30, fetchImpl: respond(body, { status: 200 }) }), /Tavily \/map: timed out after 0.03s/);
+	assert.equal(state.cancelled, true);
+	clearTimeout(keepAlive);
+});
+
+test("a caller abort while reading the body rethrows the abort error", async () => {
+	const ctrl = new AbortController();
+	const { body, state } = stream([enc.encode('{"a":')], { hang: true });
+	const p = call("/map", "k", { timeoutMs: 5000, signal: ctrl.signal, fetchImpl: respond(body, { status: 200 }) });
+	setTimeout(() => ctrl.abort(), 20);
+	await assert.rejects(p, { name: "AbortError" });
+	assert.equal(state.cancelled, true);
+});
+
+test("a body that is null is empty; the reader is released after a normal read", async () => {
+	const empty = await call("/map", "k", { timeoutMs: 1000, fetchImpl: respond(null, { status: 200 }) });
+	assert.deepEqual(empty, { ok: true, value: {} });
+	let resp!: Response;
+	const fetchImpl = (async () => (resp = new Response('{"ok":1}'))) as typeof fetch;
+	await call("/map", "k", { timeoutMs: 1000, fetchImpl });
+	assert.equal(resp.body?.locked, false);
 });
