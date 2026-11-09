@@ -7,6 +7,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { lstat, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { MAX_ERROR_CHARS, serverText, statusLabel } from "./client.ts";
 import { checkPrivateDir, ensurePrivateDir } from "./output.ts";
 
 export const KEYS_FILE = "api-keys.json";
@@ -318,13 +319,15 @@ export async function withRotation<T>(
 	for (const entry of snap.available) {
 		const res = await run(entry.key);
 		if (res.ok) return { value: res.value, key: entry.key, via: entry.label, notes };
+		// call() already vets server text; a custom run() may not, so judge it again before it is thrown.
+		const message = serverText(res.message, entry.key, MAX_ERROR_CHARS + 100) ?? `${pool.service}: request failed with ${res.status} (details withheld)`;
 		const status = verdictFor(res.status);
-		if (!status) throw new ApiError(res.message, res.status);
+		if (!status) throw new ApiError(message, res.status);
 		const until =
 			status === "exhausted" ? nextMonthUtc(now()) : status === "rate_limited" ? now() + (res.retryAfter ?? 60) * 1000 : null;
 		const what = `${pool.service} key "${entry.label}" ${status.replace("_", "-")} (${res.status})`;
 		try {
-			await pool.mark(entry, { status, until, reason: `${res.status}: ${res.message}`.slice(0, 200) });
+			await pool.mark(entry, { status, until, reason: `${res.status}: ${statusLabel(res.status)}` });
 			note(what);
 		} catch (err) {
 			// A failed state write must not stop the failover; the mark is only lost for later calls.
@@ -340,7 +343,10 @@ export async function withRotation<T>(
 		);
 	}
 	const res = await run(null);
-	if (!res.ok) throw new ApiError(`${res.message} (keyless mode: ${why})`, res.status);
+	if (!res.ok) {
+		const message = serverText(res.message, null, MAX_ERROR_CHARS + 100) ?? `${pool.service}: request failed with ${res.status} (details withheld)`;
+		throw new ApiError(`${message} (keyless mode: ${why})`, res.status);
+	}
 	note(`${pool.service}: ${why}, used keyless mode`);
 	return { value: res.value, key: null, via: "keyless", notes };
 }
