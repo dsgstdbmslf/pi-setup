@@ -32,7 +32,7 @@ const DNS_TIMEOUT_MS = 5_000;
 export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 export const MAX_PDF_BYTES = 20 * 1024 * 1024;
 export const MAX_PDF_PAGES = 100;
-const MAX_PDF_TEXT_CHARS = 2_000_000;
+export const MAX_PDF_TEXT_CHARS = 2_000_000;
 export const MAX_REDIRECTS = 10;
 const MAX_URL_LENGTH = 8192;
 const MAX_TITLE_CHARS = 200;
@@ -289,48 +289,100 @@ export function htmlToMarkdown(html: string, url: string): FetchResult {
 }
 
 type PdfItem = { str?: string; hasEOL?: boolean };
+type PdfDoc = Awaited<ReturnType<typeof import("unpdf").getDocumentProxy>>;
 
-/** PDF → text, page by page, keeping line breaks. Always destroys the PDF.js document. */
+function normalizeSpaces(text: string): string {
+	return text.replace(/[ \t]+/g, " ").replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n");
+}
+
+/** At most `max` UTF-16 units of `text`, never ending in half a surrogate pair. */
+function cutChars(text: string, max: number): string {
+	const cut = text.slice(0, max);
+	return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+
+/**
+ * The text of one page, keeping line breaks. Stops reading items once the text cannot fit in
+ * `room` characters; `cut` says whether anything was left out.
+ */
+function pageText(items: PdfItem[], room: number): { text: string; cut: boolean } {
+	// Whitespace collapses, so the raw text may run ahead of the budget before it is normalized.
+	const slack = 2 * room + 1024;
+	let text = "";
+	for (const item of items) {
+		text += (item.str ?? "").slice(0, slack) + (item.hasEOL ? "\n" : "");
+		if (text.length > slack) {
+			text = normalizeSpaces(text);
+			if (text.trim().length > room) break;
+		}
+	}
+	text = normalizeSpaces(text).trim();
+	return text.length > room ? { text: cutChars(text, room).trimEnd(), cut: true } : { text, cut: false };
+}
+
+/**
+ * PDF → text, page by page, keeping line breaks. Destroys the PDF.js document when done, failed
+ * or aborted. Cancellation is cooperative: it is checked around every PDF.js call, but PDF.js work
+ * already running in this process is not interrupted.
+ */
 export async function pdfToText(
 	bytes: Uint8Array,
 	url: string,
 	signal?: AbortSignal,
-	open?: (bytes: Uint8Array) => ReturnType<typeof import("unpdf").getDocumentProxy>,
+	open?: (bytes: Uint8Array) => Promise<PdfDoc>,
 ): Promise<FetchResult> {
-	const pdf = await (open ?? (await import("unpdf")).getDocumentProxy)(bytes);
+	signal?.throwIfAborted();
+	const opening = (open ?? (await import("unpdf")).getDocumentProxy)(bytes);
+	let pdf: PdfDoc;
 	try {
-		const info = (await pdf.getMetadata()).info as Record<string, unknown> | undefined;
+		pdf = await abortable(opening, signal);
+	} catch (err) {
+		// Given up on (abort): destroy the document should it still open.
+		opening.then((late) => late.loadingTask.destroy()).catch(() => {});
+		throw err;
+	}
+	let destroyed: Promise<void> | undefined;
+	const destroy = () => (destroyed ??= pdf.loadingTask.destroy().catch(() => {}));
+	signal?.addEventListener("abort", destroy, { once: true });
+	try {
+		const info = (await abortable(pdf.getMetadata(), signal)).info as Record<string, unknown> | undefined;
 		const title = (typeof info?.Title === "string" && info.Title.trim()) || urlTitle(url);
 		const pages = Math.min(pdf.numPages, MAX_PDF_PAGES);
 		const parts: string[] = [];
-		let chars = 0;
+		let chars = 0; // of the joined text below, page separators included
+		let cut = false;
 		let done = 0;
-		for (let i = 1; i <= pages && chars < MAX_PDF_TEXT_CHARS; i++) {
+		for (let i = 1; i <= pages && !cut; i++) {
 			signal?.throwIfAborted();
-			const page = await pdf.getPage(i);
+			const page = await abortable(pdf.getPage(i), signal);
 			try {
-				const items = (await page.getTextContent()).items as PdfItem[];
-				const text = items
-					.map((item) => (item.str ?? "") + (item.hasEOL ? "\n" : ""))
-					.join("")
-					.replace(/[ \t]+/g, " ")
-					.replace(/ ?\n ?/g, "\n")
-					.replace(/\n{3,}/g, "\n\n")
-					.trim();
-				if (text) parts.push(text);
-				chars += text.length;
+				const items = (await abortable(page.getTextContent(), signal)).items as PdfItem[];
+				const sep = parts.length ? 2 : 0;
+				const r = pageText(items, Math.max(0, MAX_PDF_TEXT_CHARS - chars - sep));
+				if (r.text) {
+					parts.push(r.text);
+					chars += sep + r.text.length;
+				}
+				cut = r.cut;
 			} finally {
-				page.cleanup();
+				try {
+					page.cleanup();
+				} catch {}
 			}
 			done = i;
 		}
+		signal?.throwIfAborted();
 		const notes: string[] = [];
-		if (done < pdf.numPages) notes.push(`text of the first ${done} pages only (limit ${MAX_PDF_PAGES} pages, ${MAX_PDF_TEXT_CHARS} characters)`);
+		if (cut) notes.push(`text cut at ${MAX_PDF_TEXT_CHARS} characters, on page ${done}`);
+		else if (done < pdf.numPages) notes.push(`text of the first ${done} pages only (limit ${MAX_PDF_PAGES} pages)`);
 		if (!parts.length) notes.push("no text layer found (scanned or image-only PDF?); OCR is not performed");
 		const head = `Pages: ${pdf.numPages}${notes.length ? ` (${notes.join("; ")})` : ""}`;
 		return { url, title, content: parts.length ? `${head}\n\n${parts.join("\n\n")}` : head };
 	} finally {
-		await pdf.loadingTask.destroy().catch(() => {});
+		signal?.removeEventListener("abort", destroy);
+		// After an abort, start the cleanup but do not wait for it.
+		if (signal?.aborted) destroy();
+		else await destroy();
 	}
 }
 
@@ -594,8 +646,13 @@ function clean(result: FetchResult, via: FetchOutcome["via"]): FetchOutcome {
 	};
 }
 
+/**
+ * The deadline is cooperative: waiting on HTTP, DNS and the model stops at it, but parsing that is
+ * already running in this process (HTML, PDF) finishes its current step first.
+ */
 export async function fetchAndExtract(url: string, opts: FetchOptions): Promise<FetchOutcome> {
-	checkUrl(url);
+	url = checkUrl(url).href;
+	opts.signal?.throwIfAborted();
 	const deadline = AbortSignal.timeout(OPERATION_TIMEOUT_MS);
 	const signal = AbortSignal.any([deadline, ...(opts.signal ? [opts.signal] : [])]);
 	try {
@@ -611,7 +668,9 @@ async function run(url: string, opts: FetchOptions, signal: AbortSignal): Promis
 	const { direct = fetchDirect, viaJina = fetchViaJina, guard = privateReason } = opts;
 	let error: FetchError;
 	try {
-		return clean(await direct(url, signal), "direct");
+		const result = await direct(url, signal);
+		signal.throwIfAborted();
+		return clean(result, "direct");
 	} catch (err) {
 		signal.throwIfAborted();
 		if (!(err instanceof FetchError)) throw err;
@@ -637,7 +696,9 @@ async function run(url: string, opts: FetchOptions, signal: AbortSignal): Promis
 	if (!skip) {
 		try {
 			// Ask for the last known hop, so Jina does not have to replay the redirects.
-			return clean(await viaJina(chain[chain.length - 1], signal), "jina");
+			const result = await viaJina(chain[chain.length - 1], signal);
+			signal.throwIfAborted();
+			return clean(result, "jina");
 		} catch (err) {
 			signal.throwIfAborted();
 			if (!(err instanceof FetchError)) throw err;
