@@ -1,7 +1,8 @@
 // Show pasted screenshots as "[Image #N]" (like Claude Code) instead of raw file paths,
 // and attach the image itself to the prompt.
 //
-// - Editor: a pasted /tmp/orca-paste-*.png (or pi-clipboard-*) path becomes "[Image #N]".
+// - Editor: a pasted image path (pi-clipboard-*, or <app>-paste-* saved by a terminal app)
+//   becomes "[Image #N]".
 // - Submit: the marker expands to "[Image #N: /path]" so the model still knows the path,
 //   and the file is attached as an image block (input event; also covers typed paths).
 // - Chat: user messages render "[Image #N: /path]" as "[Image #N]" (display-only).
@@ -11,9 +12,10 @@ import { readFile, stat } from "node:fs/promises";
 import { extname } from "node:path";
 
 const IMG_EXT = "png|jpe?g|gif|webp";
-// Paths produced by Orca image paste and pi's own clipboard paste.
+// Paths produced by pi's own clipboard paste and by terminal apps that save pasted
+// images as <app>-paste-<id>.<ext>.
 const PASTE_PATH = new RegExp(
-  String.raw`(?:/[^\s'"\]]*/)?(?:orca-paste|pi-clipboard)-[A-Za-z0-9-]+\.(?:${IMG_EXT})`,
+  String.raw`(?:/[^\s'"\]]*/)?(?:[A-Za-z0-9]+-paste|pi-clipboard)-[A-Za-z0-9-]+\.(?:${IMG_EXT})`,
   "gi",
 );
 const BARE_MARKER = /\[Image #(\d+)\]/g;
