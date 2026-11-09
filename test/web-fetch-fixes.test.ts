@@ -709,10 +709,26 @@ test("R9: usage of a finished model call survives every later outcome", async ()
 	});
 });
 
+test("S4: a truncated preview lists the remaining headings with their line numbers in the saved file", async () => {
+	const body = Array.from({ length: 30 }, (_, i) => `## Part ${i}\n\n${"word ".repeat(200)}`).join("\n\n");
+	await withTool(async (tool) => {
+		await withFetch(jinaPage(body), async () => {
+			const r = await tool.execute("id", { url: PUBLIC_URL }, undefined, undefined, ctxReplying("PUBLIC"));
+			const text: string = r.content[0].text;
+			assert.ok(Buffer.byteLength(text) < 14 * 1024);
+			const m = /Remaining headings \(line numbers in the full text\):\n(L(\d+) ## Part (\d+))/.exec(text);
+			assert.ok(m, text.slice(-500));
+			const saved = (await readFile(r.details.fullOutputPath, "utf8")).split("\n");
+			assert.equal(saved[Number(m[2]) - 1], `## Part ${m[3]}`);
+			assert.match(text, /L\d+ ## Part 29$/);
+		});
+	});
+});
+
 test("S3: the description is one line naming the preview and the saved extracted text", async () => {
 	await withTool(async (tool) => {
 		assert.doesNotMatch(tool.description, /\n/);
-		assert.match(tool.description, /32KB\/1000-line preview plus a truncation note; full extracted text is saved when truncated/);
+		assert.match(tool.description, /12KB\/400-line preview plus a truncation note; full extracted text is saved when truncated, with the line numbers of the remaining headings/);
 		assert.doesNotMatch(tool.description, /capped/);
 	});
 });

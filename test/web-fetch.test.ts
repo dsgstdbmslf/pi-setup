@@ -31,6 +31,7 @@ import {
 	htmlToMarkdown,
 	isPrivateIP,
 	isSecretParam,
+	outline,
 	parseJina,
 	pdfToText,
 	preview,
@@ -287,6 +288,23 @@ test("m2: relative links and images are resolved against the page URL and <base>
 	assert.doesNotMatch(md, /#top/);
 	const withBase = `<html><head><base href="https://cdn.example/x/"></head><body><article>${"<p>Some long enough text here. </p>".repeat(30)}<a href="y">Y</a></article></body></html>`;
 	assert.match(htmlToMarkdown(withBase, "https://a.com/p").content, /\[Y\]\(https:\/\/cdn\.example\/x\/y\)/);
+});
+
+test("htmlToMarkdown saves tokens: same-page links, permalinks, utm parameters, decorative images", () => {
+	const html = `<html><body><article>${"<p>Some long enough text here. </p>".repeat(30)}<h2>Intro<a href="#intro">#</a></h2><h3>Usage <a href="page.html#u">¶</a></h3>
+		<p><a href="page.html#opts">options</a> <a href="/other?utm_source=x&amp;id=2#s">other</a> <img src="/icon.svg"> <img src="/d.png?utm_medium=y" alt="diagram"></p></article></body></html>`;
+	const md = htmlToMarkdown(html, "https://a.com/page.html?utm_campaign=z").content;
+	assert.match(md, /^## Intro$/m);
+	assert.match(md, /^### Usage *$/m);
+	assert.match(md, /options \[other\]\(https:\/\/a\.com\/other\?id=2#s\) +!\[diagram\]\(https:\/\/a\.com\/d\.png\)/);
+	assert.doesNotMatch(md, /icon\.svg|utm_|page\.html/);
+});
+
+test("outline lists headings from a line on, skipping code fences, with a cap", () => {
+	const text = ["# A", "x", "## B", "```sh", "# not a heading", "```", "### C", "#nospace", "## D"].join("\n");
+	assert.deepEqual(outline(text, 2, 10), ["L3 ## B", "L7 ### C", "L9 ## D"]);
+	assert.deepEqual(outline(text, 1, 2), ["L1 # A", "L3 ## B", "… 2 more headings"]);
+	assert.deepEqual(outline(text, 10, 5), []);
 });
 
 test("htmlToMarkdown flags JS-rendered shells", () => {

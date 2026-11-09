@@ -13,12 +13,14 @@ import {
 	resolveChoice,
 	saveChoice,
 } from "./web-fetch/classify.ts";
-import { cleanupSaved, fetchAndExtract, preview, sanitize, saveFullText } from "./web-fetch/logic.ts";
+import { cleanupSaved, fetchAndExtract, outline, preview, sanitize, saveFullText } from "./web-fetch/logic.ts";
 import { filterChoices, pickClassifier } from "./web-fetch/picker.ts";
 
-// Output cap for the agent's context (~8k tokens). The full text goes to a temp file.
-const MAX_BYTES = 32 * 1024;
-const MAX_LINES = 1000;
+// Output cap for the agent's context (~3k tokens). The full text goes to a temp file; the
+// headings after the preview point into it, so the agent can read only the part it needs.
+const MAX_BYTES = 12 * 1024;
+const MAX_LINES = 400;
+const MAX_OUTLINE = 40;
 
 interface Details {
 	url: string;
@@ -81,7 +83,7 @@ export default function webFetch(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "web_fetch",
 		label: "web_fetch",
-		description: `Fetch HTML, PDF or text as markdown. Returns a ${MAX_BYTES / 1024}KB/${MAX_LINES}-line preview plus a truncation note; full extracted text is saved when truncated.`,
+		description: `Fetch HTML, PDF or text as markdown. Returns a ${MAX_BYTES / 1024}KB/${MAX_LINES}-line preview plus a truncation note; full extracted text is saved when truncated, with the line numbers of the remaining headings.`,
 		promptSnippet: "Fetch a web page or PDF as markdown",
 		parameters: Type.Object({ url: Type.String({ description: "http(s) URL" }) }),
 
@@ -110,6 +112,9 @@ export default function webFetch(pi: ExtensionAPI) {
 					const file = await saveFullText(full);
 					details.fullOutputPath = file;
 					text += `\n\n[Truncated: ${p.shownLines} of ${p.totalLines} lines (${formatSize(p.shownBytes)} of ${formatSize(p.totalBytes)}). Full text: ${file}]`;
+					// The last shown line may be cut, so its heading (if any) is listed again.
+					const rest = outline(full, p.shownLines, MAX_OUTLINE);
+					if (rest.length) text += `\nRemaining headings (line numbers in the full text):\n${rest.join("\n")}`;
 				}
 				signal?.throwIfAborted();
 				return { content: [{ type: "text", text }], details, usage };

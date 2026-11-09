@@ -65,12 +65,15 @@ Do not install both ways at once, or the extension loads twice.
   returns markdown (Readability + Turndown for HTML, `unpdf` for PDF, text as is). Logic
   lives in `extensions/web-fetch/`; needs the package's npm dependencies, which
   `pi install` installs.
-  - Output: the agent gets a preview of at most 1000 lines / 32KB plus a short truncation
-    note. Only when the preview cuts something is the full *extracted* text saved to a
+  - Output: the agent gets a preview of at most 400 lines / 12KB (about 3k tokens) plus a
+    short truncation note listing the remaining headings (up to 40) with their line numbers
+    in the saved file. Only when the preview cuts something is the full *extracted* text saved to a
     private temp dir (`/tmp/pi-web-fetch-*/page.md`) the agent can `read` (for a PDF that
     hit its text cap, this is the capped extract, not the whole PDF). Saved pages older
     than a day are removed at a later session start, not at an exact time. Links and
-    images are made absolute; terminal escape sequences are stripped.
+    images are made absolute, without `utm_*` parameters; links to the same page, heading
+    permalinks (`#`, `¶`) and images without alt text are dropped to save tokens; terminal
+    escape sequences are stripped.
   - Limits: body 5MB (PDF 20MB), read while streaming. The declared type decides: PDF and
     text types are read, other known types (images, archives...) are refused unread; a
     missing or generic type is sniffed from its first bytes (`%PDF-` gets the PDF budget).

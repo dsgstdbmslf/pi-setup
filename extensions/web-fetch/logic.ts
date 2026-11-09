@@ -220,14 +220,21 @@ export function looksLikePDF(bytes: Uint8Array): boolean {
 // ── Content extraction ──────────────────────────────────────────────
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
-// Token savers: no link titles (they repeat the text), in-page anchors become plain text.
+// Token savers: no link titles (they repeat the text), in-page anchors become plain text and
+// heading permalinks (`#`, `¶`) disappear, images without alt text (decorative) are dropped.
+const PERMALINK = /^\s*(#|¶|§|🔗|link|permalink)\s*$/i;
 turndown.addRule("compactLinks", {
 	filter: (node) => node.nodeName === "A" && !!node.getAttribute("href"),
 	replacement: (text, node) => {
 		const href = (node as HTMLElement).getAttribute("href") ?? "";
 		if (!text.trim()) return "";
-		return href.startsWith("#") || href.startsWith("javascript:") ? text : `[${text}](${href.replace(/[()]/g, "\\$&")})`;
+		if (!href.startsWith("#") && !href.startsWith("javascript:")) return `[${text}](${href.replace(/[()]/g, "\\$&")})`;
+		return PERMALINK.test(text.replace(/\\/g, "")) ? "" : text;
 	},
+});
+turndown.addRule("decorativeImages", {
+	filter: (node) => node.nodeName === "IMG" && !node.getAttribute("alt")?.trim(),
+	replacement: () => "",
 });
 
 export function isLikelyJSRendered(html: string): boolean {
@@ -271,8 +278,19 @@ function checkComplexity(root: Node): void {
 	}
 }
 
-/** Make link and image URLs absolute against the page URL (or its `<base href>`). */
+/** Same URL without the fragment and without `utm_*` tracking parameters. */
+function untracked(url: URL): URL {
+	for (const name of [...url.searchParams.keys()]) if (/^utm_/i.test(name)) url.searchParams.delete(name);
+	return url;
+}
+
+/**
+ * Make link and image URLs absolute against the page URL (or its `<base href>`), drop `utm_*`
+ * parameters, and turn links to this same page into `#fragment` (rendered as plain text).
+ */
 function absolutizeLinks(document: Document, pageUrl: string): void {
+	const page = untracked(new URL(pageUrl));
+	page.hash = "";
 	let base = pageUrl;
 	const baseHref = document.querySelector("base[href]")?.getAttribute("href");
 	if (baseHref) {
@@ -285,7 +303,10 @@ function absolutizeLinks(document: Document, pageUrl: string): void {
 			const value = el.getAttribute(attr)?.trim();
 			if (!value || value.startsWith("#") || /^(javascript|data|mailto|tel):/i.test(value)) continue;
 			try {
-				el.setAttribute(attr, new URL(value, base).href);
+				const abs = untracked(new URL(value, base));
+				const hash = abs.hash;
+				abs.hash = "";
+				el.setAttribute(attr, attr === "href" && abs.href === page.href ? hash || "#" : abs.href + hash);
 			} catch {}
 		}
 	}
@@ -795,6 +816,26 @@ export function preview(text: string, maxBytes: number, maxLines: number): Previ
 		shownLines: out.split("\n").length,
 		totalLines: lines.length,
 	};
+}
+
+/**
+ * Markdown headings (outside code fences) from line `fromLine` (1-based) on, as `L<n> <heading>`,
+ * so the agent can read the saved file at the right offset. At most `max` entries, then a count.
+ */
+export function outline(text: string, fromLine: number, max: number): string[] {
+	const out: string[] = [];
+	let fence: string | undefined;
+	let more = 0;
+	text.split("\n").forEach((line, i) => {
+		const f = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+		if (f && (!fence || (f[0] === fence[0] && f.length >= fence.length))) fence = fence ? undefined : f;
+		else if (!fence && i + 1 >= fromLine && /^#{1,6}\s+\S/.test(line)) {
+			if (out.length < max) out.push(`L${i + 1} ${line.length > 120 ? `${line.slice(0, 119)}…` : line}`);
+			else more++;
+		}
+	});
+	if (more) out.push(`… ${more} more headings`);
+	return out;
 }
 
 export const SAVED_PREFIX = "pi-web-fetch-";
