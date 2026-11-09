@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { test } from "node:test";
 import {
 	type Question,
@@ -44,6 +45,7 @@ test("single-select pick replaces the choice and clears custom text", () => {
 	const st = newState();
 	st.other = "custom";
 	pick(single, st, 1);
+	assert.deepEqual(answersOf(single, st), [{ type: "option", label: "MySQL", value: "my", index: 2 }]);
 	pick(single, st, 0);
 	assert.deepEqual(answersOf(single, st), [{ type: "option", label: "PG", value: "PG", index: 1 }]);
 });
@@ -55,7 +57,7 @@ test("multi-select toggles, sorts, and appends custom text last", () => {
 	st.other = "SQLite";
 	assert.deepEqual(answersOf(multi, st).map((a) => a.type + ":" + a.label), ["option:PG", "option:MySQL", "other:SQLite"]);
 	pick(multi, st, 0);
-	assert.equal(answersOf(multi, st).length, 2);
+	assert.deepEqual(answersOf(multi, st).map((a) => a.label), ["MySQL", "SQLite"]);
 });
 
 test("text mode answers come from trimmed text only", () => {
@@ -77,6 +79,7 @@ test("fillDefaults keeps given answers, fills the rest, fails without a default"
 	const given = [{ type: "text" as const, label: "Ann", value: "Ann" }];
 	const withDefault = { ...single, defaultAnswer: "PG" };
 	const r = fillDefaults([text, withDefault], [given, []])!;
+	assert.deepEqual(r[0].answers, given);
 	assert.equal(r[0].usedDefault, undefined);
 	assert.equal(r[1].usedDefault, true);
 	assert.equal(r[1].answers[0].label, "PG");
@@ -127,10 +130,12 @@ const base = { questions: [single], hasUI: true, S: getStrings({}) };
 test("runAsk: abort while the dialog is pending/queued settles as cancelled", async () => {
 	const ac = new AbortController();
 	const p = runAsk({ ...base, signal: ac.signal, ask: () => new Promise(() => {}), abort: () => {} });
+	assert.equal(getEventListeners(ac.signal, "abort").length, 1);
 	ac.abort();
 	const r = await p;
 	assert.equal(r.details.status, "cancelled");
 	assert.equal("terminate" in r, false);
+	assert.equal(getEventListeners(ac.signal, "abort").length, 0);
 });
 
 test("runAsk: already aborted never opens the dialog", async () => {
@@ -143,24 +148,35 @@ test("runAsk: already aborted never opens the dialog", async () => {
 });
 
 test("runAsk: timeout aborts the whole run and sets terminate, no default used", async () => {
+	const ac = new AbortController();
 	let aborted = 0;
 	const r = await runAsk({
 		...base,
 		questions: [{ ...single, defaultAnswer: "PG" }],
+		signal: ac.signal,
 		ask: async () => ({ status: "timeout", answers: [[]] }),
-		abort: () => aborted++,
+		abort: () => {
+			aborted++;
+			ac.abort();
+		},
 	});
 	assert.equal(aborted, 1);
 	assert.equal((r as any).terminate, true);
 	assert.equal(r.details.status, "cancelled");
 	assert.deepEqual(r.details.results, []);
+	assert.deepEqual(r.content, [{ type: "text", text: base.S.timedOut }]);
 });
 
 test("runAsk: answered, and no-UI falls back to defaults or reports unavailable", async () => {
-	const answers = [[{ type: "option" as const, label: "PG", value: "PG", index: 1 }]];
+	const answers = [[{ type: "option" as const, label: "MySQL", value: "my", index: 2 }]];
 	const ok = await runAsk({ ...base, ask: async () => ({ status: "done", answers }), abort: () => {} });
 	assert.equal(ok.details.status, "answered");
-	const noUi = { ...base, hasUI: false, ask: async () => ({ status: "done" as const, answers: [] }), abort: () => {} };
+	assert.deepEqual(ok.details.results[0].answers, answers[0]);
+	assert.deepEqual(ok.content, [{ type: "text", text: "User selected: 2. MySQL (value: my)" }]);
+	const noUi = { ...base, hasUI: false, ask: async (): Promise<never> => assert.fail("no UI must not open a dialog"), abort: () => {} };
 	assert.equal((await runAsk(noUi)).details.status, "unavailable");
-	assert.equal((await runAsk({ ...noUi, questions: [{ ...single, defaultAnswer: "PG" }] })).details.status, "answered");
+	const defaulted = await runAsk({ ...noUi, questions: [{ ...single, defaultAnswer: "PG" }] });
+	assert.equal(defaulted.details.status, "answered");
+	assert.equal(defaulted.details.results[0].usedDefault, true);
+	assert.equal(defaulted.details.results[0].answers[0].label, "PG");
 });
