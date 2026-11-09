@@ -1,13 +1,11 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { type ExtensionAPI, formatSize, getAgentDir, truncateHead } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, formatSize, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
 	AUTO,
 	type Choice,
 	ENV_VAR,
+	type Usage,
 	classifyUrl,
 	configPath,
 	findModel,
@@ -15,7 +13,7 @@ import {
 	resolveChoice,
 	saveChoice,
 } from "./web-fetch/classify.ts";
-import { fetchAndExtract } from "./web-fetch/logic.ts";
+import { FetchError, cleanupSaved, fetchAndExtract, preview, sanitize, saveFullText } from "./web-fetch/logic.ts";
 import { filterChoices, pickClassifier } from "./web-fetch/picker.ts";
 
 // Output cap for the agent's context (~8k tokens). The full text goes to a temp file.
@@ -30,11 +28,16 @@ interface Details {
 	fullOutputPath?: string;
 }
 
+function message(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
 export default function webFetch(pi: ExtensionAPI) {
 	const configFile = configPath(getAgentDir());
 	// Completions get no ctx, so keep the model list from the session start.
 	let known: Choice[] = [{ value: AUTO, kind: "auto" }];
 	pi.on("session_start", async (_event, ctx) => {
+		void cleanupSaved(); // saved pages older than a day
 		known = await listChoices(ctx.modelRegistry).catch(() => known);
 	});
 
@@ -45,29 +48,33 @@ export default function webFetch(pi: ExtensionAPI) {
 			return hits.length ? hits : null;
 		},
 		handler: async (args, ctx) => {
-			const current = await resolveChoice(configFile);
-			const query = args.trim();
-			let choice = query;
-			// An exact `auto` or `provider/id` is saved directly; anything else opens the picker
-			// with the text as the search query, like `/model <query>`.
-			if (!query || (query !== AUTO && !findModel(ctx.modelRegistry, query))) {
-				if (ctx.mode !== "tui") {
-					ctx.ui.notify(
-						query
-							? `Unknown model: ${query}. Use provider/id or ${AUTO}.`
-							: `web_fetch classifier: ${current.choice} (${current.from})`,
-						query ? "error" : "info",
-					);
-					return;
+			try {
+				const current = await resolveChoice(configFile);
+				const query = args.trim();
+				let choice = query;
+				// An exact `auto` or `provider/id` is saved directly; anything else opens the picker
+				// with the text as the search query, like `/model <query>`.
+				if (!query || (query !== AUTO && !findModel(ctx.modelRegistry, query))) {
+					if (ctx.mode !== "tui") {
+						ctx.ui.notify(
+							query
+								? `Unknown model: ${query}. Use provider/id or ${AUTO}.`
+								: `web_fetch classifier: ${current.choice} (${current.from})`,
+							query ? "error" : "info",
+						);
+						return;
+					}
+					known = await listChoices(ctx.modelRegistry).catch(() => known);
+					const picked = await pickClassifier(ctx, known, current.choice, query);
+					if (!picked) return;
+					choice = picked;
 				}
-				known = await listChoices(ctx.modelRegistry).catch(() => known);
-				const picked = await pickClassifier(ctx, known, current.choice, query);
-				if (!picked) return;
-				choice = picked;
+				await saveChoice(configFile, choice);
+				const note = current.from === "env" ? ` (${ENV_VAR} is set and still wins)` : "";
+				ctx.ui.notify(`web_fetch classifier: ${choice}${note}`, current.from === "env" ? "warning" : "info");
+			} catch (err) {
+				ctx.ui.notify(`web_fetch classifier: ${message(err)}`, "error");
 			}
-			await saveChoice(configFile, choice);
-			const note = current.from === "env" ? ` (${ENV_VAR} is set and still wins)` : "";
-			ctx.ui.notify(`web_fetch classifier: ${choice}${note}`, current.from === "env" ? "warning" : "info");
 		},
 	});
 
@@ -79,32 +86,42 @@ export default function webFetch(pi: ExtensionAPI) {
 		parameters: Type.Object({ url: Type.String({ description: "http(s) URL" }) }),
 
 		async execute(_id, params, signal, _onUpdate, ctx) {
-			const result = await fetchAndExtract(params.url, {
-				signal,
-				jina: process.env.PI_WEB_FETCH_JINA !== "0",
-				classify: async (url) =>
-					classifyUrl(ctx.modelRegistry, ctx.model, url, signal, (await resolveChoice(configFile)).choice),
-			});
-			const full = `# ${result.title}\nSource: ${result.url}${result.via === "jina" ? " (via r.jina.ai)" : ""}\n\n${result.content}`;
-			const details: Details = {
-				url: result.url,
-				title: result.title,
-				via: result.via,
-				bytes: Buffer.byteLength(full),
+			let usage: Usage | undefined;
+			const classify = async (urls: string[], sig: AbortSignal) => {
+				let choice: string;
+				try {
+					choice = (await resolveChoice(configFile)).choice;
+				} catch (err) {
+					return `classifier config error: ${message(err)}`;
+				}
+				const verdict = await classifyUrl(ctx.modelRegistry, ctx.model, urls, sig, choice);
+				usage = verdict.usage;
+				return verdict.reason;
 			};
-			const t = truncateHead(full, { maxBytes: MAX_BYTES, maxLines: MAX_LINES });
-			let text = t.content;
-			if (t.truncated) {
-				const file = join(await mkdtemp(join(tmpdir(), "pi-web-fetch-")), "page.md");
-				await writeFile(file, full, "utf8");
-				details.fullOutputPath = file;
-				text += `\n\n[Truncated: ${t.outputLines} of ${t.totalLines} lines (${formatSize(t.outputBytes)} of ${formatSize(t.totalBytes)}). Full text: ${file}]`;
+			let result: Awaited<ReturnType<typeof fetchAndExtract>>;
+			try {
+				result = await fetchAndExtract(params.url, { signal, jina: process.env.PI_WEB_FETCH_JINA !== "0", classify });
+			} catch (err) {
+				// Return the error instead of throwing, so the classifier's usage is still counted.
+				if (!(err instanceof FetchError) || !usage) throw err;
+				return { content: [{ type: "text", text: err.message }], details: undefined, isError: true, usage };
 			}
-			return { content: [{ type: "text", text }], details };
+			const via = result.via === "jina" ? " (via r.jina.ai)" : "";
+			const from = result.redirects ? `\nRedirected from: ${result.redirects[0]}` : "";
+			const full = `# ${result.title}\nSource: ${result.url}${via}${from}\n\n${result.content}`;
+			const details: Details = { url: result.url, title: result.title, via: result.via, bytes: Buffer.byteLength(full) };
+			const p = preview(full, MAX_BYTES, MAX_LINES);
+			let text = p.text;
+			if (p.truncated) {
+				const file = await saveFullText(full);
+				details.fullOutputPath = file;
+				text += `\n\n[Truncated: ${p.shownLines} of ${p.totalLines} lines (${formatSize(p.shownBytes)} of ${formatSize(p.totalBytes)}). Full text: ${file}]`;
+			}
+			return { content: [{ type: "text", text }], details, usage };
 		},
 
 		renderCall(args, theme) {
-			const url = String((args as { url?: string }).url ?? "");
+			const url = sanitize(String((args as { url?: string }).url ?? "")).replace(/\s+/g, " ");
 			const shown = url.length > 80 ? `${url.slice(0, 77)}...` : url;
 			return new Text(theme.fg("toolTitle", theme.bold("web_fetch ")) + theme.fg("accent", shown), 0, 0);
 		},
@@ -112,10 +129,11 @@ export default function webFetch(pi: ExtensionAPI) {
 		renderResult(result, { expanded, isPartial }, theme, context) {
 			if (isPartial) return new Text(theme.fg("warning", "Fetching…"), 0, 0);
 			const first = result.content.find((c) => c.type === "text");
-			const body = first?.type === "text" ? first.text : "";
+			// Strip escape sequences before any theme color is added.
+			const body = sanitize(first?.type === "text" ? first.text : "");
 			if (context.isError) return new Text(theme.fg("error", body || "Error"), 0, 0);
 			const d = result.details as Details | undefined;
-			let line = theme.fg("success", d?.title || "Untitled") + theme.fg("muted", ` (${formatSize(d?.bytes ?? 0)}`);
+			let line = theme.fg("success", sanitize(d?.title || "Untitled")) + theme.fg("muted", ` (${formatSize(d?.bytes ?? 0)}`);
 			if (d?.via === "jina") line += theme.fg("muted", ", via Jina");
 			if (d?.fullOutputPath) line += theme.fg("warning", ", truncated");
 			line += theme.fg("muted", ")");
