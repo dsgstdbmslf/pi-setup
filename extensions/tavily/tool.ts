@@ -12,7 +12,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { call, credits } from "./client.ts";
-import { KEYS_FILE, KeyPool, STATE_FILE, type RotationResult, withRotation } from "./keys.ts";
+import { KEYS_FILE, KeyPool, STATE_DIR, type RotationResult, withRotation } from "./keys.ts";
 import { cleanupSaved, sanitize, saveFull } from "./output.ts";
 
 // Output cap for the agent's context (~8k tokens). The full text goes to a temp file.
@@ -37,7 +37,7 @@ export const Paths = (description: string) => Type.Optional(Type.Array(Type.Stri
 /** The Tavily key pool in ~/.pi/agent. Rate-limit marks are shared by all pools of a service. */
 export function tavilyPool(): KeyPool {
 	const agentDir = getAgentDir();
-	return new KeyPool("tavily", join(agentDir, KEYS_FILE), join(agentDir, STATE_FILE));
+	return new KeyPool("tavily", join(agentDir, KEYS_FILE), join(agentDir, STATE_DIR));
 }
 
 export interface RequestOptions {

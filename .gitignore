@@ -3,8 +3,8 @@ auth.json
 **/auth.json
 api-keys.json
 **/api-keys.json
-api-keys-state.json
-**/api-keys-state.json
+api-keys-state/
+**/api-keys-state/
 .env
 .env.*
 

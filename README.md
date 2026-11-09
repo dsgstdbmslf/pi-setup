@@ -78,8 +78,9 @@ Do not install both ways at once, or the extension loads twice.
   skipped until the 1st of next month (UTC), an invalid key (401) until it changes,
   a rate-limited key (429) until `Retry-After`; the request is retried at once with
   the next key. Other errors fail without switching. Marks are kept in
-  `~/.pi/agent/api-keys-state.json` by key fingerprint, never the key; rate-limit
-  marks stay in memory and are shared by all web extensions of one pi process.
+  `~/.pi/agent/api-keys-state/` (one file per marked key, named by its fingerprint,
+  never the key); rate-limit marks stay in memory and are shared by all web
+  extensions of one pi process.
   Tools that allow it fall back to Tavily's rate-limited keyless mode when no key works.
 
 ### Settings

@@ -1,14 +1,15 @@
 // Shared API key store with failover. No pi imports, so tests run without node_modules.
 //
 // Keys:  ~/.pi/agent/api-keys.json   { "<service>": ["key", { "key": "...", "label": "...", "disabled": true }] }
-// State: ~/.pi/agent/api-keys-state.json   which keys are exhausted or invalid, by fingerprint (never the key).
+// State: ~/.pi/agent/api-keys-state/<service>/<fingerprint>.json   one small file per marked key (exhausted or
+//        invalid), never the key. One file per key means no read-modify-write, so no lock is needed.
 
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export const KEYS_FILE = "api-keys.json";
-export const STATE_FILE = "api-keys-state.json";
+export const STATE_DIR = "api-keys-state";
 
 export interface KeyEntry {
 	key: string;
@@ -25,8 +26,6 @@ export interface Mark {
 	until: number | null;
 	reason: string;
 }
-
-type State = Record<string, Record<string, Mark>>;
 
 export class KeyFileError extends Error {}
 
@@ -96,96 +95,29 @@ export async function loadKeys(file: string, service: string): Promise<LoadedKey
 	return { entries, missing: false, insecure, malformed };
 }
 
-async function readState(file: string): Promise<State> {
-	try {
-		const data = JSON.parse(await readFile(file, "utf8"));
-		return data && typeof data === "object" ? data : {};
-	} catch {
-		return {}; // missing or corrupt state only means "nothing marked"
-	}
-}
+const ID_RE = /^[0-9a-f]{12}$/;
+/** Mark files only; temp files start with a dot and never match. */
+const MARK_FILE_RE = /^[0-9a-f]{12}\.json$/;
 
-async function writeState(file: string, state: State): Promise<void> {
-	// Unique name: concurrent writers must never share a tmp file. Exclusive create, private mode.
-	const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-	try {
-		await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-		await rename(tmp, file);
-	} catch (err) {
-		await rm(tmp, { force: true });
-		throw err;
-	}
+function isMark(m: any): m is Mark {
+	return (
+		!!m &&
+		(m.status === "exhausted" || m.status === "invalid" || m.status === "rate_limited") &&
+		(m.until === null || typeof m.until === "number") &&
+		typeof m.reason === "string"
+	);
 }
 
 /**
- * Per state file promise chains. On globalThis for the same reason as COOLING: every extension
- * has its own module cache, but their pools write the same file.
- */
-const STATE_LOCKS = Symbol.for("pi-setup.tavily.stateLocks");
-
-const LOCK_STALE_MS = 10_000;
-const LOCK_GIVE_UP_MS = 3_000;
-const LOCK_RETRY_MS = 30;
-
-/** Create `lock` exclusively (the lock is the file's existence); wait for other holders, break stale ones. */
-async function acquireFileLock(lock: string): Promise<() => Promise<void>> {
-	const deadline = Date.now() + LOCK_GIVE_UP_MS;
-	for (;;) {
-		try {
-			const handle = await open(lock, "wx", 0o600);
-			return async () => {
-				await handle.close().catch(() => {});
-				await rm(lock, { force: true });
-			};
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-		}
-		// A crashed holder leaves its lock behind; an old mtime means nobody is working on it.
-		const st = await stat(lock).catch(() => null);
-		if (st && Date.now() - st.mtimeMs > LOCK_STALE_MS) await rm(lock, { force: true });
-		else if (Date.now() > deadline) throw new Error(`api-keys state is locked: ${lock}`);
-		else await new Promise((r) => setTimeout(r, LOCK_RETRY_MS));
-	}
-}
-
-/** Run fn exclusively for this state file: serialized in-process, then across pi processes via a lock file. */
-function withStateLock<T>(file: string, fn: () => Promise<T>): Promise<T> {
-	const locks: Map<string, Promise<unknown>> = ((globalThis as any)[STATE_LOCKS] ??= new Map());
-	const prev = locks.get(file) ?? Promise.resolve();
-	const run = prev
-		.catch(() => {}) // one failed holder must not poison the chain
-		.then(async () => {
-			await mkdir(dirname(file), { recursive: true });
-			const release = await acquireFileLock(`${file}.lock`);
-			try {
-				return await fn();
-			} finally {
-				await release();
-			}
-		});
-	locks.set(file, run);
-	const cleanup = () => {
-		if (locks.get(file) === run) locks.delete(file); // idle: do not grow the map
-	};
-	run.then(cleanup, cleanup);
-	return run;
-}
-
-/** Drop persistent marks of one service whose expiry has passed. */
-function dropExpired(marks: Record<string, Mark>, t: number): void {
-	for (const [id, m] of Object.entries(marks)) if (m.until !== null && m.until <= t) delete marks[id];
-}
-
-/**
- * Rate-limit marks in memory, shared by every KeyPool with the same state file and service.
+ * Rate-limit marks in memory, shared by every KeyPool with the same state dir and service.
  * Pi loads each extension with its own module cache, so a module-level Map would not be
  * shared between web-search, web-fetch and web-research; globalThis is.
  */
 const COOLING = Symbol.for("pi-setup.tavily.cooling");
 
-function sharedCooling(stateFile: string, service: string): Map<string, Mark> {
+function sharedCooling(stateDir: string, service: string): Map<string, Mark> {
 	const registry: Map<string, Map<string, Mark>> = ((globalThis as any)[COOLING] ??= new Map());
-	const id = `${stateFile}\0${service}`;
+	const id = `${stateDir}\0${service}`;
 	let map = registry.get(id);
 	if (!map) registry.set(id, (map = new Map()));
 	return map;
@@ -206,20 +138,62 @@ export class KeyPool {
 
 	readonly service: string;
 	readonly keysFile: string;
-	readonly stateFile: string;
+	readonly stateDir: string;
 	private now: () => number;
 
-	constructor(service: string, keysFile: string, stateFile: string, now: () => number = Date.now) {
+	constructor(service: string, keysFile: string, stateDir: string, now: () => number = Date.now) {
+		// The service becomes a path segment.
+		if (!/^[a-z0-9_-]+$/i.test(service)) throw new Error(`invalid service name: ${service}`);
 		this.service = service;
 		this.keysFile = keysFile;
-		this.stateFile = stateFile;
+		this.stateDir = stateDir;
 		this.now = now;
-		this.cooling = sharedCooling(stateFile, service);
+		this.cooling = sharedCooling(stateDir, service);
+	}
+
+	private get serviceDir(): string {
+		return join(this.stateDir, this.service);
+	}
+
+	/** ids come from fingerprint(), but clear() takes external input, so check before building a path. */
+	private markPath(id: string): string {
+		if (!ID_RE.test(id)) throw new Error(`invalid key id: ${id}`);
+		return join(this.serviceDir, `${id}.json`);
+	}
+
+	/** Persistent marks by key id. Missing, unreadable or malformed files simply mean "not marked". */
+	private async readMarks(): Promise<Record<string, Mark>> {
+		const names = await readdir(this.serviceDir).catch(() => [] as string[]);
+		const marks: Record<string, Mark> = {};
+		for (const name of names) {
+			if (!MARK_FILE_RE.test(name)) continue;
+			try {
+				const mark = JSON.parse(await readFile(join(this.serviceDir, name), "utf8"));
+				if (isMark(mark)) marks[name.slice(0, -5)] = mark;
+			} catch {
+				// corrupt or removed meanwhile
+			}
+		}
+		return marks;
+	}
+
+	/** Write to a temp file and rename: readers see the old or the new mark, never a partial one. */
+	private async writeMark(id: string, mark: Mark): Promise<void> {
+		const file = this.markPath(id);
+		await mkdir(this.serviceDir, { recursive: true, mode: 0o700 });
+		const tmp = join(this.serviceDir, `.${id}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
+		try {
+			await writeFile(tmp, `${JSON.stringify(mark)}\n`, { mode: 0o600, flag: "wx" });
+			await rename(tmp, file);
+		} catch (err) {
+			await rm(tmp, { force: true });
+			throw err;
+		}
 	}
 
 	async snapshot(): Promise<PoolSnapshot> {
 		const { entries, missing, insecure, malformed } = await loadKeys(this.keysFile, this.service);
-		const marks = (await readState(this.stateFile))[this.service] ?? {};
+		const marks = await this.readMarks();
 		const t = this.now();
 		// Forget expired marks and keys that are gone. Every pool of a bucket reads the same key file.
 		// The bucket Map itself stays in the registry: live pools hold it and share it across extensions.
@@ -242,29 +216,21 @@ export class KeyPool {
 			this.cooling.set(entry.id, mark);
 			return;
 		}
-		// Read, modify and write under the lock so no other pool or pi process drops this mark.
-		await withStateLock(this.stateFile, async () => {
-			const state = await readState(this.stateFile);
-			const marks = (state[this.service] ??= {});
-			dropExpired(marks, t);
-			marks[entry.id] = mark;
-			await writeState(this.stateFile, state);
-		});
+		// One file per key: no read-modify-write, so concurrent marks of different keys cannot interfere
+		// and two marks of the same key are last-writer-wins. Expired files are not deleted automatically
+		// (read, see expired, rm could remove a fresh mark written in between); snapshot() ignores them
+		// and the next mark of the key overwrites them.
+		await this.writeMark(entry.id, mark);
 	}
 
 	/** Clear marks for the given key ids, or all marks of this service. */
 	async clear(ids?: string[]): Promise<void> {
 		if (ids) ids.forEach((id) => this.cooling.delete(id));
 		else this.cooling.clear();
-		await withStateLock(this.stateFile, async () => {
-			const state = await readState(this.stateFile);
-			const marks = state[this.service];
-			if (!marks) return;
-			for (const id of ids ?? Object.keys(marks)) delete marks[id];
-			dropExpired(marks, this.now());
-			if (Object.keys(marks).length === 0) delete state[this.service];
-			await writeState(this.stateFile, state);
-		});
+		const files = ids
+			? ids.filter((id) => ID_RE.test(id)).map((id) => this.markPath(id))
+			: (await readdir(this.serviceDir).catch(() => [] as string[])).filter((n) => MARK_FILE_RE.test(n)).map((n) => join(this.serviceDir, n));
+		for (const file of files) await rm(file, { force: true });
 	}
 }
 
