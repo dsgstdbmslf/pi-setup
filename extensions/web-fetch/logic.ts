@@ -409,7 +409,7 @@ export async function pdfToText(
 		signal?.removeEventListener("abort", destroy);
 		// After an abort, start the cleanup but do not wait for it.
 		if (signal?.aborted) destroy();
-		else await destroy();
+		else await abortable(destroy(), signal); // an abort from here on stops the wait, not the cleanup
 	}
 }
 

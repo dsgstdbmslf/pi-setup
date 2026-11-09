@@ -219,6 +219,84 @@ test("R1: an abort during the last page is reported even when the page returns i
 	);
 });
 
+/** A fake PDF whose destroy starts, reports it, and waits for the test to settle it. */
+function slowCleanupPdf() {
+	const pdf = fakePdf([[{ str: "text" }]]);
+	let started!: () => void;
+	const cleanupStarted = new Promise<void>((r) => (started = r));
+	const release = { resolve: () => {}, reject: (_: Error) => {} };
+	pdf.doc.loadingTask.destroy = () => {
+		pdf.stats.destroyed++;
+		started();
+		return new Promise<void>((res, rej) => Object.assign(release, { resolve: res, reject: rej }));
+	};
+	return { pdf, cleanupStarted, release };
+}
+
+const within = <T>(p: Promise<T>, ms = 500) =>
+	Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error("still pending")), ms))]);
+
+test("S2: an abort during normal cleanup rejects promptly; cleanup runs once in the background", async () => {
+	const { pdf, cleanupStarted, release } = slowCleanupPdf();
+	const ac = new AbortController();
+	let jina = 0;
+	try {
+		const pending = fetchAndExtract("https://a.com/x.pdf", {
+			jina: true,
+			signal: ac.signal,
+			direct: (u, sig) => pdfToText(new Uint8Array(), u, sig, pdf.open),
+			guard: async () => null,
+			classify: async () => null,
+			viaJina: async () => (jina++, ok),
+		});
+		pending.catch(() => {});
+		await within(cleanupStarted);
+		ac.abort();
+		await assert.rejects(within(pending), (e: Error) => e.name === "AbortError");
+		assert.equal(pdf.stats.destroyed, 1);
+		assert.equal(jina, 0);
+	} finally {
+		release.resolve();
+	}
+	await tick();
+	assert.equal(pdf.stats.destroyed, 1);
+});
+
+test("S2: without an abort cleanup is awaited; a late cleanup failure after an abort stays quiet", async () => {
+	const a = slowCleanupPdf();
+	let settled = false;
+	try {
+		const pending = pdfToText(new Uint8Array(), "u", new AbortController().signal, a.pdf.open).finally(() => (settled = true));
+		await within(a.cleanupStarted);
+		await tick();
+		assert.equal(settled, false);
+		a.release.resolve();
+		assert.equal((await within(pending)).content, "Pages: 1\n\ntext");
+	} finally {
+		a.release.resolve();
+	}
+
+	const unhandled: unknown[] = [];
+	const onUnhandled = (e: unknown) => unhandled.push(e);
+	process.on("unhandledRejection", onUnhandled);
+	const b = slowCleanupPdf();
+	const ac = new AbortController();
+	try {
+		const pending = pdfToText(new Uint8Array(), "u", ac.signal, b.pdf.open);
+		pending.catch(() => {});
+		await within(b.cleanupStarted);
+		ac.abort();
+		await assert.rejects(within(pending), (e: Error) => e.name === "AbortError");
+		b.release.reject(new Error("cleanup failed"));
+		await tick(20);
+		assert.deepEqual(unhandled, []);
+		assert.equal(b.pdf.stats.destroyed, 1);
+	} finally {
+		b.release.resolve();
+		process.off("unhandledRejection", onUnhandled);
+	}
+});
+
 test("R1: an already-aborted signal starts no PDF work", async () => {
 	const pdf = fakePdf([[{ str: "x" }]]);
 	await assert.rejects(pdfToText(new Uint8Array(), "https://a.com/x.pdf", AbortSignal.abort(), pdf.open), (e: Error) => e.name === "AbortError");
