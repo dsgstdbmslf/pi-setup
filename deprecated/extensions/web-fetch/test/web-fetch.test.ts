@@ -16,7 +16,7 @@ import {
 	readReply,
 	resolveChoice,
 	saveChoice,
-} from "../extensions/web-fetch/classify.ts";
+} from "../classify.ts";
 import {
 	FetchError,
 	MAX_HTML_DEPTH,
@@ -39,8 +39,8 @@ import {
 	readLimited,
 	sanitize,
 	saveFullText,
-} from "../extensions/web-fetch/logic.ts";
-import { filterChoices, pickClassifier } from "../extensions/web-fetch/picker.ts";
+} from "../logic.ts";
+import { filterChoices, pickClassifier } from "../picker.ts";
 
 const article = `<!doctype html><html><head><title>Hello page</title></head><body>
 <nav>menu menu menu</nav><article><h1>Hello page</h1>${"<p>Readable paragraph with enough words to count as content. </p>".repeat(20)}
@@ -701,7 +701,7 @@ test("m10: picker colors follow a theme change", () => {
 // ── Tool registration and rendering ─────────────────────────────────
 
 test("M1: the tool renders untrusted URLs, titles and errors without escape sequences", async () => {
-	const { default: webFetch } = await import("../extensions/web-fetch.ts");
+	const { default: webFetch } = await import("../index.ts");
 	let tool: any;
 	webFetch({ on() {}, registerCommand() {}, registerTool: (t: any) => (tool = t) } as any);
 	assert.equal(tool.name, "web_fetch");

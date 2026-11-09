@@ -12,9 +12,9 @@ import {
 	listChoices,
 	resolveChoice,
 	saveChoice,
-} from "./web-fetch/classify.ts";
-import { cleanupSaved, fetchAndExtract, outline, preview, sanitize, saveFullText } from "./web-fetch/logic.ts";
-import { filterChoices, pickClassifier } from "./web-fetch/picker.ts";
+} from "./classify.ts";
+import { cleanupSaved, fetchAndExtract, outline, preview, sanitize, saveFullText } from "./logic.ts";
+import { filterChoices, pickClassifier } from "./picker.ts";
 
 // Output cap for the agent's context (~3k tokens). The full text goes to a temp file; the
 // headings after the preview point into it, so the agent can read only the part it needs.

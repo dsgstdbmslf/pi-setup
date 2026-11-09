@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { AUTO, saveChoice } from "../extensions/web-fetch/classify.ts";
+import { AUTO, saveChoice } from "../classify.ts";
 import {
 	FetchError,
 	MAX_PDF_TEXT_CHARS,
@@ -21,8 +21,8 @@ import {
 	pdfToText,
 	preview,
 	privateReason,
-} from "../extensions/web-fetch/logic.ts";
-import { pickClassifier } from "../extensions/web-fetch/picker.ts";
+} from "../logic.ts";
+import { pickClassifier } from "../picker.ts";
 
 const article = `<!doctype html><html><head><title>Hello page</title></head><body><article><h1>Hello page</h1>${"<p>Readable paragraph with enough words to count as content. </p>".repeat(20)}</article></body></html>`;
 
@@ -611,7 +611,7 @@ async function withTool(fn: (tool: any, env: { tmp: string }) => Promise<void>) 
 	delete process.env.PI_WEB_FETCH_CLASSIFIER;
 	delete process.env.PI_WEB_FETCH_JINA;
 	try {
-		const { default: webFetch } = await import("../extensions/web-fetch.ts");
+		const { default: webFetch } = await import("../index.ts");
 		let tool: any;
 		webFetch({ on() {}, registerCommand() {}, registerTool: (t: any) => (tool = t) } as any);
 		await fn(tool, { tmp: process.env.TMPDIR });
