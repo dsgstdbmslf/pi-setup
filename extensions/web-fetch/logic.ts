@@ -317,34 +317,26 @@ function cutChars(text: string, max: number): string {
 }
 
 /**
- * The text of one page, keeping line breaks, normalized as it is read: a run of spaces/tabs
- * becomes one space, a run holding line breaks becomes one or two of them, and the ends are
- * trimmed. Stops once the normalized text cannot fit in `room` characters; `cut` says so.
+ * One page's text, normalized while read (space/tab runs → " ", runs with line breaks → at most
+ * two of them, ends trimmed), so it stops once it cannot fit in `room` characters; `cut` says so.
  */
 function pageText(items: PdfItem[], room: number): { text: string; cut: boolean } {
-	const out: string[] = [];
-	let len = 0;
-	let space = false; // whitespace pending between words
-	let breaks = 0; // line breaks in it
+	let text = "";
+	let gap = -1; // whitespace pending between words: -1 none, 0 spaces, else its line breaks (≤ 2)
 	for (const item of items) {
 		for (const [word] of `${item.str ?? ""}${item.hasEOL ? "\n" : ""}`.matchAll(/[ \t\n]+|[^ \t\n]+/g)) {
 			if (/^[ \t\n]/.test(word)) {
-				space = true;
-				for (let i = 0; i < word.length && breaks < 2; i++) if (word[i] === "\n") breaks++;
+				gap = Math.max(gap, 0);
+				for (let i = 0; i < word.length && gap < 2; i++) if (word[i] === "\n") gap++;
 				continue;
 			}
-			const piece = (len && space ? (breaks ? "\n".repeat(breaks) : " ") : "") + word;
-			space = false;
-			breaks = 0;
-			if (len + piece.length > room) {
-				out.push(cutChars(piece, room - len));
-				return { text: out.join("").trim(), cut: true };
-			}
-			out.push(piece);
-			len += piece.length;
+			const piece = (text && gap >= 0 ? (gap ? "\n".repeat(gap) : " ") : "") + word;
+			gap = -1;
+			if (text.length + piece.length > room) return { text: (text + cutChars(piece, room - text.length)).trim(), cut: true };
+			text += piece;
 		}
 	}
-	return { text: out.join("").trim(), cut: false };
+	return { text: text.trim(), cut: false };
 }
 
 /**
