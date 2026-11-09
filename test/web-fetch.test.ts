@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	AUTO,
 	PUBLIC_MAX_PROBABILITY,
@@ -38,7 +39,7 @@ import {
 	sanitize,
 	saveFullText,
 } from "../extensions/web-fetch/logic.ts";
-import { filterChoices } from "../extensions/web-fetch/picker.ts";
+import { filterChoices, pickClassifier } from "../extensions/web-fetch/picker.ts";
 
 const article = `<!doctype html><html><head><title>Hello page</title></head><body>
 <nav>menu menu menu</nav><article><h1>Hello page</h1>${"<p>Readable paragraph with enough words to count as content. </p>".repeat(20)}
@@ -634,6 +635,49 @@ test("filterChoices fuzzy-matches like /model", () => {
 	assert.equal(filterChoices(choices, "anth son")[0].value, "anthropic/claude-sonnet-5-5");
 	assert.deepEqual(filterChoices(choices, "classif").map((c) => c.value), ["typesafe/jev-latest"]);
 	assert.deepEqual(filterChoices(choices, "zzz"), []);
+});
+
+function openPicker(rows: number, initialQuery = "") {
+	let comp: any;
+	let color = "";
+	const theme: any = { fg: (_: string, s: string) => `${color}${s}`, bold: (s: string) => s };
+	const choices = [
+		{ value: AUTO, kind: "auto" as const },
+		...Array.from({ length: 12 }, (_, i) => ({ value: `provider-${i}/a-very-long-model-identifier-haiku-${i}`, kind: "chat" as const, name: `Model number ${i}` })),
+	];
+	const keys: Record<string, string> = { "tui.select.up": "\x1b[A", "tui.select.down": "\x1b[B", "tui.select.confirm": "\r", "tui.select.cancel": "\x1b" };
+	const result = pickClassifier(
+		{ ui: { custom: (factory: any) => new Promise((resolve) => (comp = factory({ terminal: { rows }, requestRender() {} }, theme, { matches: (d: string, k: string) => keys[k] === d }, resolve))) } } as any,
+		choices,
+		AUTO,
+		initialQuery,
+	);
+	return { result, comp: () => comp, setColor: (c: string) => void (color = c) };
+}
+
+test("m8: the picker fits the terminal height and width", () => {
+	for (const [rows, width] of [[15, 20], [15, 80], [40, 30]]) {
+		const p = openPicker(rows);
+		const lines: string[] = p.comp().render(width);
+		assert.ok(lines.length <= rows, `${lines.length} lines for ${rows} rows`);
+		for (const l of lines) assert.ok(visibleWidth(l) <= width, l);
+	}
+});
+
+test("m9: a pre-filled query puts the cursor at its end", async () => {
+	const p = openPicker(40, "haiku");
+	p.comp().handleInput("x");
+	assert.match(p.comp().render(80).join("\n"), /haikux/);
+	p.comp().handleInput("\x1b");
+	assert.equal(await p.result, undefined);
+});
+
+test("m10: picker colors follow a theme change", () => {
+	const p = openPicker(40);
+	assert.doesNotMatch(p.comp().render(80).join("\n"), /\[NEW\]/);
+	p.setColor("[NEW]");
+	p.comp().invalidate();
+	assert.match(p.comp().render(80).join("\n"), /\[NEW\]web_fetch classifier/);
 });
 
 // ── Tool registration and rendering ─────────────────────────────────

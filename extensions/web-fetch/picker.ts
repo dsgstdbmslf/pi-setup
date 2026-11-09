@@ -1,11 +1,13 @@
 // Searchable model picker for /web-fetch-classifier, styled like pi's /model:
 // type to fuzzy-filter, ↑↓ to move, Enter to pick, Esc to cancel.
 
-import { DynamicBorder, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, type Focusable, fuzzyFilter, Input, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type Focusable, fuzzyFilter, Input, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Choice } from "./classify.ts";
 
 const MAX_VISIBLE = 10;
+/** Lines around the list: borders, title, subtitle, input, spacers, counter, hint. */
+const CHROME_LINES = 10;
 
 /** Fuzzy filter over `provider/id`, model name and kind; best matches first. */
 export function filterChoices(choices: Choice[], query: string): Choice[] {
@@ -14,7 +16,7 @@ export function filterChoices(choices: Choice[], query: string): Choice[] {
 }
 
 export function pickClassifier(
-	ctx: ExtensionContext,
+	ctx: Pick<ExtensionContext, "ui">,
 	choices: Choice[],
 	current: string,
 	initialQuery = "",
@@ -22,8 +24,8 @@ export function pickClassifier(
 	return ctx.ui.custom<string | undefined>(
 		(tui, theme, keybindings, done) => {
 			const input = new Input();
-			input.setValue(initialQuery);
-			const list = new Container();
+			// A bracketed paste inserts the query with the cursor at its end (setValue keeps it at 0).
+			if (initialQuery) input.handleInput(`\x1b[200~${initialQuery}\x1b[201~`);
 			let filtered = filterChoices(choices, initialQuery);
 			let selected = initialQuery ? 0 : Math.max(0, filtered.findIndex((c) => c.value === current));
 
@@ -32,37 +34,39 @@ export function pickClassifier(
 					? "first available classifier, else the session model"
 					: `${c.name ? `${c.name} · ` : ""}${c.kind}`;
 
-			const update = () => {
-				list.clear();
-				const start = Math.max(0, Math.min(selected - Math.floor(MAX_VISIBLE / 2), filtered.length - MAX_VISIBLE));
-				const end = Math.min(start + MAX_VISIBLE, filtered.length);
+			// Everything is built at render time: one line per item (cut, never wrapped), the list fits
+			// the terminal height, and theme colors are always current.
+			const render = (width: number): string[] => {
+				const fit = (s: string) => truncateToWidth(s, width);
+				const border = theme.fg("border", "─".repeat(Math.max(1, width)));
+				const visible = Math.max(1, Math.min(MAX_VISIBLE, (tui.terminal?.rows ?? 24) - CHROME_LINES));
+				const start = Math.max(0, Math.min(selected - Math.floor(visible / 2), filtered.length - visible));
+				const end = Math.min(start + visible, filtered.length);
+				const lines = [
+					border,
+					fit(theme.fg("accent", theme.bold("web_fetch classifier"))),
+					fit(theme.fg("muted", "Decides whether a URL may be sent to r.jina.ai. Saved globally.")),
+					"",
+					...input.render(width).map(fit),
+					"",
+				];
 				for (let i = start; i < end; i++) {
 					const c = filtered[i];
 					const isSel = i === selected;
-					const line =
-						(isSel ? theme.fg("accent", "→ ") : "  ") +
-						(c.value === current ? theme.fg("accent", "✓ ") : "  ") +
-						(isSel ? theme.fg("accent", c.value) : c.value) +
-						theme.fg("muted", `  ${describe(c)}`);
-					list.addChild(new Text(line, 0, 0));
+					lines.push(
+						fit(
+							(isSel ? theme.fg("accent", "→ ") : "  ") +
+								(c.value === current ? theme.fg("accent", "✓ ") : "  ") +
+								(isSel ? theme.fg("accent", c.value) : c.value) +
+								theme.fg("muted", `  ${describe(c)}`),
+						),
+					);
 				}
-				if (filtered.length === 0) list.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
-				else if (start > 0 || end < filtered.length)
-					list.addChild(new Text(theme.fg("muted", `  (${selected + 1}/${filtered.length})`), 0, 0));
+				if (filtered.length === 0) lines.push(fit(theme.fg("muted", "  No matching models")));
+				else if (start > 0 || end < filtered.length) lines.push(fit(theme.fg("muted", `  (${selected + 1}/${filtered.length})`)));
+				lines.push("", fit(theme.fg("dim", "  type to search · ↑↓ move · enter select · esc cancel")), border);
+				return lines;
 			};
-
-			const root = new Container();
-			root.addChild(new DynamicBorder());
-			root.addChild(new Text(theme.fg("accent", theme.bold("web_fetch classifier")), 0, 0));
-			root.addChild(new Text(theme.fg("muted", "Decides whether a URL may be sent to r.jina.ai. Saved globally."), 0, 0));
-			root.addChild(new Spacer(1));
-			root.addChild(input);
-			root.addChild(new Spacer(1));
-			root.addChild(list);
-			root.addChild(new Spacer(1));
-			root.addChild(new Text(theme.fg("dim", "  type to search · ↑↓ move · enter select · esc cancel"), 0, 0));
-			root.addChild(new DynamicBorder());
-			update();
 
 			const component: Focusable & {
 				capturesViewportInput: boolean;
@@ -78,8 +82,8 @@ export function pickClassifier(
 				set focused(value: boolean) {
 					input.focused = value;
 				},
-				render: (width) => root.render(width).map((l) => truncateToWidth(l, width)),
-				invalidate: () => root.invalidate(),
+				render,
+				invalidate: () => input.invalidate(),
 				handleInput(data) {
 					if (keybindings.matches(data, "tui.select.up")) {
 						if (filtered.length) selected = selected === 0 ? filtered.length - 1 : selected - 1;
@@ -99,7 +103,6 @@ export function pickClassifier(
 							selected = 0;
 						}
 					}
-					update();
 					tui.requestRender();
 				},
 			};
