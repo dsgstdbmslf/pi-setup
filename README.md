@@ -40,7 +40,8 @@ No credentials, sessions, or machine state are stored here (`auth.json`, `sessio
 
 Then restart pi or run `/reload`.
 
-Single files work too: `cp extensions/code-fence-hide.ts ~/.pi/agent/extensions/`.
+Single files work too: `cp extensions/code-fence-hide.ts ~/.pi/agent/extensions/`
+(not `web-fetch.ts`, which needs its folder and npm dependencies).
 Do not install both ways at once, or the extension loads twice.
 
 ## Contents
@@ -59,6 +60,21 @@ Do not install both ways at once, or the extension loads twice.
   Tab adds a comment to the highlighted option. Optional `defaultAnswer` per question
   (used only without a UI) and `timeoutSeconds` (on timeout the run stops); the UI is English or Russian (system locale, or `PI_ASK_LANG=en|ru`).
   Logic lives in `extensions/ask-user-question/`; tests: `npm test`
+
+- `web-fetch.ts` — `web_fetch` tool: fetches a URL with browser-like headers and returns
+  markdown (Readability + Turndown for HTML, `unpdf` for PDF, text as is). Output to the
+  agent is capped at 32KB; the full text is saved to a temp file the agent can `read`.
+  Body size is limited while streaming (5MB, PDF 20MB). When a page cannot be read
+  directly (JS-rendered, blocked), it falls back to the public reader `r.jina.ai`, but only
+  if the URL looks public: http(s), no credentials or token-like query parameters, a host
+  that resolves to public IPs, no 401, and a model agrees the URL is public (a classifier
+  model if one is available, otherwise the session model; any doubt means no Jina).
+  `/web-fetch-classifier` picks that model in a searchable list like `/model` (type to
+  filter; `/web-fetch-classifier haiku` opens it pre-filtered, an exact `provider/id` or
+  `auto` is saved directly). The choice is saved in `~/.pi/agent/web-fetch.json` and
+  applies to every session. `PI_WEB_FETCH_CLASSIFIER=provider/id` overrides it, and
+  `PI_WEB_FETCH_JINA=0` turns the fallback off. Logic lives in `extensions/web-fetch/`. Needs the package's npm
+  dependencies (`pi install` installs them; for a single-file copy run `npm install`)
 
 ### Settings
 

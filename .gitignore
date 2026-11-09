@@ -35,3 +35,6 @@ tmp/
 trust.json
 models-store.json
 *.bak*
+
+# No lockfile: pi installs dependencies itself (without peers)
+package-lock.json
