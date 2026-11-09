@@ -12,6 +12,7 @@ import {
 	newState,
 	normalizeOptions,
 	pick,
+	runAsk,
 	setNote,
 } from "../extensions/ask-user-question/logic.ts";
 
@@ -99,7 +100,7 @@ test("setNote attaches a comment, selects the option, and empty text clears it",
 	const st = newState();
 	setNote(multi, st, 1, "  only on prod ");
 	assert.deepEqual(answersOf(multi, st)[0], { type: "option", label: "MySQL", value: "my", index: 2, note: "only on prod" });
-	assert.equal(buildResultText([{ question: "q", mode: "multi-select", answers: answersOf(multi, st) }]), "User selected:\n- 2. MySQL (note: only on prod)");
+	assert.equal(buildResultText([{ question: "q", mode: "multi-select", answers: answersOf(multi, st) }]), "User selected:\n- 2. MySQL (value: my; note: only on prod)");
 	setNote(multi, st, 1, "");
 	assert.equal(st.notes.size, 0);
 
@@ -114,4 +115,52 @@ test("note of an unselected option is not reported", () => {
 	setNote(single, st, 0, "hi");
 	pick(single, st, 1);
 	assert.equal(answersOf(single, st)[0].note, undefined);
+});
+
+test("model-visible text includes option value when it differs from the label", () => {
+	const r = fillDefaults([{ ...single, defaultAnswer: "my" }], [])!;
+	assert.equal(buildResultText(r), "User selected: 2. MySQL (value: my)");
+});
+
+const base = { questions: [single], hasUI: true, S: getStrings({}) };
+
+test("runAsk: abort while the dialog is pending/queued settles as cancelled", async () => {
+	const ac = new AbortController();
+	const p = runAsk({ ...base, signal: ac.signal, ask: () => new Promise(() => {}), abort: () => {} });
+	ac.abort();
+	const r = await p;
+	assert.equal(r.details.status, "cancelled");
+	assert.equal("terminate" in r, false);
+});
+
+test("runAsk: already aborted never opens the dialog", async () => {
+	const ac = new AbortController();
+	ac.abort();
+	let asked = false;
+	const r = await runAsk({ ...base, signal: ac.signal, ask: async () => ((asked = true), { status: "done", answers: [] }), abort: () => {} });
+	assert.equal(asked, false);
+	assert.equal(r.details.status, "cancelled");
+});
+
+test("runAsk: timeout aborts the whole run and sets terminate, no default used", async () => {
+	let aborted = 0;
+	const r = await runAsk({
+		...base,
+		questions: [{ ...single, defaultAnswer: "PG" }],
+		ask: async () => ({ status: "timeout", answers: [[]] }),
+		abort: () => aborted++,
+	});
+	assert.equal(aborted, 1);
+	assert.equal((r as any).terminate, true);
+	assert.equal(r.details.status, "cancelled");
+	assert.deepEqual(r.details.results, []);
+});
+
+test("runAsk: answered, and no-UI falls back to defaults or reports unavailable", async () => {
+	const answers = [[{ type: "option" as const, label: "PG", value: "PG", index: 1 }]];
+	const ok = await runAsk({ ...base, ask: async () => ({ status: "done", answers }), abort: () => {} });
+	assert.equal(ok.details.status, "answered");
+	const noUi = { ...base, hasUI: false, ask: async () => ({ status: "done" as const, answers: [] }), abort: () => {} };
+	assert.equal((await runAsk(noUi)).details.status, "unavailable");
+	assert.equal((await runAsk({ ...noUi, questions: [{ ...single, defaultAnswer: "PG" }] })).details.status, "answered");
 });

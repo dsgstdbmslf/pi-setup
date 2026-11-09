@@ -3,20 +3,13 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
 	type Question,
-	type QuestionResult,
-	buildResultText,
-	fillDefaults,
+	type ToolDetails,
+	runAsk,
 	formatAnswer,
 	getStrings,
 	normalizeOptions,
 } from "./ask-user-question/logic.ts";
 import { askQuestions } from "./ask-user-question/ui.ts";
-
-interface Details {
-	status: "answered" | "cancelled" | "unavailable";
-	results: QuestionResult[];
-	message?: string;
-}
 
 const QuestionSchema = Type.Object({
 	question: Type.String({ description: "The question to ask the user." }),
@@ -75,10 +68,6 @@ function withUILock<T>(fn: () => Promise<T>): Promise<T> {
 	return g[LOCK_KEY].withLock(fn);
 }
 
-function result(status: Details["status"], results: QuestionResult[], text: string) {
-	return { content: [{ type: "text" as const, text }], details: { status, results, message: text } as Details };
-}
-
 export default function askUserQuestion(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ask_user_question",
@@ -97,28 +86,22 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		parameters: Params,
 
 		async execute(_id, params, signal, _onUpdate, ctx) {
-			const S = getStrings();
 			const questions = params.questions as Question[];
-			const empty: QuestionResult[] = [];
-
-			if (signal?.aborted) return result("cancelled", empty, S.cancelled);
-
-			if (!ctx.hasUI) {
-				const defaults = fillDefaults(questions, []);
-				if (!defaults) return result("unavailable", empty, S.noUI);
-				return result("answered", defaults, `${S.usedDefaults}.\n${buildResultText(defaults)}`);
-			}
-
-			const outcome = await withUILock(() => askQuestions(ctx, questions, S, params.timeoutSeconds));
-			if (outcome.status === "timeout") {
-				// Nobody answered: stop the run instead of guessing a default.
-				return { ...result("cancelled", empty, S.timedOut), terminate: true };
-			}
-			if (outcome.status === "cancelled") return result("cancelled", empty, S.cancelled);
-
-			const results = fillDefaults(questions, outcome.answers);
-			if (!results) return result("cancelled", empty, S.cancelled);
-			return result("answered", results, buildResultText(results));
+			const S = getStrings();
+			return runAsk({
+				questions,
+				signal,
+				hasUI: ctx.hasUI,
+				S,
+				abort: () => ctx.abort(),
+				ask: () =>
+					withUILock(async () =>
+						// A dialog queued behind another one must not pop up after the run was aborted.
+						signal?.aborted
+							? { status: "cancelled" as const, answers: [] }
+							: askQuestions(ctx, questions, S, params.timeoutSeconds, signal),
+					),
+			});
 		},
 
 		renderCall(args, theme) {
@@ -134,7 +117,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		},
 
 		renderResult(result, _options, theme) {
-			const d = result.details as Details | undefined;
+			const d = result.details as ToolDetails | undefined;
 			if (!d || d.status !== "answered") {
 				const first = result.content[0];
 				return new Text(theme.fg("warning", d?.message || (first?.type === "text" ? first.text : "")), 0, 0);

@@ -1,6 +1,6 @@
 import { Editor, type EditorTheme, Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
-	type Answer,
+	type UiOutcome,
 	type Question,
 	type Strings,
 	answersOf,
@@ -12,11 +12,6 @@ import {
 	pick,
 	setNote,
 } from "./logic.ts";
-
-export interface UiOutcome {
-	status: "done" | "cancelled" | "timeout";
-	answers: Answer[][]; // per question; empty array = unanswered
-}
 
 function editorTheme(theme: any): EditorTheme {
 	return {
@@ -32,7 +27,13 @@ function editorTheme(theme: any): EditorTheme {
 }
 
 /** One dialog for all questions: tabs when there are several, a review tab before submitting. */
-export function askQuestions(ctx: any, questions: Question[], S: Strings, timeoutSec?: number): Promise<UiOutcome> {
+export function askQuestions(
+	ctx: any,
+	questions: Question[],
+	S: Strings,
+	timeoutSec?: number,
+	signal?: AbortSignal,
+): Promise<UiOutcome> {
 	return ctx.ui.custom<UiOutcome>((tui: any, theme: any, _kb: any, done: (r: UiOutcome) => void) => {
 		const states = questions.map(newState);
 		const multiTab = questions.length > 1;
@@ -55,9 +56,12 @@ export function askQuestions(ctx: any, questions: Question[], S: Strings, timeou
 			if (finished) return;
 			finished = true;
 			if (timer) clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
 			commitText();
 			done({ status, answers: allAnswers() });
 		}
+		const onAbort = () => finish("cancelled");
+		signal?.addEventListener("abort", onAbort, { once: true });
 		if (timeoutSec) timer = setTimeout(() => finish("timeout"), timeoutSec * 1000);
 
 		function commitText() {

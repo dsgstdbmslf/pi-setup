@@ -205,7 +205,8 @@ export function fillDefaults(questions: Question[], answers: Answer[][]): Questi
 export function formatAnswer(a: Answer): string {
 	if (a.type === "other") return `Other: ${a.label}`;
 	if (a.type === "text") return a.label;
-	return `${a.index}. ${a.label}${a.note ? ` (note: ${a.note})` : ""}`;
+	const extras = [a.value !== a.label ? `value: ${a.value}` : "", a.note ? `note: ${a.note}` : ""].filter(Boolean);
+	return `${a.index}. ${a.label}${extras.length ? ` (${extras.join("; ")})` : ""}`;
 }
 
 function describe(r: QuestionResult, s: Strings = EN): string {
@@ -217,4 +218,71 @@ function describe(r: QuestionResult, s: Strings = EN): string {
 export function buildResultText(results: QuestionResult[], s: Strings = EN): string {
 	if (results.length === 1) return describe(results[0], s);
 	return results.map((r, i) => `Q${i + 1}: ${r.question}\n${describe(r, s)}`).join("\n\n");
+}
+
+// ---------- tool flow (UI injected, so it can be tested) ----------
+
+export interface UiOutcome {
+	status: "done" | "cancelled" | "timeout";
+	answers: Answer[][]; // per question; empty array = unanswered
+}
+
+export interface ToolDetails {
+	status: "answered" | "cancelled" | "unavailable";
+	results: QuestionResult[];
+	message?: string;
+}
+
+function toolResult(status: ToolDetails["status"], results: QuestionResult[], text: string, terminate?: boolean) {
+	return {
+		content: [{ type: "text" as const, text }],
+		details: { status, results, message: text } as ToolDetails,
+		...(terminate ? { terminate: true } : {}),
+	};
+}
+
+/**
+ * Whole tool flow. `ask` shows the dialog (and must close it itself when `signal` aborts);
+ * `abort` stops the agent run. A timeout both sets `terminate` and aborts the run, because
+ * `terminate` alone is ignored when a sibling tool call in the same batch succeeds.
+ */
+export async function runAsk(opts: {
+	questions: Question[];
+	signal?: AbortSignal;
+	hasUI: boolean;
+	ask: () => Promise<UiOutcome>;
+	abort: () => void;
+	S: Strings;
+}) {
+	const { questions, signal, hasUI, ask, abort, S } = opts;
+	const cancelled = () => toolResult("cancelled", [], S.cancelled);
+	if (signal?.aborted) return cancelled();
+
+	if (!hasUI) {
+		const defaults = fillDefaults(questions, []);
+		if (!defaults) return toolResult("unavailable", [], S.noUI);
+		return toolResult("answered", defaults, `${S.usedDefaults}.\n${buildResultText(defaults)}`);
+	}
+
+	// Race against abort so a queued (not yet shown) dialog cannot hang the run.
+	let onAbort: (() => void) | undefined;
+	const aborted = new Promise<UiOutcome>((resolve) => {
+		onAbort = () => resolve({ status: "cancelled", answers: [] });
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+	let outcome: UiOutcome;
+	try {
+		outcome = await Promise.race([ask(), aborted]);
+	} finally {
+		if (onAbort) signal?.removeEventListener("abort", onAbort);
+	}
+
+	if (outcome.status === "timeout") {
+		// Nobody answered: stop the run instead of guessing a default.
+		abort();
+		return toolResult("cancelled", [], S.timedOut, true);
+	}
+	if (outcome.status === "cancelled") return cancelled();
+	const results = fillDefaults(questions, outcome.answers);
+	return results ? toolResult("answered", results, buildResultText(results)) : cancelled();
 }
