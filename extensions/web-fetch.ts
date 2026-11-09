@@ -13,7 +13,7 @@ import {
 	resolveChoice,
 	saveChoice,
 } from "./web-fetch/classify.ts";
-import { FetchError, cleanupSaved, fetchAndExtract, preview, sanitize, saveFullText } from "./web-fetch/logic.ts";
+import { cleanupSaved, fetchAndExtract, preview, sanitize, saveFullText } from "./web-fetch/logic.ts";
 import { filterChoices, pickClassifier } from "./web-fetch/picker.ts";
 
 // Output cap for the agent's context (~8k tokens). The full text goes to a temp file.
@@ -81,7 +81,7 @@ export default function webFetch(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "web_fetch",
 		label: "web_fetch",
-		description: `Fetch a URL (HTML, PDF, text) as markdown. Output is capped at ${formatSize(MAX_BYTES)}; the full text is then saved to a file you can read with offset/limit.`,
+		description: `Fetch HTML, PDF or text as markdown. Returns a ${MAX_BYTES / 1024}KB/${MAX_LINES}-line preview plus a truncation note; full extracted text is saved when truncated.`,
 		promptSnippet: "Fetch a web page or PDF as markdown",
 		parameters: Type.Object({ url: Type.String({ description: "http(s) URL" }) }),
 

@@ -709,6 +709,14 @@ test("R9: usage of a finished model call survives every later outcome", async ()
 	});
 });
 
+test("S3: the description is one line naming the preview and the saved extracted text", async () => {
+	await withTool(async (tool) => {
+		assert.doesNotMatch(tool.description, /\n/);
+		assert.match(tool.description, /32KB\/1000-line preview plus a truncation note; full extracted text is saved when truncated/);
+		assert.doesNotMatch(tool.description, /capped/);
+	});
+});
+
 test("R9: without a model call, errors are thrown as before", async () => {
 	await withTool(async (tool) => {
 		await assert.rejects(tool.execute("id", { url: "file:///etc/passwd" }, undefined, undefined, ctxReplying("PUBLIC")), /Only http/);
