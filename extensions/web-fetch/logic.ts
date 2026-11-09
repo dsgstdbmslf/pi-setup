@@ -388,6 +388,9 @@ export async function pdfToText(
 
 // ── Direct fetch ────────────────────────────────────────────────────
 
+/** The redirects a browser follows; others (300, 304, 305...) are returned as they are. */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 /**
  * Fetch with browser headers. Redirects are followed by hand (up to MAX_REDIRECTS) so every
  * hop is known: errors carry the chain, so the Jina fallback can check all of it.
@@ -408,18 +411,17 @@ export async function fetchDirect(url: string, signal?: AbortSignal): Promise<Fe
 			}
 			status = response.status;
 			const location = response.headers.get("location");
-			if (status < 300 || status >= 400 || status === 304 || !location) break;
+			if (!REDIRECT_STATUSES.has(status) || !location) break;
 			await cancelBody(response);
 			if (chain.length > MAX_REDIRECTS) throw new FetchError(`Too many redirects (over ${MAX_REDIRECTS})`, false, status, chain);
-			let next: URL;
+			let next: string;
 			try {
-				next = new URL(location, current);
-			} catch {
-				throw new FetchError(`Invalid redirect location: ${location}`, false, status, chain);
+				next = checkUrl(new URL(location, current).href).href;
+			} catch (err) {
+				// The location itself is not quoted: it may carry credentials.
+				throw new FetchError(`Invalid redirect: ${err instanceof FetchError ? err.message : "Invalid URL"}`, false, status, chain);
 			}
-			if (next.protocol !== "http:" && next.protocol !== "https:")
-				throw new FetchError(`Redirect to unsupported ${next.protocol} URL`, false, status, chain);
-			chain.push(next.href);
+			chain.push(next);
 		}
 		const result = await readResponse(response, chain, signal);
 		return chain.length > 1 ? { ...result, redirects: chain } : result;
@@ -533,14 +535,28 @@ for (const [net, prefix] of [
 ] as const)
 	specialV6.addSubnet(net, prefix, "ipv6");
 
+/** The IPv4 address inside an IPv4-mapped IPv6 address, in any spelling (`::ffff:8.8.8.8`, `::ffff:808:808`). */
+function mappedV4(ip: string): string | undefined {
+	let host: string;
+	try {
+		host = new URL(`http://[${ip}]/`).hostname; // canonical form: `[::ffff:808:808]`
+	} catch {
+		return undefined;
+	}
+	const m = /^\[::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})\]$/.exec(host);
+	if (!m) return undefined;
+	const [hi, lo] = [Number.parseInt(m[1], 16), Number.parseInt(m[2], 16)];
+	return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+}
+
 /** True unless `ip` is a publicly routable address (fails closed for anything unusual). */
 export function isPrivateIP(ip: string): boolean {
-	const v4 = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip)?.[1];
-	if (v4) return privateV4.check(v4, "ipv4");
 	const family = isIP(ip);
 	if (family === 4) return privateV4.check(ip, "ipv4");
-	if (family === 6) return !globalV6.check(ip, "ipv6") || specialV6.check(ip, "ipv6");
-	return true;
+	if (family !== 6) return true;
+	const v4 = mappedV4(ip);
+	if (v4) return privateV4.check(v4, "ipv4");
+	return !globalV6.check(ip, "ipv6") || specialV6.check(ip, "ipv6");
 }
 
 const PRIVATE_HOST = /(^localhost$|\.(localhost|local|internal|intranet|lan|home|corp|private|home\.arpa)$)/i;
@@ -591,7 +607,14 @@ export async function privateReason(
 		if (isSecretParam(name)) return `secret-looking query parameter "${name}"`;
 		if (isTokenLike(value)) return `token-like value in query parameter "${name}"`;
 	}
-	if (u.pathname.split("/").some((part) => isTokenLike(part))) return "token-like path segment";
+	// Servers usually percent-decode the path, so `%64` must not hide a token.
+	let decoded: string;
+	try {
+		decoded = decodeURIComponent(u.pathname);
+	} catch {
+		return "malformed percent-encoding in the path";
+	}
+	if (`${u.pathname}/${decoded}`.split(/[/\\]/).some(isTokenLike)) return "token-like path segment";
 	if (isIP(host)) return isPrivateIP(host) ? "private IP address" : null;
 	if (!host.includes(".")) return "single-label host name";
 	let addrs: string[];
@@ -678,13 +701,14 @@ async function run(url: string, opts: FetchOptions, signal: AbortSignal): Promis
 	}
 	if (!error.fallback) throw error;
 	// Check every hop: a harmless URL may redirect to a private host or a signed URL.
-	const chain = [...new Set((error.chain?.length ? error.chain : [url]).map(withoutHash))];
+	// The chain keeps repeats (A → B → A ends at A); the guard checks each distinct URL once.
+	const chain = (error.chain?.length ? error.chain : [url]).map(withoutHash);
 	const skip = await (async () => {
 		if (!opts.jina) return "disabled";
 		// 401/407 mean the page needs our credentials: it is not public.
 		if (error.status === 401 || error.status === 407) return "page requires authentication";
 		if (!opts.classify) return "no classifier";
-		for (const hop of chain) {
+		for (const hop of new Set(chain)) {
 			const reason = await guard(hop, { signal });
 			if (reason) return chain.length > 1 ? `${reason} (in redirect chain)` : reason;
 		}

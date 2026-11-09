@@ -262,3 +262,96 @@ test("R2: text at or below the budget is kept whole, with its line breaks", asyn
 	assert.doesNotMatch(body(emoji.content), /[\ud800-\udbff]$/);
 	assert.ok(body(emoji.content).length <= MAX_PDF_TEXT_CHARS);
 });
+
+// ── R3: percent-encoded paths ───────────────────────────────────────
+
+test("R3: percent-encoded token paths are refused like their decoded form", async () => {
+	const reason = (url: string) => privateReason(url, { resolve: pub });
+	assert.match((await reason("https://example.com/s/aB3dE5fG7hJ9kL1mN3pQ5rS7"))!, /token-like path/);
+	assert.match((await reason("https://example.com/s/aB3%64E5fG7hJ9kL1mN3pQ5rS7"))!, /token-like path/);
+	assert.match((await reason("https://example.com/s%2FaB3dE5fG7hJ9kL1mN3pQ5rS7"))!, /token-like path/);
+	assert.match((await reason("https://example.com/x%5CaB3dE5fG7hJ9kL1mN3pQ5rS7"))!, /token-like path/);
+	assert.match((await reason("https://example.com/a%zz/b"))!, /malformed percent-encoding/);
+	assert.match((await reason("https://example.com/a%E0%A4"))!, /malformed percent-encoding/);
+	assert.equal(await reason("https://ru.wikipedia.org/wiki/%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82"), null);
+	assert.equal(await reason("https://example.com/docs/hello%20world"), null);
+	assert.equal(await reason("https://github.com/a/b/commit/0123456789abcdef0123456789abcdef01234567"), null);
+});
+
+test("R3: an encoded token URL reaches neither the classifier nor Jina", async () => {
+	let classified = 0;
+	let jina = 0;
+	await assert.rejects(
+		fetchAndExtract("https://example.com/s/aB3%64E5fG7hJ9kL1mN3pQ5rS7", {
+			jina: true,
+			direct: async () => {
+				throw new FetchError("HTTP 403", true, 403);
+			},
+			guard: (u, o) => privateReason(u, { ...o, resolve: pub }),
+			classify: async () => (classified++, null),
+			viaJina: async () => (jina++, ok),
+		}),
+		/skipped: token-like path/,
+	);
+	assert.equal(classified + jina, 0);
+});
+
+// ── R4: the real last hop ───────────────────────────────────────────
+
+test("R4: a redirect chain A → B → A keeps A as its last hop", async () => {
+	const A = "https://a.com/start";
+	const B = "https://b.com/login";
+	const guarded: string[] = [];
+	let classified: string[] = [];
+	let sent = "";
+	const r = await fetchAndExtract(`${A}#frag`, {
+		jina: true,
+		direct: async () => {
+			throw new FetchError("HTTP 403", true, 403, [`${A}#frag`, B, A]);
+		},
+		guard: async (u) => (guarded.push(u), null),
+		classify: async (urls) => ((classified = urls), null),
+		viaJina: async (u) => ((sent = u), { ...ok, url: u }),
+	});
+	assert.equal(r.via, "jina");
+	assert.deepEqual(classified, [A, B, A]);
+	assert.deepEqual(guarded, [A, B]);
+	assert.equal(sent, A);
+
+	// The same with a real server that answers the second visit differently.
+	await assert.rejects(fetchDirect(`${base}/ra`), (e: FetchError) => e.status === 403 && e.chain?.join(" ") === `${base}/ra ${base}/rb ${base}/ra`);
+});
+
+// ── R12: redirect statuses and next-hop checks ──────────────────────
+
+test("R12: only 301/302/303/307/308 are followed", async () => {
+	for (const s of [301, 302, 303, 307, 308]) assert.equal((await fetchDirect(`${base}/s${s}`)).content, "reached", String(s));
+	hits["/counted"] = 0;
+	for (const s of [300, 304, 305, 306]) {
+		await assert.rejects(fetchDirect(`${base}/s${s}`), (e: FetchError) => e.status === s, String(s));
+	}
+	assert.equal(hits["/counted"], 0);
+});
+
+test("R12: every redirect target passes the same URL checks before it is fetched", async () => {
+	hits["/counted"] = 0;
+	await assert.rejects(fetchDirect(`${base}/to-creds`), (e: FetchError) => !e.fallback && /credentials/.test(e.message) && !/hunter2/.test(e.message));
+	await assert.rejects(fetchDirect(`${base}/to-bad`), (e: FetchError) => !e.fallback && /Invalid redirect/.test(e.message));
+	await assert.rejects(fetchDirect(`${base}/to-long`), (e: FetchError) => !e.fallback && /too long/.test(e.message));
+	assert.equal(hits["/counted"], 0);
+	assert.equal((await fetchDirect(`${base}/chain/${MAX_REDIRECTS}`)).title, "Hello page");
+	await assert.rejects(fetchDirect(`${base}/chain/${MAX_REDIRECTS + 1}`), /Too many redirects/);
+});
+
+// ── R11: IPv4-mapped IPv6 ───────────────────────────────────────────
+
+test("R11: IPv4-mapped IPv6 addresses get the decision of their IPv4 address in every spelling", async () => {
+	for (const ip of ["::ffff:8.8.8.8", "::FFFF:8.8.8.8", "::ffff:808:808", "0:0:0:0:0:ffff:808:808", "0000:0000:0000:0000:0000:FFFF:0808:0808"])
+		assert.equal(isPrivateIP(ip), false, ip);
+	for (const ip of ["::ffff:10.0.0.1", "::ffff:a00:1", "0:0:0:0:0:ffff:7f00:1", "::FFFF:C0A8:101", "::ffff:0:0", "::ffff:a9fe:a9fe"])
+		assert.equal(isPrivateIP(ip), true, ip);
+	assert.equal(await privateReason("http://[::ffff:8.8.8.8]/", { resolve: pub }), null);
+	assert.equal(await privateReason("http://[0:0:0:0:0:ffff:808:808]/", { resolve: pub }), null);
+	assert.match((await privateReason("http://[::ffff:127.0.0.1]/", { resolve: pub }))!, /private IP/);
+	assert.match((await privateReason("http://[::ffff:c0a8:101]/", { resolve: pub }))!, /private IP/);
+});
