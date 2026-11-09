@@ -1,4 +1,4 @@
-// Regression tests for the second review round (R1-R13). No real network, model or agent config:
+// Regression tests for the review rounds (R1-R13, S1-S3). No real network, model or agent config:
 // local HTTP fixtures, mocked fetch/registry, and temp directories for the agent dir and TMPDIR.
 
 import assert from "node:assert/strict";
@@ -261,6 +261,30 @@ test("R2: text at or below the budget is kept whole, with its line breaks", asyn
 	const emoji = await pdfToText(new Uint8Array(), "u", undefined, fakePdf([[{ str: `a${"😀".repeat(MAX_PDF_TEXT_CHARS)}` }]]).open);
 	assert.doesNotMatch(body(emoji.content), /[\ud800-\udbff]$/);
 	assert.ok(body(emoji.content).length <= MAX_PDF_TEXT_CHARS);
+});
+
+// ── S1: whitespace never costs text that fits ───────────────────────
+
+const pdfText = (pages: Item[][]) => pdfToText(new Uint8Array(), "u", undefined, fakePdf(pages).open);
+
+test("S1: a long whitespace run does not drop the text after it", async () => {
+	const two = await pdfText([[{ str: "x".repeat(MAX_PDF_TEXT_CHARS - 20) }], [{ str: `A${" ".repeat(2000)}TAIL` }]]);
+	assert.equal(two.content, `Pages: 2\n\n${"x".repeat(MAX_PDF_TEXT_CHARS - 20)}\n\nA TAIL`);
+	const one = await pdfText([[{ str: `${" ".repeat(4_001_100)}IMPORTANT` }]]);
+	assert.equal(one.content, "Pages: 1\n\nIMPORTANT");
+});
+
+test("S1: whitespace runs split across items normalize as if joined", async () => {
+	const r = await pdfText([
+		[{ str: " a " }, { str: "\t b" }, { str: "  ", hasEOL: true }, { str: " " }, { str: "\n" }, { str: " \n\n c", hasEOL: true }, { str: "d " }, { str: "  " }],
+	]);
+	assert.equal(r.content, "Pages: 1\n\na b\n\nc\nd");
+});
+
+test("S1: a suffix that really does not fit is cut with a note, also on the last page", async () => {
+	const r = await pdfText([[{ str: "x".repeat(MAX_PDF_TEXT_CHARS - 20) }], [{ str: `A${" ".repeat(2000)}${"T".repeat(100)}` }]]);
+	assert.equal(r.content, `Pages: 2 (text cut at 2000000 characters, on page 2)\n\n${"x".repeat(MAX_PDF_TEXT_CHARS - 20)}\n\nA ${"T".repeat(16)}`);
+	assert.equal(body(r.content).length, MAX_PDF_TEXT_CHARS);
 });
 
 // ── R3: percent-encoded paths ───────────────────────────────────────

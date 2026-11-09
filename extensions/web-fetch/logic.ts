@@ -310,10 +310,6 @@ export function htmlToMarkdown(html: string, url: string): FetchResult {
 type PdfItem = { str?: string; hasEOL?: boolean };
 type PdfDoc = Awaited<ReturnType<typeof import("unpdf").getDocumentProxy>>;
 
-function normalizeSpaces(text: string): string {
-	return text.replace(/[ \t]+/g, " ").replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n");
-}
-
 /** At most `max` UTF-16 units of `text`, never ending in half a surrogate pair. */
 function cutChars(text: string, max: number): string {
 	const cut = text.slice(0, max);
@@ -321,22 +317,34 @@ function cutChars(text: string, max: number): string {
 }
 
 /**
- * The text of one page, keeping line breaks. Stops reading items once the text cannot fit in
- * `room` characters; `cut` says whether anything was left out.
+ * The text of one page, keeping line breaks, normalized as it is read: a run of spaces/tabs
+ * becomes one space, a run holding line breaks becomes one or two of them, and the ends are
+ * trimmed. Stops once the normalized text cannot fit in `room` characters; `cut` says so.
  */
 function pageText(items: PdfItem[], room: number): { text: string; cut: boolean } {
-	// Whitespace collapses, so the raw text may run ahead of the budget before it is normalized.
-	const slack = 2 * room + 1024;
-	let text = "";
+	const out: string[] = [];
+	let len = 0;
+	let space = false; // whitespace pending between words
+	let breaks = 0; // line breaks in it
 	for (const item of items) {
-		text += (item.str ?? "").slice(0, slack) + (item.hasEOL ? "\n" : "");
-		if (text.length > slack) {
-			text = normalizeSpaces(text);
-			if (text.trim().length > room) break;
+		for (const [word] of `${item.str ?? ""}${item.hasEOL ? "\n" : ""}`.matchAll(/[ \t\n]+|[^ \t\n]+/g)) {
+			if (/^[ \t\n]/.test(word)) {
+				space = true;
+				for (let i = 0; i < word.length && breaks < 2; i++) if (word[i] === "\n") breaks++;
+				continue;
+			}
+			const piece = (len && space ? (breaks ? "\n".repeat(breaks) : " ") : "") + word;
+			space = false;
+			breaks = 0;
+			if (len + piece.length > room) {
+				out.push(cutChars(piece, room - len));
+				return { text: out.join("").trim(), cut: true };
+			}
+			out.push(piece);
+			len += piece.length;
 		}
 	}
-	text = normalizeSpaces(text).trim();
-	return text.length > room ? { text: cutChars(text, room).trimEnd(), cut: true } : { text, cut: false };
+	return { text: out.join("").trim(), cut: false };
 }
 
 /**
