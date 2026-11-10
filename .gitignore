@@ -1,6 +1,10 @@
 # Secrets - keep local only
 auth.json
 **/auth.json
+api-keys.json
+**/api-keys.json
+api-keys-state/
+**/api-keys-state/
 .env
 .env.*
 
@@ -34,4 +38,5 @@ tmp/
 # Local pi state never committed
 trust.json
 models-store.json
+web-fetch.json
 *.bak*
