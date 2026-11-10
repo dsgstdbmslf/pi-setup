@@ -129,6 +129,9 @@ copy one by hand to use it. Kept for reference.
 - `deprecated/extensions/web-fetch/` — `web_fetch` tool: URL to markdown (HTML, PDF,
   text) with a 12KB preview and a privacy-checked Jina fallback. Replaced by Tavily;
   see its [README](deprecated/extensions/web-fetch/README.md) for install and details
+- `deprecated/extensions/orca-kitty-images/` — set `WEZTERM_PANE` in Orca so fullscreen
+  drew Kitty images after text. pi 1.5.1 does this itself; see its
+  [README](deprecated/extensions/orca-kitty-images/README.md)
 
 ## Rollback
 
