@@ -18,7 +18,7 @@ import {
 	verdictFor,
 	withRotation,
 } from "../extensions/tavily/keys.ts";
-import { call, compact, credits, plain } from "../extensions/tavily/client.ts";
+import { call, compact, credits, plain, serverText, statusLabel } from "../extensions/tavily/client.ts";
 import { cleanupSaved, ensurePrivateDir, plural, sanitize, saveFull } from "../extensions/tavily/output.ts";
 
 const markFile = (stateDir: string, key: string) => join(stateDir, "tavily", `${fingerprint(key)}.json`);
@@ -279,7 +279,7 @@ test("loadKeys skips keys that are not valid header values and reports their lab
 	assert.deepEqual((await new KeyPool("tavily", keysFile, join(tmpdir(), "x-state")).snapshot()).malformed, malformed);
 });
 
-test("call redacts the key from fetch errors and drops the cause", async () => {
+test("call withholds fetch errors that carry the key and drops the cause", async () => {
 	const key = "tvly-dummy-secret-0001";
 	const fetchImpl = (async () => {
 		throw new TypeError(`Headers.append: "Bearer ${key}" is an invalid header value.`, {
@@ -289,7 +289,7 @@ test("call redacts the key from fetch errors and drops the cause", async () => {
 	await assert.rejects(call("/search", key, { timeoutMs: 1000, fetchImpl }), (err: Error) => {
 		assert.ok(!err.message.includes(key));
 		assert.ok(!err.message.includes("tvly-dummy"));
-		assert.match(err.message, /^Tavily \/search: request failed: .*\[redacted\]/);
+		assert.equal(err.message, "Tavily /search: request failed (details withheld)");
 		assert.equal(err.cause, undefined);
 		return true;
 	});
@@ -588,4 +588,320 @@ test("snapshot() and clear() create nothing; only mark() does", async () => {
 	await assert.rejects(lstat(stateDir), { code: "ENOENT" });
 	await pool.mark(entryOf(KEY_A), markOf("invalid"));
 	assert.equal((await lstat(stateDir)).isDirectory(), true);
+});
+
+// ---------- error redaction, error cap, response budget ----------
+
+const SECRET = "tvly-dummy-secret-0001";
+const respond = (body: BodyInit | null, init: ResponseInit) => (async () => new Response(body, init)) as typeof fetch;
+const MIB = 1024 * 1024;
+
+test("HTTP error messages are bounded: 1 MiB bodies, 400 and 500", async () => {
+	const words = "word ".repeat(MIB / 5);
+	for (const status of [400, 500]) {
+		// readable text is cut; a single huge token is withheld
+		// (the JSON bodies are cut by the 64 KiB read limit, so they are shown as raw text)
+		for (const body of [JSON.stringify({ detail: { error: words } }), words, JSON.stringify({ detail: words })]) {
+			const r = await call("/extract", "tvly-k", { timeoutMs: 1000, fetchImpl: respond(body, { status }) });
+			assert.ok(!r.ok);
+			assert.ok(r.message.length <= 400, `${r.message.length}`);
+			assert.ok(r.message.startsWith(`Tavily /extract ${status}: `) && r.message.includes("word word"));
+			assert.ok(r.message.endsWith("..."));
+		}
+		const full = await call("/extract", "tvly-k", { timeoutMs: 1000, fetchImpl: respond(JSON.stringify({ detail: { error: "word ".repeat(1000) } }), { status }) });
+		assert.ok(!full.ok && full.message.startsWith(`Tavily /extract ${status}: word word`) && full.message.length <= 400);
+		for (const body of [JSON.stringify({ detail: { error: "y".repeat(MIB) } }), "y".repeat(MIB), `<p>${words}</p>`]) {
+			const r = await call("/extract", "tvly-k", { timeoutMs: 1000, fetchImpl: respond(body, { status }) });
+			assert.ok(!r.ok);
+			assert.equal(r.message, `Tavily /extract ${status}: ${statusLabel(status)} (server text withheld)`);
+		}
+	}
+});
+
+test("network error messages are bounded and withheld when not plain", async () => {
+	const failWith = (text: string, cause: string) =>
+		call("/search", "tvly-k", { timeoutMs: 1000, fetchImpl: (async () => { throw new TypeError(text, { cause: new Error(cause) }); }) as typeof fetch });
+	await assert.rejects(failWith("word ".repeat(MIB / 5), "c "), (err: Error) => err.message.length <= 400 && err.message.endsWith("..."));
+	await assert.rejects(failWith("z".repeat(MIB), "c"), { message: "Tavily /search: request failed (details withheld)" });
+	await assert.rejects(failWith("fetch failed", "connect ECONNREFUSED 127.0.0.1:443"), {
+		message: "Tavily /search: request failed: fetch failed (connect ECONNREFUSED 127.0.0.1:443)",
+	});
+});
+
+/** A body stream that yields `chunks` and records pull/cancel. */
+function stream(chunks: Uint8Array[], opts: { hang?: boolean } = {}) {
+	const state = { pulls: 0, cancelled: false };
+	let i = 0;
+	const body = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			state.pulls++;
+			if (i < chunks.length) controller.enqueue(chunks[i++]);
+			else if (!opts.hang) controller.close();
+			else return new Promise(() => {});
+		},
+		cancel() {
+			state.cancelled = true;
+		},
+	});
+	return { body, state };
+}
+const enc = new TextEncoder();
+
+test("call refuses a response over maxBytes and cancels the stream", async () => {
+	const chunk = enc.encode("x".repeat(400));
+	const { body, state } = stream(Array(100).fill(chunk));
+	await assert.rejects(
+		call("/crawl", "tvly-k", { timeoutMs: 1000, maxBytes: 1024, fetchImpl: respond(body, { status: 200 }) }),
+		/Tavily \/crawl: response exceeds 1 KiB; narrow the request/,
+	);
+	assert.equal(state.cancelled, true);
+	assert.ok(state.pulls < 10, `stopped reading early (${state.pulls} pulls)`);
+});
+
+test("an oversized overflow is an error, not a failed attempt: keys are not rotated", async () => {
+	const { pool, stateDir } = await setup({ tavily: [KEY_A, KEY_B] });
+	const calls: (string | null)[] = [];
+	const run = (key: string | null) => {
+		calls.push(key);
+		return call("/crawl", key, { timeoutMs: 1000, maxBytes: 100, fetchImpl: respond("x".repeat(500), { status: 200 }) });
+	};
+	await assert.rejects(withRotation(pool, run, { keyless: true }), /response exceeds/);
+	assert.deepEqual(calls, [KEY_A]);
+	assert.deepEqual(await stateFiles(stateDir), []);
+});
+
+test("a declared Content-Length over the limit fails before reading", async () => {
+	const { body, state } = stream([enc.encode("{}")]);
+	await assert.rejects(
+		call("/map", "tvly-k", { timeoutMs: 1000, maxBytes: 1024, fetchImpl: respond(body, { status: 200, headers: { "content-length": "5000" } }) }),
+		/response exceeds/,
+	);
+	assert.ok(state.pulls <= 1, `${state.pulls} pulls`);
+	assert.equal(state.cancelled, true);
+});
+
+test("a multi-chunk body with a multibyte character split across chunks parses", async () => {
+	const bytes = enc.encode(JSON.stringify({ results: ["héllo wörld ✓ 日本語 😀"] }));
+	const chunks: Uint8Array[] = [];
+	for (let i = 0; i < bytes.length; i += 3) chunks.push(bytes.subarray(i, i + 3)); // splits every multibyte char
+	const { body } = stream(chunks);
+	const r = await call("/map", "tvly-k", { timeoutMs: 1000, maxBytes: bytes.length, fetchImpl: respond(body, { status: 200 }) });
+	assert.deepEqual(r, { ok: true, value: { results: ["héllo wörld ✓ 日本語 😀"] } });
+});
+
+test("a huge non-2xx body gives a bounded failed attempt, not an error", async () => {
+	const chunk = enc.encode('{"detail":{"error":"' + "e".repeat(8000));
+	const { body, state } = stream([chunk, ...Array(50).fill(chunk)]);
+	const r = await call("/extract", "tvly-k", { timeoutMs: 1000, fetchImpl: respond(body, { status: 432, headers: { "retry-after": "7" } }) });
+	assert.ok(!r.ok);
+	assert.equal(r.status, 432);
+	assert.equal(r.retryAfter, 7);
+	assert.ok(r.message.length <= 400);
+	assert.equal(state.cancelled, true);
+	assert.ok(state.pulls < 20, `${state.pulls} pulls`);
+	assert.equal(verdictFor(r.status), "exhausted");
+});
+
+test("a timeout while reading the body reports the timeout", async () => {
+	const keepAlive = setTimeout(() => {}, 5000);
+	const { body, state } = stream([enc.encode('{"a":')], { hang: true });
+	await assert.rejects(call("/map", "k", { timeoutMs: 30, fetchImpl: respond(body, { status: 200 }) }), /Tavily \/map: timed out after 0.03s/);
+	assert.equal(state.cancelled, true);
+	clearTimeout(keepAlive);
+});
+
+test("a caller abort while reading the body rethrows the abort error", async () => {
+	const ctrl = new AbortController();
+	const { body, state } = stream([enc.encode('{"a":')], { hang: true });
+	const p = call("/map", "k", { timeoutMs: 5000, signal: ctrl.signal, fetchImpl: respond(body, { status: 200 }) });
+	setTimeout(() => ctrl.abort(), 20);
+	await assert.rejects(p, { name: "AbortError" });
+	assert.equal(state.cancelled, true);
+});
+
+test("a body that is null is empty; the reader is released after a normal read", async () => {
+	const empty = await call("/map", "k", { timeoutMs: 1000, fetchImpl: respond(null, { status: 200 }) });
+	assert.deepEqual(empty, { ok: true, value: {} });
+	let resp!: Response;
+	const fetchImpl = (async () => (resp = new Response('{"ok":1}'))) as typeof fetch;
+	await call("/map", "k", { timeoutMs: 1000, fetchImpl });
+	assert.equal(resp.body?.locked, false);
+});
+
+// ---------- allowlisted server text, fixed mark reasons ----------
+
+const SPLIT_KEY = "tvly-dev-AB0123456789abcdef0123456789abcdef";
+/** The key (or part of it) hidden in ways that defeat pattern matching: the reviewers' cases and more. */
+const HIDDEN: Record<string, string> = {
+	"tag after the regex prefix": `${SPLIT_KEY.slice(0, 11)}<b></b>${SPLIT_KEY.slice(11)}`,
+	"tag after tvly-re": `${SPLIT_KEY.slice(0, 7)}<b></b>${SPLIT_KEY.slice(7)}`,
+	"quoted > in attribute": `${SPLIT_KEY.slice(0, 7)}<span title=">">${SPLIT_KEY.slice(7)}`,
+	"U+2066": `${SPLIT_KEY.slice(0, 7)}\u2066${SPLIT_KEY.slice(7)}`,
+	"U+061C": `${SPLIT_KEY.slice(0, 7)}\u061c${SPLIT_KEY.slice(7)}`,
+	"zero-width space": `${SPLIT_KEY.slice(0, 7)}\u200b${SPLIT_KEY.slice(7)}`,
+	"decimal entity": `tvly-re&#118;iew${SPLIT_KEY.slice(11)}`,
+	"newline": `${SPLIT_KEY.slice(0, 7)}\n${SPLIT_KEY.slice(7)}`,
+	"space-separated chunks": SPLIT_KEY.match(/.{1,6}/g)!.join(" "),
+	"dot-separated chunks": SPLIT_KEY.match(/.{1,5}/g)!.join("."),
+	"partial key, 12 characters": `bad ${SPLIT_KEY.slice(16, 28)} here`,
+	"partial key, separated": `bad ${SPLIT_KEY.slice(20, 26)} ${SPLIT_KEY.slice(26, 33)} here`,
+	"lowercased": SPLIT_KEY.toLowerCase().replace(/-/g, " "),
+	"escaped": "tvl\\u0079-dev",
+	"unknown token": "key sk-live-0123456789abcdefghij0123 rejected",
+	"bearer": "Authorization: Bearer abc.def",
+};
+/** Letters and digits only, lowercased, as serverText compares. */
+const compactOf = (text: string) => text.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+const leaksKey = (text: string) => {
+	const own = compactOf(SPLIT_KEY);
+	const flat = compactOf(text);
+	if (flat.includes("tvly")) return true;
+	for (let i = 0; i + 12 <= own.length; i++) if (flat.includes(own.slice(i, i + 12))) return true;
+	return false;
+};
+
+test("serverText withholds every hidden or partial credential, with and without a known key", () => {
+	for (const [name, hidden] of Object.entries(HIDDEN)) {
+		assert.equal(serverText(`Invalid key ${hidden} for you`, SPLIT_KEY), null, name);
+		assert.equal(serverText(`x ${"word ".repeat(100)}${hidden}`, SPLIT_KEY), null, `${name} after a long prefix`);
+	}
+	for (const name of ["tag after the regex prefix", "U+2066", "newline", "space-separated chunks", "unknown token", "bearer"]) {
+		assert.equal(serverText(HIDDEN[name], null), name === "space-separated chunks" ? serverText(HIDDEN[name], null) : null, name);
+	}
+});
+
+test("serverText rules: ASCII only, no markup or escapes, no long token, whitespace collapsed", () => {
+	for (const bad of ["caf\u00e9", "emoji \ud83d\ude00", "a\u0000b", "a\x7fb", "<b>x</b>", "a > b", "x &amp; y", "a\\nb", "A".repeat(20), "a-b_".repeat(5)]) {
+		assert.equal(serverText(bad, null), null, JSON.stringify(bad));
+	}
+	assert.equal(serverText("A".repeat(19), null), "A".repeat(19));
+	assert.equal(serverText("  two\t\nlines \r\n here  ", null), "two lines here");
+	assert.equal(serverText("", null), "");
+	assert.ok((serverText("word ".repeat(200), null)?.length ?? 0) <= 303);
+	assert.equal(serverText("word ".repeat(200), null, 10), "word word...");
+	assert.equal(serverText("short key k and tvly-k", "k"), null, "tvly rule");
+	assert.equal(serverText("see tokens and mor here", "tokens-and-more-secrets"), null, "a 12-character window of the key");
+	assert.equal(serverText("tokens appear here", "k"), "tokens appear here", "a very short key is not a window");
+});
+
+test("ordinary Tavily messages are shown verbatim", () => {
+	for (const text of [
+		"Usage limit exceeded",
+		"Invalid URL: https://example.com/a",
+		"Query is too long. Max query length is 400 characters.",
+		"Your request has been blocked due to excessive requests. Please reduce rate of requests.",
+		"Unauthorized: missing or invalid API key.",
+	]) {
+		assert.equal(serverText(text, SPLIT_KEY), text);
+	}
+});
+
+test("statusLabel is fixed per status", () => {
+	assert.deepEqual([400, 401, 403, 429, 432, 433, 500, 503, 418].map(statusLabel), [
+		"bad request",
+		"invalid API key",
+		"forbidden",
+		"rate limited",
+		"plan credit limit reached",
+		"pay-as-you-go limit reached",
+		"server error",
+		"server error",
+		"HTTP error",
+	]);
+});
+
+test("call withholds hidden credentials: JSON detail.error, detail string and plain bodies, 400/401/432/500", async () => {
+	for (const status of [400, 401, 432, 500]) {
+		for (const [name, hidden] of Object.entries(HIDDEN)) {
+			const bodies = [
+				JSON.stringify({ detail: { error: `Invalid key ${hidden}` } }),
+				JSON.stringify({ detail: `Invalid key ${hidden}` }),
+				`Invalid key ${hidden}`,
+			];
+			for (const body of bodies) {
+				const r = await call("/extract", SPLIT_KEY, { timeoutMs: 1000, fetchImpl: respond(body, { status }) });
+				assert.ok(!r.ok);
+				assert.equal(r.message, `Tavily /extract ${status}: ${statusLabel(status)} (server text withheld)`, `${status} ${name}`);
+			}
+		}
+	}
+	// an echoed key in the status line, and an empty body
+	const r = await call("/x", SPLIT_KEY, { timeoutMs: 1000, fetchImpl: respond("", { status: 401, statusText: `echo ${SPLIT_KEY}` }) });
+	assert.ok(!r.ok && r.message === "Tavily /x 401: invalid API key (server text withheld)");
+	const e = await call("/x", SPLIT_KEY, { timeoutMs: 1000, fetchImpl: respond("", { status: 432 }) });
+	assert.ok(!e.ok && e.message === "Tavily /x 432: plan credit limit reached");
+	const ok = await call("/x", SPLIT_KEY, { timeoutMs: 1000, fetchImpl: respond("Too many requests", { status: 429 }) });
+	assert.ok(!ok.ok && ok.message === "Tavily /x 429: Too many requests");
+});
+
+test("withRotation: marks hold only the status and a fixed label; thrown errors never carry hidden credentials", async () => {
+	for (const [name, hidden] of Object.entries(HIDDEN)) {
+		const { pool, stateDir } = await setup({ tavily: [SPLIT_KEY, KEY_B] });
+		const viaCall = (status: number) => (key: string | null) =>
+			call("/search", key, { timeoutMs: 1000, fetchImpl: respond(`Invalid key ${hidden}`, { status }) });
+		// a custom run() that returns the raw text without any vetting
+		const raw = (status: number) => async (key: string | null): Promise<Attempt<string>> => ({
+			ok: false,
+			status,
+			message: `Tavily /search ${status}: Invalid key ${hidden}`,
+		});
+		for (const make of [viaCall, raw]) {
+			for (const [status, label] of [[401, "invalid API key"], [432, "plan credit limit reached"]] as const) {
+				await pool.clear();
+				const run = (key: string | null) => (key === KEY_B ? Promise.resolve<Attempt<string>>({ ok: true, value: "b" }) : make(status)(key));
+				assert.equal((await withRotation(pool, run, { keyless: false })).value, "b");
+				assert.equal((await readMark(stateDir, SPLIT_KEY)).reason, `${status}: ${label}`, name);
+				assert.ok(!(await readFile(markFile(stateDir, SPLIT_KEY), "utf8")).includes(SPLIT_KEY.slice(0, 11)));
+			}
+			await pool.clear();
+			await assert.rejects(withRotation(pool, (k) => make(400)(k), { keyless: false }), (err: ApiError) => {
+				assert.equal(err.status, 400);
+				assert.ok(!leaksKey(err.message), `${name}: ${err.message}`);
+				assert.match(err.message, make === viaCall ? /400: bad request \(server text withheld\)$/ : /^tavily: request failed with 400 \(details withheld\)$/);
+				return true;
+			});
+		}
+		const keyless = await setup(undefined);
+		for (const make of [viaCall, raw]) {
+			await assert.rejects(withRotation(keyless.pool, (k) => make(500)(k), { keyless: true }), (err: ApiError) => {
+				// no key is sent keyless, so only key-independent patterns can be checked here
+				assert.ok(!/tvly|bearer/i.test(err.message.replace(/\W/g, "")) && err.message.endsWith("(keyless mode: no key file)"), err.message);
+				return true;
+			});
+		}
+	}
+});
+
+test("a mark file written by an older version is never shown: mark reasons are not read back into messages", async () => {
+	const { pool, stateDir } = await setup({ tavily: [SPLIT_KEY] });
+	await pool.mark(entryOf(SPLIT_KEY), { status: "invalid", until: null, reason: `401: ${SPLIT_KEY}` });
+	const snap = await pool.snapshot();
+	assert.equal(snap.available.length, 0);
+	// callers only use status; a fresh failure overwrites the reason with the fixed label
+	await pool.clear();
+	await withRotation(pool, async (k): Promise<Attempt<string>> => (k === SPLIT_KEY ? { ok: false, status: 401, message: "x" } : { ok: true, value: "" }), { keyless: true }).catch(() => {});
+	assert.equal((await readMark(stateDir, SPLIT_KEY)).reason, "401: invalid API key");
+});
+
+test("serverText and call are linear on 64 KiB of hostile input", async () => {
+	const size = 64 * 1024;
+	const inputs = [
+		"<".repeat(size),
+		"<<>".repeat(size / 3),
+		"a".repeat(size),
+		"tvly-".repeat(13_000),
+		"&#".repeat(size / 2),
+		"a ".repeat(size / 2),
+		"a-".repeat(size / 2),
+		"Bearer ".repeat(size / 7),
+		` ${"ab cd ".repeat(size / 6)}`,
+		"caf\u00e9 ".repeat(size / 6),
+		`${"word ".repeat(size / 10)}${"<".repeat(size / 2)}`,
+	];
+	for (const input of inputs) {
+		const t = Date.now();
+		serverText(input, SPLIT_KEY);
+		await call("/x", SPLIT_KEY, { timeoutMs: 1000, fetchImpl: respond(input, { status: 400 }) });
+		assert.ok(Date.now() - t < 200, `${input.slice(0, 8)}: ${Date.now() - t} ms`);
+	}
 });
