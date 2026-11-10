@@ -45,6 +45,11 @@ Sign in to a provider with `pi auth login <provider>` (sign out with `pi auth lo
 sign-in method, such as a device code, instead of opening a browser. It cannot be combined
 with `--api-key`.
 
+If a session's working directory no longer exists (for example after a folder rename),
+interactive pi asks how to open it: `Continue` runs it in the current directory and asks
+again next time; `Fork` copies it into the current directory with a new ID, so later
+resumes no longer ask; `Cancel` leaves things as they are. Other modes exit with an error.
+
 Single files work too: `cp extensions/code-fence-hide.ts ~/.pi/agent/extensions/`.
 Do not install both ways at once, or the extension loads twice.
 
@@ -140,5 +145,5 @@ restore your previous one), revert the merged settings fields, then `/reload`.
 
 ## Dependencies
 
-- pi (`@earendil-works/pi-coding-agent`) 1.5+; tested on 1.5.1
+- pi (`@earendil-works/pi-coding-agent`) 1.5+; tested on 1.5.2
 - `git` (for `pi install git:...`)
