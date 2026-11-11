@@ -1,17 +1,20 @@
 // Tool kit shared by the web-* extensions: key pool, requests with failover, result
 // truncation and rendering. Not an extension itself: pi loads only extensions/*.ts.
 
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	formatSize,
 	getAgentDir,
+	getPackageDir,
 	truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { call, credits } from "./client.ts";
+import { call, credits, cut } from "./client.ts";
+import { type Network, networkState, resolveNetwork } from "./network.ts";
 import { KEYS_FILE, KeyPool, STATE_DIR, type RotationResult, withRotation } from "./keys.ts";
 import { cleanupSaved, sanitize, saveFull } from "./output.ts";
 
@@ -40,6 +43,25 @@ export function tavilyPool(): KeyPool {
 	return new KeyPool("tavily", join(agentDir, KEYS_FILE), join(agentDir, STATE_DIR));
 }
 
+/**
+ * How Tavily connects, read from pi's settings on every call (so /reload or an edit takes effect).
+ * Extensions cannot import undici themselves; it is pi's own dependency, so it is resolved from
+ * pi's package dir. A warning is marked as shown only after a UI notify; headless, it goes into
+ * the tool result (see request()) and /search-keys.
+ */
+export function tavilyNetwork(pi: ExtensionAPI, ctx?: ExtensionContext): Network {
+	const net = resolveNetwork(pi.getSettings(), process.env, () => createRequire(join(getPackageDir(), "package.json"))("undici"));
+	if (ctx?.hasUI) {
+		const state = networkState();
+		for (const text of [...net.warnings, ...(net.error ? [net.error] : [])]) {
+			if (state.notified.has(text)) continue;
+			ctx.ui.notify(`tavily: ${text}`, "warning");
+			state.notified.add(text);
+		}
+	}
+	return net;
+}
+
 export interface RequestOptions {
 	/** Fall back to Tavily's keyless mode when no key works (search and extract only). */
 	keyless: boolean;
@@ -59,15 +81,18 @@ export function createTavily(pi: ExtensionAPI) {
 	});
 
 	/** POST to Tavily with key failover; keyless fallback where Tavily allows it. */
-	function request(path: string, body: unknown, opts: RequestOptions) {
-		return withRotation(pool, (key) => call(path, key, { body, signal: opts.signal, timeoutMs: opts.timeoutMs, maxBytes: opts.maxBytes }), {
+	async function request(path: string, body: unknown, opts: RequestOptions) {
+		const { dispatcher, warnings, error } = tavilyNetwork(pi, opts.ctx);
+		if (error) throw new Error(`Tavily ${path}: ${error}`);
+		const rot = await withRotation(pool, (key) => call(path, key, { body, signal: opts.signal, timeoutMs: opts.timeoutMs, maxBytes: opts.maxBytes, dispatcher }), {
 			keyless: opts.keyless,
 			onNote: (note) => opts.ctx.hasUI && opts.ctx.ui.notify(note, "warning"),
 		});
+		return { ...rot, warnings };
 	}
 
 	/** Tool result: text capped at MAX_BYTES/MAX_LINES, the rest saved to a temp file. */
-	async function finish(text: string, summary: string, rot: RotationResult<unknown>, data: unknown) {
+	async function finish(text: string, summary: string, rot: RotationResult<unknown> & { warnings?: string[] }, data: unknown) {
 		const details: Details = { summary, via: rot.via, credits: credits(data), notes: rot.notes };
 		const t = truncateHead(text, { maxBytes: MAX_BYTES, maxLines: MAX_LINES });
 		let out = t.content;
@@ -75,6 +100,7 @@ export function createTavily(pi: ExtensionAPI) {
 			details.fullOutputPath = await saveFull(text);
 			out += `\n\n[Truncated: ${t.outputLines} of ${t.totalLines} lines (${formatSize(t.outputBytes)} of ${formatSize(t.totalBytes)}). Full text: ${details.fullOutputPath}]`;
 		}
+		for (const warning of rot.warnings ?? []) out += `\n\n[Tavily: ${warning}]`;
 		if (rot.via === "keyless") out += "\n\n[Tavily keyless mode: no usable API key, rate-limited]";
 		return { content: [{ type: "text" as const, text: out }], details };
 	}
@@ -83,7 +109,7 @@ export function createTavily(pi: ExtensionAPI) {
 	const render = (name: string, main: (args: any) => string, pending: string) => ({
 		renderCall(args: any, theme: any) {
 			const value = sanitize(main(args) ?? "").replace(/\s+/g, " ");
-			const shown = value.length > 80 ? `${value.slice(0, 77)}...` : value;
+			const shown = value.length > 80 ? `${cut(value, 77)}...` : value;
 			return new Text(theme.fg("toolTitle", theme.bold(`${name} `)) + theme.fg("accent", shown), 0, 0);
 		},
 		renderResult(result: any, { expanded, isPartial }: { expanded: boolean; isPartial: boolean }, theme: any, context: any) {
@@ -98,7 +124,7 @@ export function createTavily(pi: ExtensionAPI) {
 			line += theme.fg("muted", ` (${meta.filter(Boolean).join(", ")})`);
 			if (expanded) {
 				for (const note of d?.notes ?? []) line += `\n${theme.fg("warning", note)}`;
-				line += `\n${theme.fg("dim", body.length > 1500 ? `${body.slice(0, 1500)}…` : body)}`;
+				line += `\n${theme.fg("dim", body.length > 1500 ? `${cut(body, 1500)}…` : body)}`;
 			}
 			return new Text(line, 0, 0);
 		},

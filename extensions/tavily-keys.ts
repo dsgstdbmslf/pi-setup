@@ -6,7 +6,7 @@ import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { call, statusLabel } from "./tavily/client.ts";
 import { KEYS_FILE, mask, nextMonthUtc } from "./tavily/keys.ts";
-import { tavilyPool } from "./tavily/tool.ts";
+import { tavilyNetwork, tavilyPool } from "./tavily/tool.ts";
 
 const EXAMPLE = { tavily: [{ key: "tvly-YOUR_KEY", label: "main" }, { key: "tvly-SECOND_KEY", label: "backup" }] };
 
@@ -14,19 +14,22 @@ export default function tavilyKeys(pi: ExtensionAPI) {
 	const pool = tavilyPool();
 
 	async function status(ctx: ExtensionContext): Promise<string> {
+		const net = tavilyNetwork(pi, ctx);
+		const netLines = [`network: ${net.description}`, ...net.warnings.map((w) => `Warning: ${w}.`)];
 		const snap = await pool.snapshot();
-		if (snap.missing) return `No key file. Run /search-keys init, then put your keys into ${pool.keysFile}.`;
+		if (snap.missing) return [`No key file. Run /search-keys init, then put your keys into ${pool.keysFile}.`, ...netLines].join("\n");
 		const all = [...snap.available.map((entry) => ({ entry, mark: undefined })), ...snap.skipped];
 		const bad = snap.malformed.length
 			? `Warning: skipped ${snap.malformed.length} malformed key(s) (${snap.malformed.join(", ")}): keys may contain only visible ASCII characters.`
 			: "";
 		const warn = [bad, snap.stateWarning ? `Warning: ${snap.stateWarning}.` : ""].filter(Boolean);
-		if (all.length === 0) return [`No tavily keys in ${pool.keysFile}. Tools that allow it use keyless mode.`, ...warn].join("\n");
-		const lines = [`tavily keys (${pool.keysFile}), used in file order:`];
+		if (all.length === 0) return [`No tavily keys in ${pool.keysFile}. Tools that allow it use keyless mode.`, ...netLines, ...warn].join("\n");
+		const lines = [`tavily keys (${pool.keysFile}), used in file order:`, ...netLines];
+		if (net.error) return [...lines, `Usage checks skipped: ${net.error}.`, ...warn].join("\n");
 		const cleared: string[] = [];
 		for (const { entry, mark } of all) {
 			let info: string;
-			const res = await call("/usage", entry.key, { method: "GET", timeoutMs: 15_000, signal: ctx.signal });
+			const res = await call("/usage", entry.key, { method: "GET", timeoutMs: 15_000, signal: ctx.signal, dispatcher: net.dispatcher });
 			if (res.ok) {
 				const k = res.value?.key ?? {};
 				const a = res.value?.account ?? {};

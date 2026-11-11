@@ -20,6 +20,8 @@ export interface CallOptions {
 	fetchImpl?: typeof fetch;
 	/** Cap for a successful response body in bytes. Default MAX_RESPONSE_BYTES. */
 	maxBytes?: number;
+	/** undici dispatcher for this request (e.g. a direct Agent that skips the proxy). Default: the global one. */
+	dispatcher?: unknown;
 }
 
 function errorText(data: unknown, fallback: string): string {
@@ -28,17 +30,23 @@ function errorText(data: unknown, fallback: string): string {
 	return typeof error === "string" && error ? error : fallback;
 }
 
+/** `text.slice(0, max)` without a trailing high surrogate, so a cut never leaves half an emoji. Length stays in UTF-16 units. */
+export function cut(text: string, max: number): string {
+	return text.slice(0, max).replace(/[\ud800-\udbff]$/, "");
+}
+
 /** Shortest piece of the key that counts as an echo of it (checked on letters and digits only). */
 const KEY_WINDOW = 12;
 
 /**
  * Server- or network-derived text that is safe to show or log, or null when it must be withheld.
  * Allowlist: plain printable ASCII, no markup/entity/escape characters, no long token-like run,
- * and no trace of the key or a bearer token, however it is split. The whole text is judged and
+ * no URL userinfo (`//user:pass@host`), and no trace of the key or a bearer token, however it is split. The whole text is judged and
  * only then cut. Every check is linear; nothing here tries to repair or decode the text.
  */
 export function serverText(raw: string, key: string | null, max = MAX_ERROR_CHARS): string | null {
 	if (/[^\x20-\x7e\t\n\r]/.test(raw) || /[<>&\\]/.test(raw) || /[A-Za-z0-9_-]{20}/.test(raw)) return null;
+	if (/\/\/[^\s/]*@/.test(raw)) return null; // URL userinfo, e.g. proxy credentials
 	const compact = raw.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
 	if (compact.includes("tvly") || compact.includes("bearer")) return null;
 	const own = key ? key.replace(/[^A-Za-z0-9]/g, "").toLowerCase() : "";
@@ -47,14 +55,14 @@ export function serverText(raw: string, key: string | null, max = MAX_ERROR_CHAR
 		for (let i = 0; i + size <= own.length; i++) if (compact.includes(own.slice(i, i + size))) return null;
 	}
 	const line = raw.replace(/\s+/g, " ").trim();
-	return line.length > max ? `${line.slice(0, max).trimEnd()}...` : line;
+	return line.length > max ? `${cut(line, max).trimEnd()}...` : line;
 }
 
 /** What a failed status means, in our own words. Used instead of server text when that is withheld. */
 export function statusLabel(status: number): string {
 	if (status >= 500) return "server error";
 	return (
-		({ 400: "bad request", 401: "invalid API key", 403: "forbidden", 429: "rate limited", 432: "plan credit limit reached", 433: "pay-as-you-go limit reached" } as Record<number, string>)[status] ??
+		({ 400: "bad request", 401: "invalid API key", 403: "forbidden", 407: "proxy authentication required", 429: "rate limited", 432: "plan credit limit reached", 433: "pay-as-you-go limit reached" } as Record<number, string>)[status] ??
 		"HTTP error"
 	);
 }
@@ -145,7 +153,8 @@ export async function call<T = any>(path: string, key: string | null, opts: Call
 			headers,
 			body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
 			signal,
-		});
+			...(opts.dispatcher ? { dispatcher: opts.dispatcher } : {}),
+		} as RequestInit);
 		const limit = resp.ok ? (opts.maxBytes ?? MAX_RESPONSE_BYTES) : MAX_ERROR_BODY_BYTES;
 		({ text, truncated } = await readLimited(resp, limit, signal, resp.ok));
 	} catch (err) {
