@@ -37,8 +37,13 @@ const dir = await mkdtemp(join(tmpdir(), "img-markers-"));
 after(() => rm(dir, { recursive: true, force: true }));
 const png = join(dir, "pi-clipboard-abc.png");
 const png2 = join(dir, "Ghostty-paste-xyz.jpg");
-await writeFile(png, "png-bytes");
-await writeFile(png2, "jpg-bytes");
+// Real 1x1 images (red pixel), so pi's image pipeline accepts them.
+const PNG_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+const JPG_B64 =
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDi6KKK+ZP3E//Z";
+await writeFile(png, Buffer.from(PNG_B64, "base64"));
+await writeFile(png2, Buffer.from(JPG_B64, "base64"));
 
 beforeEach(async () => {
   await startSession();
@@ -112,6 +117,53 @@ test("history: submitted expanded text is recalled as the short marker and re-ex
   assert.equal(e.getExpandedText(), `look [Image #1: ${png}]`);
 });
 
+test("history: Enter after recall re-expands the marker and the input handler attaches the image", async () => {
+  const e = newEditor();
+  paste(e, png);
+  const expanded = e.getExpandedText();
+  e.setText("");
+  e.addToHistory(expanded);
+  e.handleInput("\x1b[A");
+  assert.equal(e.getText(), "[Image #1]");
+  let submitted = "";
+  e.onSubmit = (t) => (submitted = t);
+  e.handleInput("\r");
+  assert.equal(submitted, expanded);
+  const r = await run(submitted);
+  assert.equal(r.images.length, 1);
+  assert.equal(r.images[0].data, PNG_B64);
+});
+
+test("history: consecutive duplicates are not added (expanded and short forms collapse to one entry)", () => {
+  const e = newEditor();
+  paste(e, png);
+  const expanded = e.getExpandedText();
+  e.addToHistory(expanded);
+  e.addToHistory(expanded);
+  e.addToHistory("[Image #1]");
+  // history is a private pi-tui field; read it only for this assertion
+  assert.equal((e as any).history.length, 1);
+});
+
+test("restore with [paste #N] + [Image #N]: all text kept, undo brings back both markers", () => {
+  const big = Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n");
+  for (const order of ["image-first", "paste-first"]) {
+    const e = newEditor();
+    if (order === "image-first") (paste(e, png), paste(e, big));
+    else (paste(e, big), paste(e, png));
+    const original = e.getText();
+    const expanded = e.getExpandedText();
+    assert.match(original, /\[paste #1 \+12 lines\]/);
+    e.setText(expanded);
+    // pi resets its paste registry in setText, so the paste comes back expanded (native behaviour)
+    assert.equal(e.getText(), order === "image-first" ? `[Image #1]${big}` : `${big}[Image #1]`);
+    assert.equal(e.getExpandedText(), expanded);
+    e.handleInput("\x1f"); // undo
+    assert.equal(e.getText(), original);
+    assert.equal(e.getExpandedText(), expanded);
+  }
+});
+
 test("pi-tui contract: getExpandedText and submit both go through expandPasteMarkers", () => {
   // Guards the override of a private pi-tui method: fail loudly if pi-tui stops calling it.
   const calls: string[] = [];
@@ -165,7 +217,7 @@ test("input: full marker attaches the image", async () => {
   assert.equal(r.action, "transform");
   assert.equal(r.images.length, 1);
   assert.equal(r.images[0].mimeType, "image/png");
-  assert.equal(r.images[0].data, Buffer.from("png-bytes").toString("base64"));
+  assert.equal(r.images[0].data, PNG_B64);
   assert.equal(r.text, `a [Image #1: ${png}]`);
 });
 
@@ -183,7 +235,7 @@ test("input: both forms together, duplicates are not attached twice", async () =
 });
 
 test("input: an already attached identical image is not duplicated", async () => {
-  const data = Buffer.from("png-bytes").toString("base64");
+  const data = PNG_B64;
   const r = await run(`[Image #1: ${png}]`, [{ type: "image", data, mimeType: "image/png" }]);
   assert.equal(r.action, "continue");
 });
@@ -195,11 +247,28 @@ test("input: missing file is ignored; plain text continues", async () => {
   assert.equal((await run("just text")).action, "continue");
 });
 
-test("input: image-only message still carries text and image (steer/follow-up use the same handler)", async () => {
+test("input handler only: image-only message keeps non-empty text and the image (pi session steer/follow-up path not exercised here)", async () => {
   const r = await run(`[Image #1: ${png}]`);
   assert.equal(r.action, "transform");
   assert.ok(r.text.trim().length > 0);
   assert.equal(r.images.length, 1);
+});
+
+test("attached image passes pi's own image normalization", async (t) => {
+  let processImage: any;
+  try {
+    // not a public export of pi-coding-agent; resolve next to its main entry
+    ({ processImage } = await import(new URL("./utils/image-process.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href));
+  } catch {
+    return t.skip("pi image-process module not importable in this pi version");
+  }
+  for (const [p, mime] of [[png, "image/png"], [png2, "image/jpeg"]]) {
+    const r = await run(`[Image #1: ${p}]`);
+    assert.equal(r.images.length, 1);
+    const out = await processImage(Buffer.from(r.images[0].data, "base64"), r.images[0].mimeType, { autoResizeImages: true });
+    assert.equal(out.ok, true, out.message);
+    assert.equal(r.images[0].mimeType, mime);
+  }
 });
 
 test("markdown transformer shortens full markers for user messages only", () => {
