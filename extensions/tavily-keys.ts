@@ -14,16 +14,18 @@ export default function tavilyKeys(pi: ExtensionAPI) {
 	const pool = tavilyPool();
 
 	async function status(ctx: ExtensionContext): Promise<string> {
+		const net = tavilyNetwork(pi, ctx);
+		const netLines = [`network: ${net.description}`, ...net.warnings.map((w) => `Warning: ${w}.`)];
 		const snap = await pool.snapshot();
-		if (snap.missing) return `No key file. Run /search-keys init, then put your keys into ${pool.keysFile}.`;
+		if (snap.missing) return [`No key file. Run /search-keys init, then put your keys into ${pool.keysFile}.`, ...netLines].join("\n");
 		const all = [...snap.available.map((entry) => ({ entry, mark: undefined })), ...snap.skipped];
 		const bad = snap.malformed.length
 			? `Warning: skipped ${snap.malformed.length} malformed key(s) (${snap.malformed.join(", ")}): keys may contain only visible ASCII characters.`
 			: "";
 		const warn = [bad, snap.stateWarning ? `Warning: ${snap.stateWarning}.` : ""].filter(Boolean);
-		if (all.length === 0) return [`No tavily keys in ${pool.keysFile}. Tools that allow it use keyless mode.`, ...warn].join("\n");
-		const net = tavilyNetwork(pi, ctx);
-		const lines = [`tavily keys (${pool.keysFile}), used in file order:`, `network: ${net.description}`];
+		if (all.length === 0) return [`No tavily keys in ${pool.keysFile}. Tools that allow it use keyless mode.`, ...netLines, ...warn].join("\n");
+		const lines = [`tavily keys (${pool.keysFile}), used in file order:`, ...netLines];
+		if (net.error) return [...lines, `Usage checks skipped: ${net.error}.`, ...warn].join("\n");
 		const cleared: string[] = [];
 		for (const { entry, mark } of all) {
 			let info: string;

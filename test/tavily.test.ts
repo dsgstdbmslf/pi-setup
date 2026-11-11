@@ -19,7 +19,7 @@ import {
 	withRotation,
 } from "../extensions/tavily/keys.ts";
 import { call, compact, credits, cut, plain, serverText, statusLabel } from "../extensions/tavily/client.ts";
-import { describeNetwork, noProxyMatches, parseProxySetting } from "../extensions/tavily/network.ts";
+import { describeNetwork, directAgentOptions, idleTimeoutMs, networkState, noProxyMatches, parseProxySetting, proxyFor, resolveNetwork } from "../extensions/tavily/network.ts";
 import { cleanupSaved, ensurePrivateDir, plural, sanitize, saveFull } from "../extensions/tavily/output.ts";
 
 const markFile = (stateDir: string, key: string) => join(stateDir, "tavily", `${fingerprint(key)}.json`);
@@ -952,15 +952,130 @@ test("parseProxySetting: true, false, missing and invalid values", () => {
 test("describeNetwork: route line never shows credentials", () => {
 	const env = { HTTPS_PROXY: "http://user:secret@proxy.local:3128" };
 	assert.equal(describeNetwork(false, env), "direct (tavily.proxy = false)");
-	assert.equal(describeNetwork(true, {}), "direct (no proxy configured)");
-	assert.equal(describeNetwork(true, { ...env, NO_PROXY: "localhost,.tavily.com" }), "direct (NO_PROXY)");
-	assert.equal(describeNetwork(true, { ...env, no_proxy: "api.tavily.com:443" }), "direct (NO_PROXY)");
+	assert.equal(describeNetwork(true, {}), "direct (no proxy for api.tavily.com)");
 	const via = describeNetwork(true, env);
 	assert.equal(via, "via proxy proxy.local:3128 (pi httpProxy/HTTPS_PROXY)");
 	assert.ok(!/secret|user/.test(via));
-	assert.match(describeNetwork(false, env, false), /could not be applied/);
+	assert.match(describeNetwork(false, { HTTP_PROXY: "http://u:p@h:1" }, false), /^via proxy h:1 .*could not be applied/);
 	assert.ok(noProxyMatches("*", "api.tavily.com", 443));
 	assert.ok(!noProxyMatches("example.com,tavily.com:8080", "api.tavily.com", 443));
+});
+
+// What undici 8's EnvHttpProxyAgent does for https://api.tavily.com, one row per environment (checked against a CONNECT proxy).
+const ROUTES: [string, Record<string, string>, string | null][] = [
+	["HTTP_PROXY only: https falls back to it", { HTTP_PROXY: "http://p:1" }, "http://p:1"],
+	["lowercase http_proxy only", { http_proxy: "http://p:1" }, "http://p:1"],
+	["NO_PROXY uppercase ignored when no_proxy is set", { HTTPS_PROXY: "http://p:1", NO_PROXY: "api.tavily.com", no_proxy: "example.net" }, "http://p:1"],
+	["lowercase https_proxy wins over HTTPS_PROXY", { HTTPS_PROXY: "http://wrong:1", https_proxy: "http://p:2" }, "http://p:2"],
+	["empty https_proxy wins, falls back to HTTP_PROXY", { https_proxy: "", HTTPS_PROXY: "http://wrong:1", HTTP_PROXY: "http://p:3" }, "http://p:3"],
+	["empty https_proxy and no http proxy: direct", { https_proxy: "", HTTPS_PROXY: "http://wrong:1" }, null],
+	["NO_PROXY=*:443", { HTTPS_PROXY: "http://p:1", NO_PROXY: "*:443" }, null],
+	["NO_PROXY=*:8080 other port", { HTTPS_PROXY: "http://p:1", NO_PROXY: "*:8080" }, "http://p:1"],
+	["NO_PROXY=*", { HTTPS_PROXY: "http://p:1", NO_PROXY: "none.invalid, *" }, null],
+	["NO_PROXY trailing dot", { HTTPS_PROXY: "http://p:1", NO_PROXY: "api.tavily.com." }, null],
+	["NO_PROXY=*.api.tavily.com is subdomains only", { HTTPS_PROXY: "http://p:1", NO_PROXY: "*.api.tavily.com" }, "http://p:1"],
+	["NO_PROXY=*.tavily.com matches a subdomain", { HTTPS_PROXY: "http://p:1", NO_PROXY: "*.tavily.com" }, null],
+	["NO_PROXY=.tavily.com and tavily.com", { HTTPS_PROXY: "http://p:1", NO_PROXY: ".tavily.com" }, null],
+	["NO_PROXY=api.tavily.com:443", { HTTPS_PROXY: "http://p:1", no_proxy: "api.tavily.com:443" }, null],
+	["NO_PROXY=api.tavily.com:80 other port", { HTTPS_PROXY: "http://p:1", no_proxy: "api.tavily.com:80" }, "http://p:1"],
+	["NO_PROXY=tavily.com.", { HTTPS_PROXY: "http://p:1", NO_PROXY: "tavily.com." }, null],
+	["no proxy at all", {}, null],
+];
+for (const [name, env, want] of ROUTES)
+	test(`proxyFor/describeNetwork mirror undici: ${name}`, () => {
+		assert.equal(proxyFor(env, "api.tavily.com", 443), want);
+		assert.equal(describeNetwork(true, env).startsWith("via proxy"), want !== null);
+	});
+
+test("idleTimeoutMs follows pi's httpIdleTimeoutMs", () => {
+	assert.equal(idleTimeoutMs({}), 300_000);
+	assert.equal(idleTimeoutMs(undefined), 300_000);
+	assert.equal(idleTimeoutMs({ httpIdleTimeoutMs: 30_000 }), 30_000);
+	assert.equal(idleTimeoutMs({ httpIdleTimeoutMs: "disabled" }), 0);
+	assert.equal(idleTimeoutMs({ httpIdleTimeoutMs: 0 }), 0);
+	assert.equal(idleTimeoutMs({ httpIdleTimeoutMs: "60000" }), 60_000);
+	assert.equal(idleTimeoutMs({ httpIdleTimeoutMs: -1 }), 300_000);
+	assert.equal(idleTimeoutMs({ httpIdleTimeoutMs: "soon" }), 300_000);
+});
+
+/** A stand-in for pi's undici that records what it was asked to build. */
+function fakeUndici() {
+	const made: any[] = [];
+	class Agent {
+		closed = false;
+		listeners: string[] = [];
+		opts: any;
+		constructor(opts: any) {
+			this.opts = opts;
+			made.push(this);
+		}
+		on(name: string) {
+			this.listeners.push(name);
+			return this;
+		}
+		async close() {
+			this.closed = true;
+		}
+	}
+	return { made, undici: { Agent, Client: class {}, Pool: class {} } };
+}
+
+test("directAgentOptions copies pi's dispatcher settings", () => {
+	const { undici } = fakeUndici();
+	for (const ms of [300_000, 30_000, 0]) {
+		const o = directAgentOptions(ms, undici) as any;
+		assert.equal(o.bodyTimeout, ms);
+		assert.equal(o.headersTimeout, ms);
+		assert.equal(o.allowH2, false);
+		assert.equal(o.connect.autoSelectFamilyAttemptTimeout, 2000);
+		assert.equal(typeof o.factory, "function");
+		assert.equal(typeof o.clientFactory, "function");
+	}
+});
+
+test("resolveNetwork: one direct agent, recreated (old one closed) when the idle timeout changes", () => {
+	const { made, undici } = fakeUndici();
+	const state = { notified: new Set<string>() } as ReturnType<typeof networkState>;
+	const load = () => undici;
+	const a = resolveNetwork({ tavily: { proxy: false } }, {}, load, state);
+	const b = resolveNetwork({ tavily: { proxy: false } }, {}, load, state);
+	assert.equal(a.dispatcher, b.dispatcher);
+	assert.equal(made.length, 1);
+	assert.deepEqual(made[0].listeners, ["error"]);
+	assert.equal(made[0].opts.headersTimeout, 300_000);
+	const c = resolveNetwork({ tavily: { proxy: false }, httpIdleTimeoutMs: "disabled" }, {}, load, state);
+	assert.notEqual(c.dispatcher, a.dispatcher);
+	assert.equal(made.length, 2);
+	assert.equal(made[0].closed, true);
+	assert.equal(made[1].opts.bodyTimeout, 0);
+	assert.equal(a.description, "direct (tavily.proxy = false)");
+	// following pi: no dispatcher, no agent built
+	assert.equal(resolveNetwork({}, {}, load, { notified: new Set() }).dispatcher, undefined);
+});
+
+test("resolveNetwork: proxy false without undici fails closed, with a visible message, also headless", () => {
+	const state = { notified: new Set<string>() } as ReturnType<typeof networkState>;
+	const net = resolveNetwork({ tavily: { proxy: false } }, { HTTP_PROXY: "http://u:p@h:1" }, () => {
+		throw new Error("MODULE_NOT_FOUND");
+	}, state);
+	assert.equal(net.dispatcher, undefined);
+	assert.match(net.error ?? "", /tavily\.proxy = false cannot be applied/);
+	assert.ok(!/via proxy|no proxy for/.test(net.description), net.description);
+	assert.equal(state.notified.size, 0, "nothing is marked as shown by resolving");
+});
+
+test("resolveNetwork: an invalid setting is a warning on every call, never marked shown", () => {
+	const state = { notified: new Set<string>() } as ReturnType<typeof networkState>;
+	for (let i = 0; i < 2; i++) {
+		const net = resolveNetwork({ tavily: { proxy: "no" } }, {}, () => ({}), state);
+		assert.match(net.warnings[0], /tavily\.proxy must be true or false/);
+		assert.equal(net.error, undefined);
+	}
+	assert.equal(state.notified.size, 0);
+});
+
+test("networkState is one object per process", () => {
+	assert.equal(networkState(), networkState());
 });
 
 test("serverText withholds proxy error pages and URL userinfo", () => {

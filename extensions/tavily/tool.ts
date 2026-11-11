@@ -14,7 +14,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { call, credits, cut } from "./client.ts";
-import { describeNetwork, parseProxySetting } from "./network.ts";
+import { type Network, networkState, resolveNetwork } from "./network.ts";
 import { KEYS_FILE, KeyPool, STATE_DIR, type RotationResult, withRotation } from "./keys.ts";
 import { cleanupSaved, sanitize, saveFull } from "./output.ts";
 
@@ -43,42 +43,23 @@ export function tavilyPool(): KeyPool {
 	return new KeyPool("tavily", join(agentDir, KEYS_FILE), join(agentDir, STATE_DIR));
 }
 
-let directAgent: unknown;
-const warned = new Set<string>();
-
 /**
- * A direct undici Agent (ignores HTTP(S)_PROXY), or null when undici cannot be loaded. Extensions
- * cannot import undici themselves; it is pi's own dependency, so it is resolved from pi's package dir.
+ * How Tavily connects, read from pi's settings on every call (so /reload or an edit takes effect).
+ * Extensions cannot import undici themselves; it is pi's own dependency, so it is resolved from
+ * pi's package dir. A warning is marked as shown only after a UI notify; headless, it goes into
+ * the tool result (see request()) and /search-keys.
  */
-function directDispatcher(): unknown {
-	if (directAgent === undefined) {
-		try {
-			const undici = createRequire(join(getPackageDir(), "package.json"))("undici");
-			directAgent = new undici.Agent();
-		} catch {
-			directAgent = null;
+export function tavilyNetwork(pi: ExtensionAPI, ctx?: ExtensionContext): Network {
+	const net = resolveNetwork(pi.getSettings(), process.env, () => createRequire(join(getPackageDir(), "package.json"))("undici"));
+	if (ctx?.hasUI) {
+		const state = networkState();
+		for (const text of [...net.warnings, ...(net.error ? [net.error] : [])]) {
+			if (state.notified.has(text)) continue;
+			ctx.ui.notify(`tavily: ${text}`, "warning");
+			state.notified.add(text);
 		}
 	}
-	return directAgent;
-}
-
-/**
- * How Tavily connects, read from `tavily.proxy` in pi's settings on every call (so /reload or an
- * edit takes effect). `dispatcher` is set only to bypass the proxy; the options go to `call()`
- * for tool requests and the /search-keys check alike. Problems are shown once per text.
- */
-export function tavilyNetwork(pi: ExtensionAPI, ctx?: ExtensionContext): { dispatcher?: unknown; description: string } {
-	const warn = (text: string) => {
-		if (warned.has(text)) return;
-		warned.add(text);
-		if (ctx?.hasUI) ctx.ui.notify(`tavily: ${text}`, "warning");
-	};
-	const { proxy, invalid } = parseProxySetting(pi.getSettings());
-	if (invalid) warn(`${invalid}; using the default (true, follow pi's proxy)`);
-	if (proxy) return { description: describeNetwork(true, process.env) };
-	const dispatcher = directDispatcher();
-	if (!dispatcher) warn("tavily.proxy = false could not be applied: undici is not available from pi; following pi's proxy");
-	return dispatcher ? { dispatcher, description: describeNetwork(false, process.env) } : { description: describeNetwork(false, process.env, false) };
+	return net;
 }
 
 export interface RequestOptions {
@@ -100,16 +81,18 @@ export function createTavily(pi: ExtensionAPI) {
 	});
 
 	/** POST to Tavily with key failover; keyless fallback where Tavily allows it. */
-	function request(path: string, body: unknown, opts: RequestOptions) {
-		const { dispatcher } = tavilyNetwork(pi, opts.ctx);
-		return withRotation(pool, (key) => call(path, key, { body, signal: opts.signal, timeoutMs: opts.timeoutMs, maxBytes: opts.maxBytes, dispatcher }), {
+	async function request(path: string, body: unknown, opts: RequestOptions) {
+		const { dispatcher, warnings, error } = tavilyNetwork(pi, opts.ctx);
+		if (error) throw new Error(`Tavily ${path}: ${error}`);
+		const rot = await withRotation(pool, (key) => call(path, key, { body, signal: opts.signal, timeoutMs: opts.timeoutMs, maxBytes: opts.maxBytes, dispatcher }), {
 			keyless: opts.keyless,
 			onNote: (note) => opts.ctx.hasUI && opts.ctx.ui.notify(note, "warning"),
 		});
+		return { ...rot, warnings };
 	}
 
 	/** Tool result: text capped at MAX_BYTES/MAX_LINES, the rest saved to a temp file. */
-	async function finish(text: string, summary: string, rot: RotationResult<unknown>, data: unknown) {
+	async function finish(text: string, summary: string, rot: RotationResult<unknown> & { warnings?: string[] }, data: unknown) {
 		const details: Details = { summary, via: rot.via, credits: credits(data), notes: rot.notes };
 		const t = truncateHead(text, { maxBytes: MAX_BYTES, maxLines: MAX_LINES });
 		let out = t.content;
@@ -117,6 +100,7 @@ export function createTavily(pi: ExtensionAPI) {
 			details.fullOutputPath = await saveFull(text);
 			out += `\n\n[Truncated: ${t.outputLines} of ${t.totalLines} lines (${formatSize(t.outputBytes)} of ${formatSize(t.totalBytes)}). Full text: ${details.fullOutputPath}]`;
 		}
+		for (const warning of rot.warnings ?? []) out += `\n\n[Tavily: ${warning}]`;
 		if (rot.via === "keyless") out += "\n\n[Tavily keyless mode: no usable API key, rate-limited]";
 		return { content: [{ type: "text" as const, text: out }], details };
 	}
