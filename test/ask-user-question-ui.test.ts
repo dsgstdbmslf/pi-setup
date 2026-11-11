@@ -6,6 +6,7 @@ import { getStrings, type Question, type UiOutcome } from "../extensions/ask-use
 
 import { getKeybindings } from "@earendil-works/pi-tui";
 import { FieldEditor } from "../extensions/ask-user-question/field-editor.ts";
+import { Editor } from "@earendil-works/pi-tui";
 import { askQuestions } from "../extensions/ask-user-question/ui.ts";
 
 const theme: any = { fg: (_: string, s: string) => s, bg: (_: string, s: string) => s };
@@ -394,4 +395,21 @@ test("without the private paste fields, snapshots fall back to the expanded text
 	e.setText("");
 	e.restore(snap);
 	assert.equal(e.getText(), BIG); // no marker left that could not be expanded
+});
+
+test("if pi-tui stops calling the submit hook, a submitted field keeps its full text", async () => {
+	const proto = FieldEditor.prototype as any;
+	const hooked = proto.submitValue;
+	proto.submitValue = (Editor.prototype as any).submitValue; // as if the hook was renamed: lastSubmit never set
+	try {
+		const d = open([text, single]);
+		d.press(PASTE, ENTER, LEFT); // Q1 submitted, Q2, back to Q1
+		assert.ok(d.screen().includes("line1") && d.screen().includes("line15")); // full text, no marker
+		d.press(TAB, "1", ENTER); // Tab to Q2, answer it, submit from Review
+		const r = await d.result;
+		assert.equal(r.answers[0][0].label, BIG);
+		assert.doesNotMatch(JSON.stringify(r.answers), /paste #/);
+	} finally {
+		proto.submitValue = hooked;
+	}
 });

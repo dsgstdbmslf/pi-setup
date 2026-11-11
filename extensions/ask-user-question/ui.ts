@@ -132,7 +132,7 @@ export function askQuestions(
 			function submit(f: Field, value: string) {
 				const text = value.trim();
 				const display = f.editor.lastSubmit?.text ?? text; // snapshot taken before the editor cleared itself
-				f.saved = f.editor.lastSubmit;
+				f.saved = f.editor.lastSubmit ?? { text, pastes: new Map(), counter: 0 }; // no hook: keep the full text, without markers
 				const st = states[tab];
 				if (noteIdx !== undefined) {
 					setNote(cur(), st, noteIdx, text, display);
