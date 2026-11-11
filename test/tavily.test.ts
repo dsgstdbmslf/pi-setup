@@ -18,7 +18,7 @@ import {
 	verdictFor,
 	withRotation,
 } from "../extensions/tavily/keys.ts";
-import { call, compact, credits, plain, serverText, statusLabel } from "../extensions/tavily/client.ts";
+import { call, compact, credits, cut, plain, serverText, statusLabel } from "../extensions/tavily/client.ts";
 import { cleanupSaved, ensurePrivateDir, plural, sanitize, saveFull } from "../extensions/tavily/output.ts";
 
 const markFile = (stateDir: string, key: string) => join(stateDir, "tavily", `${fingerprint(key)}.json`);
@@ -904,4 +904,23 @@ test("serverText and call are linear on 64 KiB of hostile input", async () => {
 		await call("/x", SPLIT_KEY, { timeoutMs: 1000, fetchImpl: respond(input, { status: 400 }) });
 		assert.ok(Date.now() - t < 200, `${input.slice(0, 8)}: ${Date.now() - t} ms`);
 	}
+});
+
+test("cut drops a high surrogate left at the boundary and keeps well-formed text", () => {
+	const emoji = "😀"; // U+1F600, two UTF-16 units
+	const wellFormed = (s: string) => !/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(s);
+	assert.equal(cut(`abc${emoji}def`, 4), "abc", "cut between the surrogates drops the pair");
+	assert.equal(cut(`abc${emoji}def`, 5), `abc${emoji}`, "cut right after the pair keeps it");
+	assert.equal(cut(`abc${emoji}def`, 3), "abc", "cut before the pair");
+	assert.equal(cut(`abc${emoji}def`, 6), `abc${emoji}d`, "cut after the pair");
+	assert.equal(cut(`${emoji}${emoji}`, 3), emoji);
+	assert.equal(cut(emoji, 1), "");
+	assert.equal(cut("short", 80), "short", "short text is unchanged");
+	assert.equal(cut("", 5), "");
+	for (let max = 0; max <= 8; max++) assert.ok(wellFormed(cut(`a${emoji}b${emoji}c`, max)), `max ${max}`);
+});
+
+test("serverText withholds non-BMP text, so no cut can reach an emoji", () => {
+	assert.equal(serverText(`bad ${"😀"} request`, null), null);
+	assert.equal(serverText(`${"😀".repeat(200)}`, null, 5), null);
 });

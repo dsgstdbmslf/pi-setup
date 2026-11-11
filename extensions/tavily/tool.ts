@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { call, credits } from "./client.ts";
+import { call, credits, cut } from "./client.ts";
 import { KEYS_FILE, KeyPool, STATE_DIR, type RotationResult, withRotation } from "./keys.ts";
 import { cleanupSaved, sanitize, saveFull } from "./output.ts";
 
@@ -83,7 +83,7 @@ export function createTavily(pi: ExtensionAPI) {
 	const render = (name: string, main: (args: any) => string, pending: string) => ({
 		renderCall(args: any, theme: any) {
 			const value = sanitize(main(args) ?? "").replace(/\s+/g, " ");
-			const shown = value.length > 80 ? `${value.slice(0, 77)}...` : value;
+			const shown = value.length > 80 ? `${cut(value, 77)}...` : value;
 			return new Text(theme.fg("toolTitle", theme.bold(`${name} `)) + theme.fg("accent", shown), 0, 0);
 		},
 		renderResult(result: any, { expanded, isPartial }: { expanded: boolean; isPartial: boolean }, theme: any, context: any) {
@@ -98,7 +98,7 @@ export function createTavily(pi: ExtensionAPI) {
 			line += theme.fg("muted", ` (${meta.filter(Boolean).join(", ")})`);
 			if (expanded) {
 				for (const note of d?.notes ?? []) line += `\n${theme.fg("warning", note)}`;
-				line += `\n${theme.fg("dim", body.length > 1500 ? `${body.slice(0, 1500)}…` : body)}`;
+				line += `\n${theme.fg("dim", body.length > 1500 ? `${cut(body, 1500)}…` : body)}`;
 			}
 			return new Text(line, 0, 0);
 		},

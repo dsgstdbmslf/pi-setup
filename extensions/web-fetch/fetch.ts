@@ -1,7 +1,7 @@
 // web_extract, web_map and web_crawl request bodies and result text.
 // No pi imports, so tests run without node_modules.
 
-import { compact, plain } from "../tavily/client.ts";
+import { compact, cut, plain } from "../tavily/client.ts";
 import { plural } from "../tavily/output.ts";
 
 export interface ExtractParams {
@@ -72,7 +72,7 @@ export const MAX_PAGE_CHARS = 200_000;
 function pageText(raw: unknown): string {
 	const text = String(raw ?? "").trim();
 	if (text.length <= MAX_PAGE_CHARS) return text || "(empty)";
-	return `${text.slice(0, MAX_PAGE_CHARS).replace(/[\ud800-\udbff]$/, "")}\n\n[page truncated at ${MAX_PAGE_CHARS} chars]`;
+	return `${cut(text, MAX_PAGE_CHARS)}\n\n[page truncated at ${MAX_PAGE_CHARS} chars]`;
 }
 
 function pages(results: any[]): string {

@@ -28,6 +28,11 @@ function errorText(data: unknown, fallback: string): string {
 	return typeof error === "string" && error ? error : fallback;
 }
 
+/** `text.slice(0, max)` without a trailing high surrogate, so a cut never leaves half an emoji. Length stays in UTF-16 units. */
+export function cut(text: string, max: number): string {
+	return text.slice(0, max).replace(/[\ud800-\udbff]$/, "");
+}
+
 /** Shortest piece of the key that counts as an echo of it (checked on letters and digits only). */
 const KEY_WINDOW = 12;
 
@@ -47,7 +52,7 @@ export function serverText(raw: string, key: string | null, max = MAX_ERROR_CHAR
 		for (let i = 0; i + size <= own.length; i++) if (compact.includes(own.slice(i, i + size))) return null;
 	}
 	const line = raw.replace(/\s+/g, " ").trim();
-	return line.length > max ? `${line.slice(0, max).trimEnd()}...` : line;
+	return line.length > max ? `${cut(line, max).trimEnd()}...` : line;
 }
 
 /** What a failed status means, in our own words. Used instead of server text when that is withheld. */
