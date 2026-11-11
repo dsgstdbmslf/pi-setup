@@ -7,10 +7,13 @@ import {
 	getMode,
 	formatAnswer,
 	getOtherLabel,
+	noteShown,
 	newState,
 	normalizeOptions,
+	otherShown,
 	pick,
 	setNote,
+	setOther,
 } from "./logic.ts";
 
 const MAX_VISIBLE = 10; // option rows shown at once
@@ -44,7 +47,14 @@ export function askQuestions(
 			const multiTab = questions.length > 1;
 			const reviewTab = multiTab ? questions.length : -1;
 			const tabCount = questions.length + (multiTab ? 1 : 0);
-			const editor = new Editor(tui, editorTheme(theme));
+				// One editor per field (open answer / option comment), created lazily: setText() would drop
+			// the paste map, so a `[paste #N]` marker only stays valid in the editor that made it.
+			interface Field {
+				editor: Editor;
+				snap?: { text: string; pastes: Map<number, string>; counter: number }; // state when editing began (Esc restores it)
+			}
+			const fields = new Map<string, Field>();
+			let active: Field | undefined;
 			let tab = 0;
 			let editMode = getMode(questions[0]) === "text";
 			let noteIdx: number | undefined; // option being commented on (edit mode)
@@ -70,12 +80,32 @@ export function askQuestions(
 			if (timeoutSec) timer = setTimeout(() => finish("timeout"), timeoutSec * 1000);
 
 			function commitText() {
-				if (editMode && isText()) states[tab].other = editor.getText().trim() || undefined;
+				if (editMode && isText() && active) setOther(states[tab], active.editor.getExpandedText(), active.editor.getText());
+			}
+
+			// Activate the editor for a field; `hasValue` false means it starts empty.
+			function openField(key: string, hasValue: boolean) {
+				let f = fields.get(key);
+				if (!f) fields.set(key, (f = { editor: new Editor(tui, editorTheme(theme)) }));
+				if (!hasValue) f.editor.setText("");
+				const e = f.editor as any; // pastes/pasteCounter are private in pi-tui
+				f.snap = { text: f.editor.getText(), pastes: new Map(e.pastes), counter: e.pasteCounter };
+				active = f;
+				editMode = true;
+			}
+
+			// Drop unsaved edits: put the editor back as it was when editing began, markers included.
+			function discardEdit() {
+				const f = active;
+				if (!f?.snap) return;
+				const e = f.editor as any;
+				f.editor.setText(f.snap.text);
+				e.pastes = new Map(f.snap.pastes);
+				e.pasteCounter = f.snap.counter;
 			}
 
 			function startEdit() {
-				editMode = true;
-				editor.setText(states[tab].other ?? "");
+				openField(`${tab}:o`, !!states[tab].other);
 			}
 
 			function goTo(n: number) {
@@ -93,24 +123,26 @@ export function askQuestions(
 				else finish("done");
 			}
 
-			editor.onSubmit = (value) => {
-				const text = value.trim();
+			// Enter in the editor: the value for the model is the expanded text, the display keeps paste markers.
+			function submit() {
+				if (!active) return;
+				const text = active.editor.getExpandedText().trim();
+				const display = active.editor.getText();
 				const st = states[tab];
 				if (noteIdx !== undefined) {
-					setNote(cur(), st, noteIdx, text);
+					setNote(cur(), st, noteIdx, text, display);
 					noteIdx = undefined;
 					editMode = false;
 					refresh();
 					return;
 				}
+				setOther(st, text, display);
 				if (isText()) {
 					if (!text) return;
-					st.other = text;
-					editMode = false; // the editor is already cleared; don't re-read it
+					editMode = false;
 					advance();
 					return;
 				}
-				st.other = text || undefined;
 				editMode = false;
 				if (text && getMode(cur()) === "single-select") {
 					st.picked.clear();
@@ -118,13 +150,14 @@ export function askQuestions(
 					return;
 				}
 				refresh();
-			};
+			}
 
 			function handleInput(data: string) {
 				if (editMode) {
 					if (matchesKey(data, Key.escape)) {
 						if (isText()) finish("cancelled");
 						else {
+							discardEdit();
 							editMode = false;
 							noteIdx = undefined;
 							refresh();
@@ -133,7 +166,11 @@ export function askQuestions(
 					}
 					if (isText() && multiTab && matchesKey(data, Key.tab)) return goTo(tab + 1);
 					if (isText() && multiTab && matchesKey(data, Key.shift("tab"))) return goTo(tab - 1);
-					editor.handleInput(data);
+					// Enter submits, except after a trailing "\" (newline workaround, handled by the editor)
+					const { line, col } = active!.editor.getCursor();
+					const afterBackslash = col > 0 && active!.editor.getLines()[line]?.[col - 1] === "\\";
+					if (matchesKey(data, Key.enter) && !afterBackslash) return submit();
+					active!.editor.handleInput(data);
 					refresh();
 					return;
 				}
@@ -167,8 +204,7 @@ export function askQuestions(
 				if (matchesKey(data, Key.tab)) {
 					if (st.cursor < otherIdx) {
 						noteIdx = st.cursor;
-						editMode = true;
-						editor.setText(st.notes.get(noteIdx) ?? "");
+						openField(`${tab}:n${noteIdx}`, st.notes.has(noteIdx));
 					}
 				} else if (matchesKey(data, Key.up)) st.cursor = Math.max(0, st.cursor - 1);
 				else if (matchesKey(data, Key.down)) st.cursor = Math.min(itemCount - 1, st.cursor + 1);
@@ -178,7 +214,7 @@ export function askQuestions(
 				} else if (matchesKey(data, Key.enter) || matchesKey(data, Key.space)) {
 					if (st.cursor < otherIdx) return choose(st.cursor);
 					if (st.cursor === otherIdx) {
-						if (multi && st.other && matchesKey(data, Key.space)) st.other = undefined; // Space toggles off
+						if (multi && st.other && matchesKey(data, Key.space)) setOther(st, ""); // Space toggles off
 						else startEdit();
 					} else if (matchesKey(data, Key.enter) && answersOf(q, st).length > 0) return advance();
 				}
@@ -211,7 +247,10 @@ export function askQuestions(
 						wrap(theme.fg("text", ` ${i + 1}. ${q.question}`));
 						if (answers[i].length === 0) add(theme.fg("warning", `    ${S.notAnswered}`));
 						for (const a of answers[i]) {
-							const text = a.type === "other" ? `${S.other}: ${a.label}` : formatAnswer(a);
+							const st = states[i];
+							const shown = otherShown(st);
+							const text =
+								a.type === "other" ? `${S.other}: ${shown}` : a.type === "text" ? shown! : formatAnswer({ ...a, note: noteShown(st, a.index! - 1) });
 							wrap(theme.fg("accent", text), "    ");
 						}
 					});
@@ -239,7 +278,7 @@ export function askQuestions(
 					const items = [
 						...options.map((o, i) => ({ text: `${mark(st.picked.has(i))} ${i + 1}. ${o.label}`, on: st.picked.has(i), desc: o.description })),
 						{
-							text: `${mark(!!st.other)} ${getOtherLabel(options, S)}${st.other ? ` — ${st.other.replace(/\s+/g, " ")}` : ""}`,
+							text: `${mark(!!st.other)} ${getOtherLabel(options, S)}${st.other ? ` — ${otherShown(st)!.replace(/\s+/g, " ")}` : ""}`,
 							on: !!st.other,
 							desc: undefined,
 						},
@@ -255,7 +294,7 @@ export function askQuestions(
 						const focused = i === st.cursor && !editMode;
 						add(`${focused ? theme.fg("accent", "> ") : "  "}${theme.fg(focused ? "accent" : it.on ? "success" : "text", it.text)}`);
 						if (it.desc) wrap(theme.fg("muted", it.desc), "     ");
-						const note = i < options.length ? st.notes.get(i) : undefined;
+						const note = i < options.length ? noteShown(st, i) : undefined;
 						if (note) wrap(theme.fg("success", `↳ ${note.replace(/\s+/g, " ")}`), "     ");
 					}
 					if (end < items.length) add(theme.fg("dim", `  ↓ ${S.more.replace("%d", String(items.length - end))}`));
@@ -265,7 +304,7 @@ export function askQuestions(
 				if (editMode) {
 					if (noteIdx !== undefined) add(theme.fg("muted", ` ${S.writeNote} ${noteIdx + 1}. ${options[noteIdx].label}:`));
 					else if (mode !== "text") add(theme.fg("muted", ` ${S.writeAnswer}`));
-					for (const l of editor.render(Math.max(1, width - 2))) add(` ${l}`);
+					for (const l of active!.editor.render(Math.max(1, width - 2))) add(` ${l}`);
 					lines.push("");
 					add(theme.fg("dim", ` ${mode === "text" ? S.hintText : S.hintEdit}${mode === "text" && multiTab ? S.hintTabsText : ""}`));
 				} else {
@@ -277,6 +316,7 @@ export function askQuestions(
 				return lines;
 			}
 
+			if (editMode) startEdit(); // a text question opens in edit mode
 			return { render, invalidate: () => {}, handleInput };
 		},
 		{ blocked: { kind: "question", message: blockedMessage } },

@@ -13,6 +13,7 @@ const TAB = "\t";
 const DOWN = "\x1b[B";
 const RIGHT = "\x1b[C";
 const LEFT = "\x1b[D";
+const SHIFT_TAB = "\x1b[Z";
 
 const text: Question = { question: "Name?" };
 const single: Question = { question: "DB?", options: [{ label: "PG" }, { label: "My", value: "my" }] };
@@ -195,4 +196,91 @@ test("list of 10 or fewer renders without a window", () => {
 	const d = open([many(9)]);
 	assert.equal(rows(d.screen()).length, 10); // 9 options + Other
 	assert.doesNotMatch(d.screen(), /more/);
+});
+
+// ---- large pastes: marker on screen, full text to the model ----
+const BIG = Array.from({ length: 15 }, (_, i) => `line${i + 1}`).join("\n");
+const PASTE = `\x1b[200~${BIG}\x1b[201~`;
+const MARKER = "[paste #1 +15 lines]";
+
+test("paste into Other: marker on screen and in the editor, full text in the answer", async () => {
+	const d = open([single]);
+	d.press(DOWN, DOWN, ENTER, PASTE);
+	assert.ok(d.screen().includes(MARKER));
+	assert.doesNotMatch(d.screen(), /line7/);
+	d.press(ENTER);
+	const a = (await d.result).answers[0][0];
+	assert.equal(a.type, "other");
+	assert.equal(a.label, BIG);
+});
+
+test("paste into Other stays a marker in the option row and on Review", async () => {
+	const d = open([multi, single]);
+	d.press(DOWN, DOWN, ENTER, PASTE, ENTER); // Other of the multi-select, saved
+	assert.match(d.screen(), new RegExp(`\\[x\\] Other — \\[paste #1 \\+15 lines\\]`));
+	assert.doesNotMatch(d.screen(), /line7/);
+	d.press(RIGHT, RIGHT); // Review
+	assert.ok(d.screen().includes(`Other: ${MARKER}`));
+	assert.doesNotMatch(d.screen(), /line7/);
+});
+
+test("paste into a text question", async () => {
+	const d = open([text]);
+	d.press(PASTE);
+	assert.ok(d.screen().includes(MARKER));
+	d.press(ENTER);
+	const a = (await d.result).answers[0][0];
+	assert.equal(a.type, "text");
+	assert.equal(a.label, BIG);
+});
+
+test("paste into an option comment (Tab)", async () => {
+	const d = open([single]);
+	d.press(TAB, PASTE);
+	assert.ok(d.screen().includes(MARKER));
+	d.press(ENTER);
+	assert.ok(d.screen().includes(`↳ ${MARKER}`));
+	assert.doesNotMatch(d.screen(), /line7/);
+	d.press(ENTER);
+	const a = (await d.result).answers[0][0];
+	assert.equal(a.label, "PG");
+	assert.equal(a.note, BIG);
+});
+
+test("unsent paste survives Tab / Shift+Tab between questions", async () => {
+	const d = open([text, text]);
+	d.press(PASTE, TAB); // Q1 -> Q2 with an unsent paste
+	d.press("b", SHIFT_TAB); // back to Q1
+	assert.ok(d.screen().includes(MARKER));
+	d.press(TAB, TAB); // Q2 -> Review
+	assert.ok(d.screen().includes(MARKER));
+	assert.doesNotMatch(d.screen(), /line7/);
+	d.press(ENTER);
+	const r = await d.result;
+	assert.equal(r.answers[0][0].label, BIG);
+	assert.equal(r.answers[1][0].label, "b");
+});
+
+test("returning to a field shows the marker again and still sends the full text", async () => {
+	const d = open([text, single]);
+	d.press(PASTE, ENTER); // Q1 answered, now Q2
+	d.press(LEFT); // back to Q1
+	assert.ok(d.screen().includes(MARKER));
+	assert.doesNotMatch(d.screen(), /line7/);
+	d.press(ENTER); // resubmit unchanged -> Q2
+	d.press("1", ENTER); // PG, then Review submit
+	const r = await d.result;
+	assert.equal(r.answers[0][0].label, BIG);
+	assert.equal(r.answers[1][0].label, "PG");
+});
+
+test("Esc on a comment discards the edit but keeps the saved paste valid", async () => {
+	const d = open([single]);
+	d.press(TAB, PASTE, ENTER); // saved comment with a paste
+	d.press(TAB, "x", ESC); // edit and discard
+	d.press(TAB);
+	assert.ok(d.screen().includes(MARKER));
+	assert.doesNotMatch(d.screen(), /lines\]x/);
+	d.press(ENTER, ENTER);
+	assert.equal((await d.result).answers[0][0].note, BIG);
 });
