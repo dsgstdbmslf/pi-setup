@@ -144,3 +144,55 @@ test("reports pi as blocked on the first question (one line, bounded)", () => {
 	assert.ok(blocked.message.length <= 200);
 	assert.equal(open([single]).options().blocked.message, "DB?");
 });
+
+const many = (n: number, multiSelect = false): Question => ({
+	question: "Pick?",
+	multiSelect,
+	options: Array.from({ length: n }, (_, i) => ({ label: `opt${i + 1}`, description: i === 12 ? "desc13" : undefined })),
+});
+const rows = (screen: string) => screen.split("\n").filter((l) => /^(> |  )(\(•\)|\( \)|\[x\]|\[ \]|[✓○]) /.test(l));
+
+test("long list shows a window of 10 items with a 'more' hint", () => {
+	const d = open([many(15)]);
+	assert.equal(rows(d.screen()).length, 10);
+	assert.match(d.screen(), /↓ 6 more/);
+	assert.doesNotMatch(d.screen(), /↑ \d+ more/);
+	assert.match(d.screen(), /> \( \) 1\. opt1/);
+});
+
+test("window follows the cursor (Down) and keeps it highlighted", () => {
+	const d = open([many(15)]);
+	d.press(...Array(12).fill(DOWN)); // cursor on opt13
+	const s = d.screen();
+	assert.ok(rows(s).length <= 10);
+	assert.match(s, /> \( \) 13\. opt13/);
+	assert.match(s, /desc13/);
+	assert.match(s, /↑ \d+ more/);
+	assert.doesNotMatch(s, /\. opt1\n/);
+	d.press(...Array(10).fill(DOWN)); // clamps on Other
+	assert.match(d.screen(), /> \( \) Other/);
+	assert.doesNotMatch(d.screen(), /↓ \d+ more/);
+});
+
+test("multi-select window includes Other and Submit", () => {
+	const d = open([many(15, true)]);
+	d.press(...Array(20).fill(DOWN));
+	assert.match(d.screen(), /> ○ Submit/);
+	assert.match(d.screen(), /Other/);
+	assert.ok(rows(d.screen()).length <= 10);
+});
+
+test("digit picks an option outside the window", async () => {
+	const d = open([many(15)]);
+	d.press("9");
+	assert.equal((await d.result).answers[0][0].label, "opt9");
+	const d2 = open([many(15)]);
+	d2.press(...Array(14).fill(DOWN), "3"); // window scrolled to the bottom, opt3 is out of view
+	assert.equal((await d2.result).answers[0][0].label, "opt3");
+});
+
+test("list of 10 or fewer renders without a window", () => {
+	const d = open([many(9)]);
+	assert.equal(rows(d.screen()).length, 10); // 9 options + Other
+	assert.doesNotMatch(d.screen(), /more/);
+});

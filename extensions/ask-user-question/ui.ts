@@ -13,6 +13,8 @@ import {
 	setNote,
 } from "./logic.ts";
 
+const MAX_VISIBLE = 10; // option rows shown at once
+
 function editorTheme(theme: any): EditorTheme {
 	return {
 		borderColor: (s) => theme.fg("accent", s),
@@ -244,13 +246,19 @@ export function askQuestions(
 					];
 					const n = answers[tab].length;
 					if (multi) items.push({ text: n > 0 ? `✓ ${S.submit} (${n})` : `○ ${S.submit}`, on: n > 0, desc: undefined });
-					items.forEach((it, i) => {
+					// Window of at most MAX_VISIBLE items centred on the cursor, like pi's own selectors.
+					const start = Math.max(0, Math.min(st.cursor - Math.floor(MAX_VISIBLE / 2), items.length - MAX_VISIBLE));
+					const end = Math.min(start + MAX_VISIBLE, items.length);
+					if (start > 0) add(theme.fg("dim", `  ↑ ${S.more.replace("%d", String(start))}`));
+					for (let i = start; i < end; i++) {
+						const it = items[i];
 						const focused = i === st.cursor && !editMode;
 						add(`${focused ? theme.fg("accent", "> ") : "  "}${theme.fg(focused ? "accent" : it.on ? "success" : "text", it.text)}`);
 						if (it.desc) wrap(theme.fg("muted", it.desc), "     ");
 						const note = i < options.length ? st.notes.get(i) : undefined;
 						if (note) wrap(theme.fg("success", `↳ ${note.replace(/\s+/g, " ")}`), "     ");
-					});
+					}
+					if (end < items.length) add(theme.fg("dim", `  ↓ ${S.more.replace("%d", String(items.length - end))}`));
 					lines.push("");
 				}
 
