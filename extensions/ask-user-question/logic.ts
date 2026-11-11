@@ -31,12 +31,18 @@ export interface QuestionResult {
 	usedDefault?: boolean;
 }
 
-/** Per-question UI state. `picked` holds 0-based option indexes; `other` is custom/free text. */
+/**
+ * Per-question UI state. `picked` holds 0-based option indexes; `other` is custom/free text.
+ * `other`/`notes` hold the full text sent to the model; `otherDisplay`/`noteDisplays` hold what the
+ * dialog shows (large pastes appear there as `[paste #1 +15 lines]` markers). Display falls back to the value.
+ */
 export interface QState {
 	cursor: number;
 	picked: Set<number>;
 	other?: string;
+	otherDisplay?: string;
 	notes: Map<number, string>; // option index -> comment
+	noteDisplays: Map<number, string>;
 }
 
 // ---------- strings (en / ru) ----------
@@ -45,6 +51,7 @@ const EN = {
 	other: "Other",
 	otherCustom: "Other (custom)",
 	submit: "Submit",
+	more: "%d more",
 	review: "Review",
 	notAnswered: "not answered",
 	writeAnswer: "Write your custom answer:",
@@ -73,6 +80,7 @@ const RU: Strings = {
 	other: "Другое",
 	otherCustom: "Другое (свой вариант)",
 	submit: "Далее",
+	more: "ещё %d",
 	review: "Проверка",
 	notAnswered: "нет ответа",
 	writeAnswer: "Напишите свой ответ:",
@@ -125,7 +133,7 @@ export function getOtherLabel(options: Option[], s: Strings = EN): string {
 // ---------- state / answers ----------
 
 export function newState(): QState {
-	return { cursor: 0, picked: new Set(), notes: new Map() };
+	return { cursor: 0, picked: new Set(), notes: new Map(), noteDisplays: new Map() };
 }
 
 /** Answers for the current state, ordered: options by index, then custom text. */
@@ -141,6 +149,16 @@ export function answersOf(q: Question, st: QState): Answer[] {
 	return answers;
 }
 
+/** Set (or clear, when empty) the custom text: `value` goes to the model, `display` is shown. */
+export function setOther(st: QState, value: string, display = value): void {
+	const v = value.trim();
+	st.other = v || undefined;
+	st.otherDisplay = v ? display.trim() || v : undefined;
+}
+
+export const otherShown = (st: QState): string | undefined => (st.other ? st.otherDisplay ?? st.other : undefined);
+export const noteShown = (st: QState, index: number): string | undefined => st.noteDisplays.get(index) ?? st.notes.get(index);
+
 /** Single-select picks exactly one option (clearing custom text); multi-select toggles. */
 export function pick(q: Question, st: QState, index: number): void {
 	if (getMode(q) === "multi-select") {
@@ -148,22 +166,24 @@ export function pick(q: Question, st: QState, index: number): void {
 		else st.picked.add(index);
 	} else {
 		st.picked = new Set([index]);
-		st.other = undefined;
+		setOther(st, "");
 	}
 }
 
 /** Set (or clear, with empty text) the comment on an option; a non-empty comment also selects the option. */
-export function setNote(q: Question, st: QState, index: number, text: string): void {
+export function setNote(q: Question, st: QState, index: number, text: string, display = text): void {
 	const note = text.trim();
 	if (!note) {
 		st.notes.delete(index);
+		st.noteDisplays.delete(index);
 		return;
 	}
 	st.notes.set(index, note);
+	st.noteDisplays.set(index, display.trim() || note);
 	if (getMode(q) === "multi-select") st.picked.add(index);
 	else {
 		st.picked = new Set([index]);
-		st.other = undefined;
+		setOther(st, "");
 	}
 }
 

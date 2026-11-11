@@ -14,7 +14,10 @@ import {
 	normalizeOptions,
 	pick,
 	runAsk,
+	noteShown,
+	otherShown,
 	setNote,
+	setOther,
 } from "../extensions/ask-user-question/logic.ts";
 
 const single: Question = { question: "DB?", options: [{ label: "PG" }, { label: "MySQL", value: "my" }] };
@@ -179,4 +182,35 @@ test("runAsk: answered, and no-UI falls back to defaults or reports unavailable"
 	assert.equal(defaulted.details.status, "answered");
 	assert.equal(defaulted.details.results[0].usedDefault, true);
 	assert.equal(defaulted.details.results[0].answers[0].label, "PG");
+});
+
+test("setOther/setNote keep the full value for the model and a separate display", () => {
+	const st = newState();
+	setOther(st, " full\ntext ", " [paste #1 +15 lines] ");
+	assert.equal(otherShown(st), "[paste #1 +15 lines]");
+	assert.equal(answersOf(single, st)[0].label, "full\ntext");
+	setNote(single, st, 0, "long note", "[paste #1 +15 lines]");
+	assert.equal(noteShown(st, 0), "[paste #1 +15 lines]");
+	assert.equal(answersOf(single, st).find((a) => a.type === "option")?.note, "long note");
+	assert.equal(st.other, undefined); // a note on a single-select option clears Other
+	assert.equal(otherShown(st), undefined);
+	setNote(single, st, 0, "");
+	assert.equal(noteShown(st, 0), undefined);
+});
+
+test("display falls back to the value; empty text clears Other", () => {
+	const st = newState();
+	setOther(st, "hi");
+	assert.equal(otherShown(st), "hi");
+	setOther(st, "  ");
+	assert.equal(st.other, undefined);
+	assert.equal(otherShown(st), undefined);
+});
+
+test("picking an option in single-select clears the Other display", () => {
+	const st = newState();
+	setOther(st, "x", "[paste]");
+	pick(single, st, 0);
+	assert.equal(otherShown(st), undefined);
+	assert.equal(st.otherDisplay, undefined);
 });
