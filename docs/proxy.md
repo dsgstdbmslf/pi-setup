@@ -19,6 +19,11 @@ pi installs undici's `EnvHttpProxyAgent` as the global `fetch` dispatcher
 the same proxy and `NO_PROXY` rules. Traffic that does not use global `fetch` (child
 processes such as `git`, `npm`) follows the environment variables only.
 
+Tavily follows the proxy by default. To send Tavily directly while everything else uses the
+proxy, set `"tavily": { "proxy": false }` in the same settings file, or add
+`api.tavily.com` to `NO_PROXY`; `/search-keys` shows the route on its `network:` line. See
+the `tavily-keys.ts` section of the [README](../README.md).
+
 ```json
 { "httpProxy": "http://proxy.example:3128" }
 ```
@@ -48,7 +53,8 @@ variables.
 3. Start pi, send a short prompt: the model answers through the proxy (check the proxy
    log).
 4. Use an extension that calls `fetch` (`web_search`): its request appears in the proxy
-   log too.
+   log too (unless `tavily.proxy` is `false`: then it does not, and `/search-keys` says
+   `network: direct (tavily.proxy = false)`).
 5. A request to a host in `NO_PROXY` does not appear in the proxy log.
 6. With a gateway: a prompt that calls a tool and a follow-up turn both succeed; adjust
    `compat` fields on errors about `tools`, `null` content or `prompt_cache_key`.
