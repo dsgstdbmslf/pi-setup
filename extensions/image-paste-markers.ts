@@ -37,14 +37,35 @@ const register = (path: string): number => {
   return counter;
 };
 
-class ImageMarkerEditor extends CustomEditor {
+// "[Image #N: /path]" -> "[Image #N]", only when /path is the one registered for N.
+export const collapseMarkers = (text: string): string =>
+  text.replace(FULL_MARKER, (m, id, p) => (paths.get(Number(id)) === p ? `[Image #${id}]` : m));
+
+// @ts-ignore TS2415: expandPasteMarkers is private in pi-tui typings; overriding it is intentional (see below).
+export class ImageMarkerEditor extends CustomEditor {
   handlePaste(text: string): void {
     const replaced = text.replace(PASTE_PATH, (p) => `[Image #${register(p)}]`);
     super.handlePaste(replaced);
   }
+  // pi pulls the editor text through getExpandedText() and restores it with setText()
+  // (ctx.ui.custom(), editor component swap, queued-message restore), which would leave the
+  // full "[Image #N: /path]" in the editor. Fold registered markers back to "[Image #N]".
+  // Note: setText() resets pi's own [paste #N] registry, so those come back expanded (pi behaviour).
+  setText(text: string): void {
+    super.setText(collapseMarkers(text));
+  }
+  // Prompt history stores the expanded submitted text; navigateHistory() uses the private
+  // setTextInternal() (bypasses setText), so collapse on the way in instead.
+  addToHistory(text: string): void {
+    super.addToHistory(collapseMarkers(text));
+  }
+  // pi-tui declares expandPasteMarkers `private`, but both getExpandedText() and the submit
+  // path (private submitValue) call it, so overriding it is the only hook that covers submit.
+  // test/image-paste-markers.test.ts fails if pi-tui stops calling it.
   expandPasteMarkers(text: string): string {
+    // @ts-ignore TS2340: super.expandPasteMarkers is private in pi-tui typings.
     const expanded = super.expandPasteMarkers(text);
-    return expanded.replace(BARE_MARKER, (m, id) => {
+    return expanded.replace(BARE_MARKER, (m: string, id: string) => {
       const p = paths.get(Number(id));
       return p ? `[Image #${id}: ${p}]` : m;
     });
