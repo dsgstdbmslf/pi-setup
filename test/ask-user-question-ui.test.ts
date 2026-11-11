@@ -4,6 +4,8 @@ import { getEventListeners } from "node:events";
 import { test } from "node:test";
 import { getStrings, type Question, type UiOutcome } from "../extensions/ask-user-question/logic.ts";
 
+import { getKeybindings } from "@earendil-works/pi-tui";
+import { FieldEditor } from "../extensions/ask-user-question/field-editor.ts";
 import { askQuestions } from "../extensions/ask-user-question/ui.ts";
 
 const theme: any = { fg: (_: string, s: string) => s, bg: (_: string, s: string) => s };
@@ -283,4 +285,113 @@ test("Esc on a comment discards the edit but keeps the saved paste valid", async
 	assert.doesNotMatch(d.screen(), /lines\]x/);
 	d.press(ENTER, ENTER);
 	assert.equal((await d.result).answers[0][0].note, BIG);
+});
+
+// ---- submit vs newline follows the editor's keybindings ----
+const CTRL_J = "\n";
+const CTRL_ENTER = "\x1b[13;5u";
+const SHIFT_ENTER = "\x1b[13;2u";
+
+async function withKeys(bindings: Record<string, string>, fn: () => Promise<void> | void) {
+	const kb = getKeybindings();
+	const saved = kb.getUserBindings();
+	try {
+		kb.setUserBindings(bindings);
+		await fn();
+	} finally {
+		kb.setUserBindings(saved);
+	}
+}
+
+// How each kind of field is reached, and what the saved answer looks like.
+const fieldCases: Array<[string, Question, string[], (a: any) => string]> = [
+	["text question", text, [], (a) => a.label],
+	["Other", single, [DOWN, DOWN, ENTER], (a) => a.label],
+	["option comment", single, [TAB], (a) => a.note],
+];
+
+for (const [name, q, enter, read] of fieldCases) {
+	test(`Ctrl+J adds a newline instead of submitting (${name})`, async () => {
+		const d = open([q]);
+		d.press(...enter, "before", CTRL_J, "after");
+		assert.equal(d.completed(), false);
+		d.press(ENTER);
+		if (name === "option comment") d.press(ENTER);
+		assert.equal(read((await d.result).answers[0].at(-1)), "before\nafter");
+	});
+
+	test(`custom submit key (ctrl+enter) sends the full pasted text (${name})`, async () => {
+		await withKeys({ "tui.input.submit": "ctrl+enter" }, async () => {
+			const d = open([q]);
+			d.press(...enter, PASTE);
+			assert.ok(d.screen().includes(MARKER));
+			d.press(CTRL_ENTER);
+			if (name === "option comment") {
+				assert.ok(d.screen().includes(`↳ ${MARKER}`));
+				d.press(ENTER);
+			}
+			assert.equal(read((await d.result).answers[0].at(-1)), BIG);
+		});
+	});
+
+	test(`swapped Enter / Shift+Enter bindings (${name})`, async () => {
+		await withKeys({ "tui.input.submit": "shift+enter", "tui.input.newLine": "enter" }, async () => {
+			const d = open([q]);
+			d.press(...enter, "a", ENTER, "b");
+			assert.equal(d.completed(), false);
+			d.press(SHIFT_ENTER);
+			if (name === "option comment") d.press(ENTER);
+			assert.equal(read((await d.result).answers[0].at(-1)), "a\nb");
+		});
+	});
+}
+
+test("a submitted paste is still a working marker when returning to the field", async () => {
+	await withKeys({ "tui.input.submit": "ctrl+enter" }, async () => {
+		const d = open([text, single]);
+		d.press(PASTE, CTRL_ENTER, LEFT); // Q1 submitted, Q2, back
+		d.press("x");
+		d.press("\x7f", "\x7f"); // delete "x", then the whole marker
+		assert.doesNotMatch(d.screen(), /paste #1/);
+	});
+});
+
+test("blocked message is cut by code points, never inside an emoji", () => {
+	const d = open([{ question: `${"a".repeat(199)}😀` }]);
+	const m: string = d.options().blocked.message;
+	assert.ok(m.isWellFormed());
+	assert.equal(Array.from(m).length, 200);
+});
+
+test("pi-tui still exposes the editor internals the adapter relies on", () => {
+	const e = new FieldEditor({ requestRender() {}, terminal: { rows: 40 } } as any, { borderColor: (s: string) => s, selectList: {} } as any);
+	assert.ok(e.hasPasteInternals(), "pi-tui renamed Editor.pastes / pasteCounter: update field-editor.ts");
+	e.handleInput(PASTE);
+	assert.equal(e.getText(), MARKER);
+	const snap = e.snapshot();
+	assert.equal(snap.pastes.size, 1);
+	e.setText("");
+	e.restore(snap);
+	assert.equal(e.getText(), MARKER);
+	assert.equal(e.getExpandedText(), BIG);
+	let got: any;
+	e.onSubmit = (v) => (got = v);
+	e.handleInput("\r");
+	assert.equal(got, BIG);
+	assert.equal(e.lastSubmit?.text, MARKER); // taken before the editor cleared itself
+});
+
+test("without the private paste fields, snapshots fall back to the expanded text", () => {
+	class Renamed extends FieldEditor {
+		hasPasteInternals() {
+			return false; // as if pi-tui renamed pastes / pasteCounter
+		}
+	}
+	const e = new Renamed({ requestRender() {}, terminal: { rows: 40 } } as any, { borderColor: (s: string) => s, selectList: {} } as any);
+	e.handleInput(PASTE);
+	const snap = e.snapshot();
+	assert.equal(snap.text, BIG);
+	e.setText("");
+	e.restore(snap);
+	assert.equal(e.getText(), BIG); // no marker left that could not be expanded
 });

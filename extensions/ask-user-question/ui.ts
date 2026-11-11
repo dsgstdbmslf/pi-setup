@@ -1,4 +1,5 @@
-import { Editor, type EditorTheme, Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type EditorTheme, Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { FieldEditor, type EditorSnapshot } from "./field-editor.ts";
 import {
 	type UiOutcome,
 	type Question,
@@ -40,18 +41,20 @@ export function askQuestions(
 	signal?: AbortSignal,
 ): Promise<UiOutcome> {
 	// One-line, bounded text of the first question for the "pi is waiting" status.
-	const blockedMessage = (questions[0]?.question ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+	// Cut by code points so an emoji is never split.
+	const blockedMessage = Array.from((questions[0]?.question ?? "").replace(/\s+/g, " ").trim()).slice(0, 200).join("");
 	return ctx.ui.custom<UiOutcome>(
 		(tui: any, theme: any, _kb: any, done: (r: UiOutcome) => void) => {
 			const states = questions.map(newState);
 			const multiTab = questions.length > 1;
 			const reviewTab = multiTab ? questions.length : -1;
 			const tabCount = questions.length + (multiTab ? 1 : 0);
-				// One editor per field (open answer / option comment), created lazily: setText() would drop
+			// One editor per field (open answer / option comment), created lazily: setText() would drop
 			// the paste map, so a `[paste #N]` marker only stays valid in the editor that made it.
 			interface Field {
-				editor: Editor;
-				snap?: { text: string; pastes: Map<number, string>; counter: number }; // state when editing began (Esc restores it)
+				editor: FieldEditor;
+				snap?: EditorSnapshot; // state when editing began (Esc restores it)
+				saved?: EditorSnapshot; // last committed state (restored when the editor was cleared by a submit)
 			}
 			const fields = new Map<string, Field>();
 			let active: Field | undefined;
@@ -80,28 +83,30 @@ export function askQuestions(
 			if (timeoutSec) timer = setTimeout(() => finish("timeout"), timeoutSec * 1000);
 
 			function commitText() {
-				if (editMode && isText() && active) setOther(states[tab], active.editor.getExpandedText(), active.editor.getText());
+				if (!(editMode && isText() && active)) return;
+				const e = active.editor;
+				active.saved = e.snapshot();
+				setOther(states[tab], e.getExpandedText(), e.getText());
 			}
 
 			// Activate the editor for a field; `hasValue` false means it starts empty.
 			function openField(key: string, hasValue: boolean) {
 				let f = fields.get(key);
-				if (!f) fields.set(key, (f = { editor: new Editor(tui, editorTheme(theme)) }));
+				if (!f) {
+					const field: Field = { editor: new FieldEditor(tui, editorTheme(theme)) };
+					field.editor.onSubmit = (value) => submit(field, value);
+					fields.set(key, (f = field));
+				}
 				if (!hasValue) f.editor.setText("");
-				const e = f.editor as any; // pastes/pasteCounter are private in pi-tui
-				f.snap = { text: f.editor.getText(), pastes: new Map(e.pastes), counter: e.pasteCounter };
+				else if (f.editor.getText() === "" && f.saved) f.editor.restore(f.saved); // a submit cleared it
+				f.snap = f.editor.snapshot();
 				active = f;
 				editMode = true;
 			}
 
 			// Drop unsaved edits: put the editor back as it was when editing began, markers included.
 			function discardEdit() {
-				const f = active;
-				if (!f?.snap) return;
-				const e = f.editor as any;
-				f.editor.setText(f.snap.text);
-				e.pastes = new Map(f.snap.pastes);
-				e.pasteCounter = f.snap.counter;
+				if (active?.snap) active.editor.restore(active.snap);
 			}
 
 			function startEdit() {
@@ -123,11 +128,11 @@ export function askQuestions(
 				else finish("done");
 			}
 
-			// Enter in the editor: the value for the model is the expanded text, the display keeps paste markers.
-			function submit() {
-				if (!active) return;
-				const text = active.editor.getExpandedText().trim();
-				const display = active.editor.getText();
+			// Editor submit: the value for the model is the expanded text, the display keeps paste markers.
+			function submit(f: Field, value: string) {
+				const text = value.trim();
+				const display = f.editor.lastSubmit?.text ?? text; // snapshot taken before the editor cleared itself
+				f.saved = f.editor.lastSubmit;
 				const st = states[tab];
 				if (noteIdx !== undefined) {
 					setNote(cur(), st, noteIdx, text, display);
@@ -166,10 +171,7 @@ export function askQuestions(
 					}
 					if (isText() && multiTab && matchesKey(data, Key.tab)) return goTo(tab + 1);
 					if (isText() && multiTab && matchesKey(data, Key.shift("tab"))) return goTo(tab - 1);
-					// Enter submits, except after a trailing "\" (newline workaround, handled by the editor)
-					const { line, col } = active!.editor.getCursor();
-					const afterBackslash = col > 0 && active!.editor.getLines()[line]?.[col - 1] === "\\";
-					if (matchesKey(data, Key.enter) && !afterBackslash) return submit();
+					// Submit vs newline is decided by the editor (keybindings, Ctrl+J, backslash); see submit()
 					active!.editor.handleInput(data);
 					refresh();
 					return;
