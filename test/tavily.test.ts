@@ -19,6 +19,7 @@ import {
 	withRotation,
 } from "../extensions/tavily/keys.ts";
 import { call, compact, credits, cut, plain, serverText, statusLabel } from "../extensions/tavily/client.ts";
+import { describeNetwork, noProxyMatches, parseProxySetting } from "../extensions/tavily/network.ts";
 import { cleanupSaved, ensurePrivateDir, plural, sanitize, saveFull } from "../extensions/tavily/output.ts";
 
 const markFile = (stateDir: string, key: string) => join(stateDir, "tavily", `${fingerprint(key)}.json`);
@@ -923,4 +924,69 @@ test("cut drops a high surrogate left at the boundary and keeps well-formed text
 test("serverText withholds non-BMP text, so no cut can reach an emoji", () => {
 	assert.equal(serverText(`bad ${"😀"} request`, null), null);
 	assert.equal(serverText(`${"😀".repeat(200)}`, null, 5), null);
+});
+
+const okResponse = () => new Response("{}", { status: 200 });
+
+test("call passes dispatcher to fetch only when given", async () => {
+	const seen: any[] = [];
+	const fetchImpl = (async (_url: string, init: any) => (seen.push(init), okResponse())) as unknown as typeof fetch;
+	const dispatcher = { name: "direct" };
+	await call("/usage", null, { timeoutMs: 1000, fetchImpl, dispatcher });
+	await call("/usage", null, { timeoutMs: 1000, fetchImpl });
+	assert.equal(seen[0].dispatcher, dispatcher);
+	assert.ok(!("dispatcher" in seen[1]));
+});
+
+test("parseProxySetting: true, false, missing and invalid values", () => {
+	assert.deepEqual(parseProxySetting({ tavily: { proxy: false } }), { proxy: false });
+	assert.deepEqual(parseProxySetting({ tavily: { proxy: true } }), { proxy: true });
+	for (const missing of [undefined, null, {}, { tavily: {} }, { tavily: null }]) assert.deepEqual(parseProxySetting(missing), { proxy: true });
+	for (const bad of [{ tavily: { proxy: "false" } }, { tavily: { proxy: 0 } }, { tavily: { proxy: null } }, { tavily: true }, { tavily: [] }]) {
+		const r = parseProxySetting(bad);
+		assert.equal(r.proxy, true, JSON.stringify(bad));
+		assert.ok(r.invalid, JSON.stringify(bad));
+	}
+});
+
+test("describeNetwork: route line never shows credentials", () => {
+	const env = { HTTPS_PROXY: "http://user:secret@proxy.local:3128" };
+	assert.equal(describeNetwork(false, env), "direct (tavily.proxy = false)");
+	assert.equal(describeNetwork(true, {}), "direct (no proxy configured)");
+	assert.equal(describeNetwork(true, { ...env, NO_PROXY: "localhost,.tavily.com" }), "direct (NO_PROXY)");
+	assert.equal(describeNetwork(true, { ...env, no_proxy: "api.tavily.com:443" }), "direct (NO_PROXY)");
+	const via = describeNetwork(true, env);
+	assert.equal(via, "via proxy proxy.local:3128 (pi httpProxy/HTTPS_PROXY)");
+	assert.ok(!/secret|user/.test(via));
+	assert.match(describeNetwork(false, env, false), /could not be applied/);
+	assert.ok(noProxyMatches("*", "api.tavily.com", 443));
+	assert.ok(!noProxyMatches("example.com,tavily.com:8080", "api.tavily.com", 443));
+});
+
+test("serverText withholds proxy error pages and URL userinfo", () => {
+	assert.equal(serverText("<html><body><h1>502 Bad Gateway</h1></body></html>", null), null);
+	assert.equal(serverText("<!DOCTYPE html><title>407 Proxy Authentication Required</title>", null), null);
+	assert.equal(serverText("connect failed via http://user:pass@proxy.local:3128", null), null);
+	assert.equal(serverText("connect failed via //user@proxy.local", null), null);
+	assert.equal(serverText("Proxy response (407) !== 200 when HTTP Tunneling", null), "Proxy response (407) !== 200 when HTTP Tunneling");
+	assert.equal(statusLabel(407), "proxy authentication required");
+});
+
+test("call: a proxy's 407 HTML page is withheld, a proxy URL with credentials never leaks", async () => {
+	const html = "<html><head><title>407 Proxy Authentication Required</title></head></html>";
+	const res = await call("/search", "tvly-abc", {
+		timeoutMs: 1000,
+		fetchImpl: (async () => new Response(html, { status: 407, headers: { "content-type": "text/html" } })) as unknown as typeof fetch,
+	});
+	assert.deepEqual(res.ok, false);
+	assert.equal((res as any).message, "Tavily /search 407: proxy authentication required (server text withheld)");
+	await assert.rejects(
+		call("/search", null, {
+			timeoutMs: 1000,
+			fetchImpl: (async () => {
+				throw new Error("tunnel failed", { cause: new Error("connect to http://user:pass@proxy.local:3128 failed") });
+			}) as unknown as typeof fetch,
+		}),
+		(err: Error) => err.message === "Tavily /search: request failed (details withheld)" && !/pass/.test(err.message),
+	);
 });

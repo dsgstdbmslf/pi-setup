@@ -6,7 +6,7 @@ import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { call, statusLabel } from "./tavily/client.ts";
 import { KEYS_FILE, mask, nextMonthUtc } from "./tavily/keys.ts";
-import { tavilyPool } from "./tavily/tool.ts";
+import { tavilyNetwork, tavilyPool } from "./tavily/tool.ts";
 
 const EXAMPLE = { tavily: [{ key: "tvly-YOUR_KEY", label: "main" }, { key: "tvly-SECOND_KEY", label: "backup" }] };
 
@@ -22,11 +22,12 @@ export default function tavilyKeys(pi: ExtensionAPI) {
 			: "";
 		const warn = [bad, snap.stateWarning ? `Warning: ${snap.stateWarning}.` : ""].filter(Boolean);
 		if (all.length === 0) return [`No tavily keys in ${pool.keysFile}. Tools that allow it use keyless mode.`, ...warn].join("\n");
-		const lines = [`tavily keys (${pool.keysFile}), used in file order:`];
+		const net = tavilyNetwork(pi, ctx);
+		const lines = [`tavily keys (${pool.keysFile}), used in file order:`, `network: ${net.description}`];
 		const cleared: string[] = [];
 		for (const { entry, mark } of all) {
 			let info: string;
-			const res = await call("/usage", entry.key, { method: "GET", timeoutMs: 15_000, signal: ctx.signal });
+			const res = await call("/usage", entry.key, { method: "GET", timeoutMs: 15_000, signal: ctx.signal, dispatcher: net.dispatcher });
 			if (res.ok) {
 				const k = res.value?.key ?? {};
 				const a = res.value?.account ?? {};

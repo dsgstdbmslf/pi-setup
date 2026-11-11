@@ -1,17 +1,20 @@
 // Tool kit shared by the web-* extensions: key pool, requests with failover, result
 // truncation and rendering. Not an extension itself: pi loads only extensions/*.ts.
 
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	formatSize,
 	getAgentDir,
+	getPackageDir,
 	truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { call, credits, cut } from "./client.ts";
+import { describeNetwork, parseProxySetting } from "./network.ts";
 import { KEYS_FILE, KeyPool, STATE_DIR, type RotationResult, withRotation } from "./keys.ts";
 import { cleanupSaved, sanitize, saveFull } from "./output.ts";
 
@@ -40,6 +43,44 @@ export function tavilyPool(): KeyPool {
 	return new KeyPool("tavily", join(agentDir, KEYS_FILE), join(agentDir, STATE_DIR));
 }
 
+let directAgent: unknown;
+const warned = new Set<string>();
+
+/**
+ * A direct undici Agent (ignores HTTP(S)_PROXY), or null when undici cannot be loaded. Extensions
+ * cannot import undici themselves; it is pi's own dependency, so it is resolved from pi's package dir.
+ */
+function directDispatcher(): unknown {
+	if (directAgent === undefined) {
+		try {
+			const undici = createRequire(join(getPackageDir(), "package.json"))("undici");
+			directAgent = new undici.Agent();
+		} catch {
+			directAgent = null;
+		}
+	}
+	return directAgent;
+}
+
+/**
+ * How Tavily connects, read from `tavily.proxy` in pi's settings on every call (so /reload or an
+ * edit takes effect). `dispatcher` is set only to bypass the proxy; the options go to `call()`
+ * for tool requests and the /search-keys check alike. Problems are shown once per text.
+ */
+export function tavilyNetwork(pi: ExtensionAPI, ctx?: ExtensionContext): { dispatcher?: unknown; description: string } {
+	const warn = (text: string) => {
+		if (warned.has(text)) return;
+		warned.add(text);
+		if (ctx?.hasUI) ctx.ui.notify(`tavily: ${text}`, "warning");
+	};
+	const { proxy, invalid } = parseProxySetting(pi.getSettings());
+	if (invalid) warn(`${invalid}; using the default (true, follow pi's proxy)`);
+	if (proxy) return { description: describeNetwork(true, process.env) };
+	const dispatcher = directDispatcher();
+	if (!dispatcher) warn("tavily.proxy = false could not be applied: undici is not available from pi; following pi's proxy");
+	return dispatcher ? { dispatcher, description: describeNetwork(false, process.env) } : { description: describeNetwork(false, process.env, false) };
+}
+
 export interface RequestOptions {
 	/** Fall back to Tavily's keyless mode when no key works (search and extract only). */
 	keyless: boolean;
@@ -60,7 +101,8 @@ export function createTavily(pi: ExtensionAPI) {
 
 	/** POST to Tavily with key failover; keyless fallback where Tavily allows it. */
 	function request(path: string, body: unknown, opts: RequestOptions) {
-		return withRotation(pool, (key) => call(path, key, { body, signal: opts.signal, timeoutMs: opts.timeoutMs, maxBytes: opts.maxBytes }), {
+		const { dispatcher } = tavilyNetwork(pi, opts.ctx);
+		return withRotation(pool, (key) => call(path, key, { body, signal: opts.signal, timeoutMs: opts.timeoutMs, maxBytes: opts.maxBytes, dispatcher }), {
 			keyless: opts.keyless,
 			onNote: (note) => opts.ctx.hasUI && opts.ctx.ui.notify(note, "warning"),
 		});

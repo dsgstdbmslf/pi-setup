@@ -86,6 +86,17 @@ Do not install both ways at once, or the extension loads twice.
   long page is cut at 200,000 characters. Server error texts are shown (up to 300 characters)
   only when plain and token-free, otherwise a fixed status label; marks store no server text.
 
+  Proxy: pi sets one for all its HTTP traffic from its `httpProxy` setting (or
+  `HTTPS_PROXY`/`NO_PROXY`), and Tavily follows it by default. To connect to Tavily directly
+  instead, set `"tavily": { "proxy": false }` in `~/.pi/agent/settings.json` (or the project
+  settings); `true` (default) follows pi. Edit, then `/reload`. A value that is not a boolean
+  is reported once and treated as `true`. `NO_PROXY=api.tavily.com` in the environment also
+  bypasses the proxy while `tavily.proxy` is left at its default. `/search-keys` shows the route
+  (`network: via proxy host:port`, never credentials, or `direct`). Proxy error pages and
+  texts with credentials in a URL are withheld like any server text; a 407 reads
+  "proxy authentication required". Needs pi's bundled `undici` for `false`; without it pi's
+  proxy is used and a warning says so.
+
 - `web-search.ts` — `web_search` tool on Tavily: title, date, URL and the most
   relevant excerpts of each result, with filters by domain, date (`time_range`), topic
   (general, news, finance) and exact phrases. Defaults are economical: 5 results,
