@@ -40,6 +40,16 @@ No credentials, sessions, or machine state are stored here (`auth.json`, `sessio
 
 Then restart pi or run `/reload`.
 
+Sign in to a provider with `pi auth login <provider>` (sign out with `pi auth logout
+<provider>`). On a headless server add `--no-browser`: pi then uses the provider's other
+sign-in method, such as a device code, instead of opening a browser. It cannot be combined
+with `--api-key`.
+
+If a session's working directory no longer exists (for example after a folder rename),
+interactive pi asks how to open it: `Continue` runs it in the current directory and asks
+again next time; `Fork` copies it into the current directory with a new ID, so later
+resumes no longer ask; `Cancel` leaves things as they are. Other modes exit with an error.
+
 Single files work too: `cp extensions/code-fence-hide.ts ~/.pi/agent/extensions/`.
 Do not install both ways at once, or the extension loads twice.
 
@@ -48,7 +58,9 @@ Do not install both ways at once, or the extension loads twice.
 ### Extensions
 
 - `code-fence-hide.ts` — renders fenced code blocks without the ``` lines (like Claude
-  Code); pair with `"markdown": { "codeBlockIndent": "" }` from `settings.json`
+  Code) on every Markdown surface, changelog included; pair with
+  `"markdown": { "codeBlockIndent": "" }` from `settings.json`. Tests:
+  `test/code-fence-hide.test.ts` (fails if the pi-tui API it patches moves)
 - `image-paste-markers.ts` — pasted screenshots show as `[Image #N]` and are attached to
   the prompt as images. Recognizes pi's own `pi-clipboard-*` files and `<app>-paste-*`
   files that terminal apps save for pasted images
@@ -117,6 +129,10 @@ Do not install both ways at once, or the extension loads twice.
 ### Settings
 
 - `settings.json` — default provider/model, thinking levels, markdown, packages
+- Prompt cache warming: the 1.5.1 default `"cacheWarming": "idle"` is kept, so
+  `settings.json` has no such key. Set `"cacheWarming": "streaming"` to restore the
+  pre-1.5.1 behavior
+- Proxy and API gateway: not enabled; see [docs/proxy.md](docs/proxy.md)
 - `npm/package.json` — pi package `@indexyz/pi-skill` (`$skill` mentions)
 
 ### Instructions
@@ -133,6 +149,9 @@ copy one by hand to use it. Kept for reference.
 - `deprecated/extensions/web-fetch/` — `web_fetch` tool: URL to markdown (HTML, PDF,
   text) with a 12KB preview and a privacy-checked Jina fallback. Replaced by Tavily;
   see its [README](deprecated/extensions/web-fetch/README.md) for install and details
+- `deprecated/extensions/orca-kitty-images/` — set `WEZTERM_PANE` in Orca so fullscreen
+  drew Kitty images after text. pi 1.5.1 does this itself; see its
+  [README](deprecated/extensions/orca-kitty-images/README.md)
 
 ## Rollback
 
@@ -141,5 +160,5 @@ restore your previous one), revert the merged settings fields, then `/reload`.
 
 ## Dependencies
 
-- pi (`@earendil-works/pi-coding-agent`) 1.5+
+- pi (`@earendil-works/pi-coding-agent`) 1.5+; tested on 1.5.2
 - `git` (for `pi install git:...`)
