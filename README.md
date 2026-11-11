@@ -48,7 +48,9 @@ Do not install both ways at once, or the extension loads twice.
 ### Extensions
 
 - `code-fence-hide.ts` — renders fenced code blocks without the ``` lines (like Claude
-  Code); pair with `"markdown": { "codeBlockIndent": "" }` from `settings.json`
+  Code) on every Markdown surface, changelog included; pair with
+  `"markdown": { "codeBlockIndent": "" }` from `settings.json`. Tests:
+  `test/code-fence-hide.test.ts` (fails if the pi-tui API it patches moves)
 - `image-paste-markers.ts` — pasted screenshots show as `[Image #N]` and are attached to
   the prompt as images. Recognizes pi's own `pi-clipboard-*` files and `<app>-paste-*`
   files that terminal apps save for pasted images

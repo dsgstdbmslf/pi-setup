@@ -1,5 +1,19 @@
 // Render fenced code blocks like Claude Code: hide the ``` fence lines and keep
 // only the (highlighted) code. Display-only; messages and context are unchanged.
+//
+// Scope: the patch is on pi-tui's Markdown.renderToken, so fences are hidden on
+// every Markdown surface in pi: user and assistant messages (and thinking),
+// custom messages, skill blocks, branch and compaction summaries, What's New,
+// /changelog and the extension update notices. Changelog code samples included.
+// registerMarkdownTransformer (and its messageTypes option) is not used: it
+// rewrites the Markdown source before rendering, so it cannot drop the fences
+// without losing syntax highlighting. If hiding must ever differ per surface,
+// this file needs an explicit check for it.
+//
+// Mermaid: the built-in transformer turns valid diagrams into rows of inline
+// code before rendering, so they never reach this patch as code blocks. An
+// invalid or too wide diagram stays a normal code block and loses its fences.
+//
 // Combine with settings.json "markdown": { "codeBlockIndent": "" } so code is
 // not shifted relative to the surrounding text.
 // Rollback: delete this file and run /reload (or restart pi).
