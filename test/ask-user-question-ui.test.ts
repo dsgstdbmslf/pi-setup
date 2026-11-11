@@ -21,10 +21,12 @@ const multi: Question = { question: "Many?", multiSelect: true, options: [{ labe
 function open(questions: Question[], timeoutSec?: number, signal?: AbortSignal) {
 	let comp: any;
 	let completed = false;
+	let options: any;
 	const ctx = {
 		ui: {
-			custom: (factory: any) =>
+			custom: (factory: any, opts?: any) =>
 				new Promise((resolve) => {
+					options = opts;
 					comp = factory({ requestRender() {}, terminal: { rows: 40 } }, theme, null, (outcome: UiOutcome) => {
 						completed = true;
 						resolve(outcome);
@@ -35,7 +37,7 @@ function open(questions: Question[], timeoutSec?: number, signal?: AbortSignal) 
 	const result = askQuestions(ctx, questions, getStrings({}), timeoutSec, signal) as Promise<UiOutcome>;
 	const press = (...keys: string[]) => keys.forEach((k) => comp.handleInput(k));
 	const screen = () => comp.render(80).join("\n");
-	return { result, press, screen, completed: () => completed };
+	return { result, press, screen, completed: () => completed, options: () => options };
 }
 
 test("single question, single-select: Enter picks and finishes", async () => {
@@ -130,4 +132,15 @@ test("timeout resolves as timeout and keeps partial answers", async (t) => {
 	assert.equal(r.status, "timeout");
 	assert.equal(r.answers[0][0].label, "PG");
 	assert.deepEqual(r.answers[1], []);
+});
+
+test("reports pi as blocked on the first question (one line, bounded)", () => {
+	const long = { question: `Line one\nline two ${"x".repeat(300)}` };
+	const d = open([long, single]);
+	const { blocked } = d.options();
+	assert.equal(blocked.kind, "question");
+	assert.ok(!blocked.message.includes("\n"));
+	assert.ok(blocked.message.startsWith("Line one line two"));
+	assert.ok(blocked.message.length <= 200);
+	assert.equal(open([single]).options().blocked.message, "DB?");
 });
