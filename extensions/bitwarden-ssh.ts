@@ -25,7 +25,8 @@ import {
 import { run } from "./bitwarden-ssh/exec.ts";
 import { findByName, keyFingerprint } from "./bitwarden-ssh/keyutil.ts";
 import { askpassSocket, ensureDir, type Paths, resolvePaths } from "./bitwarden-ssh/paths.ts";
-import { askSecret } from "./bitwarden-ssh/secret-input.ts";
+import { withFileLock } from "./bitwarden-ssh/lock.ts";
+import { askSecret, SECRET_INPUT_NEEDS_TUI, secretInputAvailable } from "./bitwarden-ssh/secret-input.ts";
 import { parseSettings, type Settings } from "./bitwarden-ssh/settings.ts";
 import {
 	addHost,
@@ -93,6 +94,8 @@ function msg(err: unknown): string {
 
 class UserError extends Error {}
 
+const CONFIG_CHANGED = "SSH config changed in another pi session; retry";
+
 export default function bitwardenSsh(pi: ExtensionAPI) {
 	const bw = new Bitwarden({ autoLockMinutes: () => settings.autoLockMinutes });
 	let settings: Settings = parseSettings(undefined).settings;
@@ -100,18 +103,51 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 	let ctxRef: ExtensionContext | undefined;
 	let lastStatus: StatusInfo | "missing" | undefined;
 	const hostKeyCache = new Map<string, { at: number; keys: CachedKey[] }>();
+	// One controller per session generation: session_shutdown (any reason: quit, reload, new, resume,
+	// fork) aborts it, which cancels open and queued dialogs and askpass requests of the old session.
+	let session = new AbortController();
+	let myHandler: AskHandler | undefined;
 
 	const P = (): Paths => {
 		if (!paths) paths = resolvePaths({ agentDir: getAgentDir(), home: homedir(), uid: process.getuid?.() ?? 0 });
 		return paths;
 	};
 	const readState = (): State => loadState(P().stateFile).state;
-	const writeState = (s: State) => {
+	/** Cross-process lock for the source config, state.json and the generated files (other pi processes share them). */
+	const withConfigLock = <T>(fn: () => Promise<T> | T): Promise<T> => {
 		ensureDir(P().dataDir);
-		saveState(P().stateFile, s);
+		return withFileLock(join(P().dataDir, "config.lock"), fn);
 	};
+	/** Read-modify-write of state.json under the lock, so concurrent pi processes do not lose updates. */
+	const updateState = (fn: (s: State) => void): Promise<State> =>
+		withConfigLock(() => {
+			const s = readState();
+			fn(s);
+			saveState(P().stateFile, s);
+			return s;
+		});
 	const ttlText = () => (settings.keyTtl ? `TTL ${settings.keyTtl}` : "no TTL");
-	const dialog = <T>(fn: () => Promise<T>) => withUILock(fn);
+	const lockedWhy = (ctx: ExtensionContext) => (secretInputAvailable(ctx) ? "unlock declined or not possible" : SECRET_INPUT_NEEDS_TUI);
+	/**
+	 * One dialog at a time. A dialog of an ended session never opens, and an open one settles (undefined)
+	 * when the session ends: pi disposes dialogs on /reload and session switches without resolving them.
+	 */
+	const dialog = <T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T | undefined> => {
+		const signal = session.signal;
+		return withUILock(async () => {
+			if (signal.aborted) return undefined;
+			let onAbort: (() => void) | undefined;
+			const aborted = new Promise<undefined>((res) => {
+				onAbort = () => res(undefined);
+				signal.addEventListener("abort", onAbort, { once: true });
+			});
+			try {
+				return await Promise.race([fn(signal), aborted]);
+			} finally {
+				signal.removeEventListener("abort", onAbort!);
+			}
+		});
+	};
 
 	// --- footer -----------------------------------------------------------------------------------
 
@@ -147,23 +183,27 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 
 	// --- vault ------------------------------------------------------------------------------------
 
-	function cacheKeys(items: SshKeyItem[]): State {
-		const s = readState();
-		s.keys = items.map((i) => ({ id: i.id, name: i.name, fingerprint: i.fingerprint, publicKey: i.publicKey }));
-		writeState(s);
+	async function cacheKeys(items: SshKeyItem[]): Promise<State> {
+		const keys = items.map((i) => ({ id: i.id, name: i.name, fingerprint: i.fingerprint, publicKey: i.publicKey }));
+		const s = await updateState((st) => {
+			st.keys = keys;
+		});
 		hostKeyCache.clear();
 		return s;
 	}
 
 	async function unlockDialog(ctx: ExtensionContext, reason?: string): Promise<boolean> {
+		// Never ask for the master password through an unmasked input (RPC mode): fail closed.
+		if (!secretInputAvailable(ctx)) return false;
 		let warning: string | undefined;
 		for (let attempt = 1; attempt <= 3; attempt++) {
 			const email = lastStatus && lastStatus !== "missing" ? lastStatus.userEmail : undefined;
-			let password = await dialog(() =>
+			let password = await dialog((signal) =>
 				askSecret(ctx, {
 					title: "Bitwarden master password",
 					message: [email ? `Unlock the vault of ${email}` : "Unlock the Bitwarden vault", reason].filter(Boolean).join(" — "),
 					warning,
+					signal,
 				}),
 			);
 			if (password === undefined) return false;
@@ -200,8 +240,9 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 		}
 		if (!st) return false;
 		if (st.status === "unlocked") return true;
+		if (!secretInputAvailable(ctx)) return false;
 		if (st.status === "unauthenticated") {
-			const ok = await dialog(() => ctx.ui.confirm("Bitwarden", "Not logged in to Bitwarden. Log in now?"));
+			const ok = await dialog((signal) => ctx.ui.confirm("Bitwarden", "Not logged in to Bitwarden. Log in now?", { signal }));
 			if (!ok) return false;
 			await loginFlow(ctx);
 			return bw.unlocked;
@@ -211,17 +252,18 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 
 	async function loginFlow(ctx: ExtensionContext): Promise<string> {
 		if (!ctx.hasUI) return "bw login needs interactive pi";
+		if (!secretInputAvailable(ctx)) return `Bitwarden login: ${SECRET_INPUT_NEEDS_TUI}`;
 		const st = await refreshStatus();
 		if (st === "missing") return "bw (Bitwarden CLI) is not installed or not in PATH";
 		if (st && st.status !== "unauthenticated") {
 			return `Already logged in${st.userEmail ? ` as ${st.userEmail}` : ""} (vault ${st.status}). Use /bw unlock, or /bw logout first.`;
 		}
-		const how = await dialog(() => ctx.ui.select("Bitwarden login", ["API key (recommended)", "Email + master password"]));
+		const how = await dialog((signal) => ctx.ui.select("Bitwarden login", ["API key (recommended)", "Email + master password"], { signal }));
 		if (!how) return "Login cancelled";
 		if (how.startsWith("API")) {
-			const clientId = await dialog(() => ctx.ui.input("Bitwarden API key: client_id", "user.xxxxxxxx-..."));
+			const clientId = await dialog((signal) => ctx.ui.input("Bitwarden API key: client_id", "user.xxxxxxxx-...", { signal }));
 			if (!clientId?.trim()) return "Login cancelled";
-			let secret = await dialog(() => askSecret(ctx, { title: "Bitwarden API key: client_secret", message: `client_id ${clientId.trim()}` }));
+			let secret = await dialog((signal) => askSecret(ctx, { title: "Bitwarden API key: client_secret", message: `client_id ${clientId.trim()}`, signal }));
 			if (!secret) return "Login cancelled";
 			try {
 				await bw.loginApiKey(clientId.trim(), secret);
@@ -234,10 +276,10 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 			return ok ? "Bitwarden: logged in and unlocked" : "Bitwarden: logged in (vault locked; /bw unlock)";
 		}
 		const def = st ? st.userEmail : undefined;
-		const emailIn = await dialog(() => ctx.ui.input("Bitwarden email", def ?? "you@example.com"));
+		const emailIn = await dialog((signal) => ctx.ui.input("Bitwarden email", def ?? "you@example.com", { signal }));
 		const email = emailIn?.trim() || def;
 		if (!email) return "Login cancelled";
-		let password = await dialog(() => askSecret(ctx, { title: "Bitwarden master password", message: `Log in as ${email}` }));
+		let password = await dialog((signal) => askSecret(ctx, { title: "Bitwarden master password", message: `Log in as ${email}`, signal }));
 		if (!password) return "Login cancelled";
 		try {
 			try {
@@ -245,9 +287,9 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 			} catch (err) {
 				if (!(err instanceof BwError && err.kind === "needs2fa")) throw err;
 				const methods: Record<string, 0 | 1 | 3> = { "Authenticator app": 0, Email: 1, YubiKey: 3 };
-				const m = await dialog(() => ctx.ui.select("Two-step login method", Object.keys(methods)));
+				const m = await dialog((signal) => ctx.ui.select("Two-step login method", Object.keys(methods), { signal }));
 				if (!m) return "Login cancelled";
-				const code = await dialog(() => ctx.ui.input(`Two-step login code (${m})`, ""));
+				const code = await dialog((signal) => ctx.ui.input(`Two-step login code (${m})`, "", { signal }));
 				if (!code?.trim()) return "Login cancelled";
 				await bw.loginPassword(email, password, { method: methods[m], code: code.trim() });
 			}
@@ -286,10 +328,10 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 
 	/** Load the given vault key ids into the agent (unlocking first). Returns a summary; never key material. */
 	async function loadKeys(ctx: ExtensionContext, select: (items: SshKeyItem[]) => SshKeyItem[] | string): Promise<{ loaded: string[]; failed: string[]; error?: string }> {
-		if (!(await ensureUnlocked(ctx, "to load SSH keys"))) return { loaded: [], failed: [], error: "vault locked (unlock declined or not possible)" };
+		if (!(await ensureUnlocked(ctx, "to load SSH keys"))) return { loaded: [], failed: [], error: `vault locked (${lockedWhy(ctx)})` };
 		let items: SshKeyItem[] | undefined = await bw.listSshKeys();
 		try {
-			cacheKeys(items);
+			await cacheKeys(items);
 			const chosen = select(items);
 			if (typeof chosen === "string") return { loaded: [], failed: [], error: chosen };
 			const loaded: string[] = [];
@@ -343,7 +385,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 		if (bw.unlocked) {
 			try {
 				let items: SshKeyItem[] | undefined = await bw.listSshKeys();
-				keys = cacheKeys(items).keys;
+				keys = (await cacheKeys(items)).keys;
 				items = undefined;
 				cached = false;
 			} catch {
@@ -363,7 +405,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 			const missing = (await hostKeys(host)).filter((k) => !loaded.has(keyFingerprint(k)));
 			if (!missing.length) continue;
 			const names = missing.map((k) => k.name).join(", ");
-			const ok = await dialog(() => ctx.ui.confirm("Load SSH key?", `Load key ${names} for host ${host} into ssh-agent (${ttlText()})?`));
+			const ok = await dialog((signal) => ctx.ui.confirm("Load SSH key?", `Load key ${names} for host ${host} into ssh-agent (${ttlText()})?`, { signal }));
 			if (!ok) continue;
 			const ids = new Set(missing.map((k) => k.id));
 			const r = await loadKeys(ctx, (items) => items.filter((i) => ids.has(i.id)));
@@ -398,11 +440,18 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 
 	// --- SSH config sync --------------------------------------------------------------------------
 
-	function regen(): RegenerateResult | undefined {
-		const r = regenerate(P(), readState(), { controlPersist: settings.controlPersist });
-		hostKeyCache.clear();
-		return r;
+	type Regen = (RegenerateResult & { include?: "created" | "added" | "present" }) | undefined;
+	/** Regenerate the generated config and .pub files from the current source and state (under the lock). */
+	function regen(opts: { include?: boolean } = {}): Promise<Regen> {
+		return withConfigLock(() => {
+			const r = regenerate(P(), readState(), { controlPersist: settings.controlPersist });
+			hostKeyCache.clear();
+			if (r && opts.include) return { ...r, include: ensureInclude(P().userConfig, P().generatedFile) };
+			return r;
+		});
 	}
+	const includeNote = (r: Regen): string[] =>
+		r?.include && r.include !== "present" ? [`${r.include === "created" ? "Created" : "Added an Include line to"} ${P().userConfig}`] : [];
 
 	function regenSummary(r: RegenerateResult | undefined, extra: string[] = []): string {
 		if (!r) return "No SSH config yet (run /ssh config pull)";
@@ -453,6 +502,13 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 		const source = readSource(P()) ?? "";
 		const state = readState();
 		const notes: string[] = [];
+		// Only the entries decided here are merged into a fresh state.json at the end (dialogs take time;
+		// another pi may have written meanwhile).
+		const changes: State["identityMap"] = {};
+		const set = (path: string, v: { itemId: string; name: string }) => {
+			state.identityMap[path] = v;
+			changes[path] = v;
+		};
 		for (const path of identityPaths(parseConfig(source))) {
 			const cur = state.identityMap[path];
 			const curValid = cur && (cur.itemId === "" || state.keys.some((k) => k.id === cur.itemId));
@@ -460,7 +516,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 			if (!opts.askAll) {
 				const auto = matchKeyName(path, state.keys);
 				if (auto) {
-					state.identityMap[path] = { itemId: auto.id, name: auto.name };
+					set(path, { itemId: auto.id, name: auto.name });
 					notes.push(`${path} -> ${auto.name} (matched by name)`);
 					continue;
 				}
@@ -468,19 +524,22 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 			}
 			if (!ctx.hasUI || !state.keys.length) continue;
 			const choices = [...state.keys.map((k) => k.name + (cur?.itemId === k.id ? "  (current)" : "")), KEEP_PATH + (cur?.itemId === "" ? "  (current)" : "")];
-			const pick = await dialog(() => ctx.ui.select(`Bitwarden SSH key for IdentityFile ${path}`, choices));
+			const pick = await dialog((signal) => ctx.ui.select(`Bitwarden SSH key for IdentityFile ${path}`, choices, { signal }));
 			if (!pick) continue;
 			const name = pick.replace(/ {2}\(current\)$/, "");
-			if (name === KEEP_PATH) state.identityMap[path] = { itemId: "", name: "" };
+			if (name === KEEP_PATH) set(path, { itemId: "", name: "" });
 			else {
 				const k = state.keys.find((x) => x.name === name);
 				if (k) {
-					state.identityMap[path] = { itemId: k.id, name: k.name };
+					set(path, { itemId: k.id, name: k.name });
 					notes.push(`${path} -> ${k.name}`);
 				}
 			}
 		}
-		writeState(state);
+		if (Object.keys(changes).length)
+			await updateState((s) => {
+				Object.assign(s.identityMap, changes);
+			});
 		return notes;
 	}
 
@@ -489,7 +548,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 	}
 
 	async function pullFlow(ctx: ExtensionContext): Promise<string> {
-		if (!(await ensureUnlocked(ctx, "to pull the SSH config"))) throw new UserError("Vault locked: pull cancelled");
+		if (!(await ensureUnlocked(ctx, "to pull the SSH config"))) throw new UserError(`Vault locked (${lockedWhy(ctx)}): pull cancelled`);
 		const warnings: string[] = [];
 		try {
 			await bw.sync();
@@ -498,66 +557,80 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 		}
 		const note = await bw.findNote(settings.configNote);
 		if (!note) throw new UserError(`No Bitwarden secure note named "${settings.configNote}". Create it on your computer (see README) or run /ssh config push.`);
+		// Same check as for edits, before anything is replaced: a broken note must not disable SSH.
+		const bad = await checkSyntax(note.notes);
+		if (bad) throw new UserError(`The note "${note.name}" is not a valid SSH config; kept the local config. ssh: ${bad}`);
 		const local = readSource(P());
 		const state = readState();
 		if (local !== undefined && local !== note.notes && (!state.syncedHash || sha256(local) !== state.syncedHash)) {
-			const ok = await dialog(() =>
+			const ok = await dialog((signal) =>
 				ctx.ui.confirm(
 					"Overwrite local SSH config?",
 					`The local SSH config changed since the last pull/push. Overwrite it with the note "${note.name}"?\n\n${lineDiff(local, note.notes, 25)}`,
+					{ signal },
 				),
 			);
 			if (!ok) throw new UserError("Pull cancelled; local config kept (use /ssh config push to upload it)");
 		}
 		if (note.notes.length > NOTE_LIMIT_WARN) warnings.push(`the note has ${note.notes.length} characters; Bitwarden notes are limited to 10000`);
-		writeSource(P(), note.notes);
-		const st2 = readState();
-		st2.note = { id: note.id, name: note.name };
-		st2.syncedHash = sha256(note.notes);
-		writeState(st2);
+		await withConfigLock(() => {
+			if (readSource(P()) !== local) throw new UserError(CONFIG_CHANGED);
+			writeSource(P(), note.notes);
+			const st2 = readState();
+			st2.note = { id: note.id, name: note.name };
+			st2.syncedHash = sha256(note.notes);
+			saveState(P().stateFile, st2);
+		});
 		let items: SshKeyItem[] | undefined = await bw.listSshKeys();
-		cacheKeys(items);
+		await cacheKeys(items);
 		items = undefined;
 		const mapped = await mapIdentities(ctx);
-		const r = regen();
-		const inc = ensureInclude(P().userConfig, P().generatedFile);
-		const extra = [...mapped.map((m) => `mapped ${m}`)];
-		if (inc !== "present") extra.push(`${inc === "created" ? "Created" : "Added an Include line to"} ${P().userConfig}`);
+		const r = await regen({ include: true });
+		const extra = [...mapped.map((m) => `mapped ${m}`), ...includeNote(r)];
 		return [`Pulled "${note.name}" (${note.notes.length} chars).`, regenSummary(r, extra), ...warnings.map((w) => `Warning: ${w}`)].join("\n");
 	}
 
 	async function pushFlow(ctx: ExtensionContext, confirmed = false): Promise<string> {
 		const text = readSource(P());
 		if (text === undefined) throw new UserError("No local SSH config to push (run /ssh config pull or /ssh config edit first)");
-		if (!(await ensureUnlocked(ctx, "to push the SSH config"))) throw new UserError("Vault locked: push cancelled");
+		if (!(await ensureUnlocked(ctx, "to push the SSH config"))) throw new UserError(`Vault locked (${lockedWhy(ctx)}): push cancelled`);
 		const note = await bw.findNote(settings.configNote);
 		if (note && note.notes === text) return `Note "${note.name}" is already up to date`;
 		if (!confirmed) {
 			const body = note
 				? `Overwrite the text of the Bitwarden note "${note.name}" with the local SSH config?\n\n${lineDiff(note.notes, text, 25)}`
 				: `Create the Bitwarden secure note "${settings.configNote}" with the local SSH config (${text.length} chars)?`;
-			const ok = await dialog(() => ctx.ui.confirm("Push SSH config to Bitwarden?", body));
+			const ok = await dialog((signal) => ctx.ui.confirm("Push SSH config to Bitwarden?", body, { signal }));
 			if (!ok) throw new UserError("Push cancelled");
 		}
-		const id = await bw.saveNote(settings.configNote, text, note?.id);
-		const st = readState();
-		st.note = { id: id || note?.id || "", name: settings.configNote };
-		st.syncedHash = sha256(text);
-		writeState(st);
+		await withConfigLock(async () => {
+			// Push only what the user confirmed: if another pi changed the source meanwhile, retry.
+			if (readSource(P()) !== text) throw new UserError(CONFIG_CHANGED);
+			const id = await bw.saveNote(settings.configNote, text, note?.id);
+			const st = readState();
+			st.note = { id: id || note?.id || "", name: settings.configNote };
+			st.syncedHash = sha256(text);
+			saveState(P().stateFile, st);
+		});
 		const warn = text.length > NOTE_LIMIT_WARN ? `\nWarning: ${text.length} characters; Bitwarden notes are limited to 10000` : "";
 		return `${note ? "Updated" : "Created"} Bitwarden note "${settings.configNote}" (${text.length} chars)${warn}`;
 	}
 
-	/** Apply an edit to the source config: syntax check, write, map new identities, regenerate. */
-	async function applySource(ctx: ExtensionContext, next: string): Promise<string> {
+	/**
+	 * Apply an edit to the source config: syntax check, write, map new identities, regenerate. `base` is the
+	 * source text the edit was made from (and the user confirmed); if another pi process changed the source
+	 * since, nothing is written and the caller is told to retry.
+	 */
+	async function applySource(ctx: ExtensionContext, base: string | undefined, next: string): Promise<string> {
 		const err = await checkSyntax(next);
 		if (err) throw new UserError(`Invalid SSH config: ${err}`);
-		writeSource(P(), next);
+		await withConfigLock(() => {
+			if (readSource(P()) !== base) throw new UserError(CONFIG_CHANGED);
+			writeSource(P(), next);
+		});
 		const mapped = await mapIdentities(ctx);
-		const r = regen();
-		const inc = ensureInclude(P().userConfig, P().generatedFile);
-		const extra = mapped.map((m) => `mapped ${m}`);
-		if (inc !== "present") extra.push(`${inc === "created" ? "Created" : "Added an Include line to"} ${P().userConfig}`);
+		const r = await regen({ include: true });
+		const extra = [...mapped.map((m) => `mapped ${m}`), ...includeNote(r)];
 		extra.push("Not yet in Bitwarden: /ssh config push (or ssh_config push) uploads it.");
 		return regenSummary(r, extra);
 	}
@@ -589,21 +662,36 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 
 	// --- events -----------------------------------------------------------------------------------
 
-	function askHandler(ctx: ExtensionContext): AskHandler {
-		return async (req, signal) => {
+	/**
+	 * The askpass socket is reachable by every process of this user (also the agent's bash), and the
+	 * requester the client names is a claim: the dialog always marks it unverified and always warns.
+	 */
+	function askHandler(ctx: ExtensionContext, sessionSignal: AbortSignal): AskHandler {
+		return async (req, reqSignal) => {
 			if (!ctx.hasUI) return undefined;
-			const who = `Asked by: ${req.requester.cmdline}`;
-			const warning = req.requester.known ? undefined : "this program will receive what you type";
+			const signal = AbortSignal.any([reqSignal, sessionSignal]);
+			if (signal.aborted) return undefined;
+			const prompt = req.prompt.trim();
+			if (req.kind === "secret" && !secretInputAvailable(ctx)) {
+				try {
+					ctx.ui.notify(`bitwarden-ssh: askpass prompt "${truncate(prompt || "Password", 80)}" cancelled: ${SECRET_INPUT_NEEDS_TUI}`, "warning");
+				} catch {}
+				return undefined;
+			}
+			const who = [
+				`Requested by (unverified): ${req.requester.cmdline}`,
+				...(req.requester.fromThisPi === false ? ["⚠ not started from this pi session"] : []),
+			].join("\n");
+			const warning = "the program that asked will receive what you type";
 			return dialog(async () => {
 				if (signal.aborted) return undefined;
-				const prompt = req.prompt.trim();
 				switch (req.kind) {
 					case "confirm":
-						return ctx.ui.confirm("SSH confirmation", `${prompt}\n\n${who}${warning ? `\n⚠ ${warning}` : ""}`, { signal });
+						return ctx.ui.confirm("SSH confirmation", `${prompt}\n\n${who}\n⚠ ${warning}`, { signal });
 					case "yesno":
-						return ctx.ui.select(`${prompt}\n${who}${warning ? `\n⚠ ${warning}` : ""}`, ["yes", "no"], { signal });
+						return ctx.ui.select(`${prompt}\n${who}\n⚠ ${warning}`, ["yes", "no"], { signal });
 					case "visible":
-						return ctx.ui.input(`${prompt} — ${who}${warning ? ` (⚠ ${warning})` : ""}`, "", { signal });
+						return ctx.ui.input(`${prompt} — ${who.replace(/\n/g, " · ")} (⚠ ${warning})`, "", { signal });
 					default:
 						return askSecret(ctx, { title: prompt || "Password", message: who, warning, signal });
 				}
@@ -612,8 +700,12 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Before any await: the askpass server must never call a handler of an ended session.
+		if (session.signal.aborted) session = new AbortController();
 		ctxRef = ctx;
 		const shared = g();
+		myHandler = askHandler(ctx, session.signal);
+		shared.handler = myHandler;
 		try {
 			const parsed = parseSettings((pi.getSettings() as any)?.bitwardenSsh);
 			settings = parsed.settings;
@@ -644,7 +736,6 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 					shared.askpassStarting = undefined;
 				}
 			}
-			shared.handler = askHandler(ctx);
 			const bwState = bwShared();
 			bwState.onChange = () => void updateFooter();
 			bwState.onAutoLock = () => {
@@ -668,6 +759,11 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (event) => {
 		const shared = g();
+		// Every reason (quit, reload, new, resume, fork): cancel this session's dialogs and askpass
+		// requests; until the next session_start installs its handler, askpass requests get "not ok".
+		session.abort();
+		if (shared.handler === myHandler) shared.handler = undefined;
+		myHandler = undefined;
 		if (shared.footerTimer) clearInterval(shared.footerTimer);
 		shared.footerTimer = undefined;
 		if (event.reason === "quit") {
@@ -720,6 +816,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 				if (st?.status === "unauthenticated") return "Not logged in: run /bw login";
 				if (bw.unlocked && st?.status === "unlocked") return "Bitwarden: already unlocked";
 				if (!ctx.hasUI) return "bw unlock needs interactive pi";
+				if (!secretInputAvailable(ctx)) return `Bitwarden unlock: ${SECRET_INPUT_NEEDS_TUI}`;
 				return (await unlockDialog(ctx)) ? "Bitwarden: unlocked" : "Bitwarden: still locked";
 			}
 			case "lock": {
@@ -738,12 +835,12 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 				return `Bitwarden: locked; ssh-agent keys removed${errs.length ? ` (warnings: ${errs.join("; ")})` : ""}`;
 			}
 			case "sync":
-				if (!(await ensureUnlocked(ctx, "to sync"))) return "Vault locked: sync cancelled";
+				if (!(await ensureUnlocked(ctx, "to sync"))) return `Vault locked (${lockedWhy(ctx)}): sync cancelled`;
 				await bw.sync();
 				return "Bitwarden: synced";
 			case "logout": {
 				if (!ctx.hasUI) return "bw logout needs interactive pi";
-				const ok = await dialog(() => ctx.ui.confirm("Log out of Bitwarden?", "This logs the bw CLI out for every process of this user (keys in ssh-agent stay until their TTL)."));
+				const ok = await dialog((signal) => ctx.ui.confirm("Log out of Bitwarden?", "This logs the bw CLI out for every process of this user (keys in ssh-agent stay until their TTL).", { signal }));
 				if (!ok) return "Logout cancelled";
 				await bw.logout();
 				await refreshStatus();
@@ -806,13 +903,13 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 					if (!ctx.hasUI) return { text: "Usage: /ssh add <name|all|host>", level: "warning" };
 					let keys = readState().keys;
 					if (!keys.length) {
-						if (!(await ensureUnlocked(ctx, "to list SSH keys"))) return { text: "Vault locked", level: "warning" };
+						if (!(await ensureUnlocked(ctx, "to list SSH keys"))) return { text: `Vault locked (${lockedWhy(ctx)})`, level: "warning" };
 						let items: SshKeyItem[] | undefined = await bw.listSshKeys();
-						keys = cacheKeys(items).keys;
+						keys = (await cacheKeys(items)).keys;
 						items = undefined;
 					}
 					if (!keys.length) return { text: "The vault has no SSH key items", level: "warning" };
-					const pick = await dialog<string | undefined>(() => ctx.ui.select("Load which SSH key into ssh-agent?", ["all", ...keys.map((k) => k.name)]));
+					const pick = await dialog<string | undefined>((signal) => ctx.ui.select("Load which SSH key into ssh-agent?", ["all", ...keys.map((k) => k.name)], { signal }));
 					if (!pick) return { text: "Cancelled" };
 					target = pick;
 				}
@@ -827,7 +924,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 				if (!name) {
 					if (!ctx.hasUI) return { text: "Usage: /ssh rm <name>", level: "warning" };
 					const labels = loaded.map((k) => nameOf(k.fingerprint, keys) ?? `${k.comment} ${k.fingerprint}`);
-					const pick = await dialog<string | undefined>(() => ctx.ui.select("Remove which key from ssh-agent?", labels));
+					const pick = await dialog<string | undefined>((signal) => ctx.ui.select("Remove which key from ssh-agent?", labels, { signal }));
 					if (!pick) return { text: "Cancelled" };
 					name = pick;
 				}
@@ -844,7 +941,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 				const hosts = hostNames(parseConfig(readSource(P()) ?? ""));
 				if (!host) {
 					if (!ctx.hasUI || !hosts.length) return { text: "Usage: /ssh test <host>", level: "warning" };
-					const pick = await dialog<string | undefined>(() => ctx.ui.select("Test SSH connection to", hosts));
+					const pick = await dialog<string | undefined>((signal) => ctx.ui.select("Test SSH connection to", hosts, { signal }));
 					if (!pick) return { text: "Cancelled" };
 					host = pick;
 				}
@@ -873,20 +970,21 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 				return { text: await pushFlow(ctx) };
 			case "edit": {
 				if (!ctx.hasUI) return { text: "/ssh config edit needs interactive pi", level: "warning" };
-				const cur = readSource(P()) ?? "";
+				const orig = readSource(P());
+				const cur = orig ?? "";
 				const next = await dialog<string | undefined>(() => ctx.ui.editor("SSH config (as on your computer; IdentityFile paths stay as there)", cur));
 				if (next === undefined || next === cur) return { text: "No changes" };
-				return { text: await applySource(ctx, next) };
+				return { text: await applySource(ctx, orig, next) };
 			}
 			case "map": {
 				if (!readSource(P())) return { text: "No SSH config yet (run /ssh config pull)", level: "warning" };
 				if (bw.unlocked) {
 					let items: SshKeyItem[] | undefined = await bw.listSshKeys();
-					cacheKeys(items);
+					await cacheKeys(items);
 					items = undefined;
 				}
 				const notes = await mapIdentities(ctx, { askAll: true });
-				return { text: regenSummary(regen(), notes.map((n) => `mapped ${n}`)) };
+				return { text: regenSummary(await regen(), notes.map((n) => `mapped ${n}`)) };
 			}
 			case "show": {
 				const source = readSource(P());
@@ -898,7 +996,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 					`Bitwarden note: ${settings.configNote}${st.note ? ` (id ${st.note.id})` : ""}`,
 					`local changes since last pull/push: ${source === undefined ? "-" : st.syncedHash ? (sha256(source) === st.syncedHash ? "no" : "yes") : "unknown"}`,
 				];
-				if (source !== undefined) lines.push(regenSummary(regen()));
+				if (source !== undefined) lines.push(regenSummary(await regen()));
 				return { text: lines.join("\n") };
 			}
 			default:
@@ -990,8 +1088,8 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 						if (!ctx.hasUI) return text("ssh_keys load needs interactive pi (the user must confirm and unlock)", true);
 						const target = (params.host ?? params.name ?? "").trim();
 						if (!target) return text("load needs name or host", true);
-						const ok = await dialog(() =>
-							ctx.ui.confirm("Load SSH key?", `The agent asks to load SSH key(s) ${params.host ? `for host ${target}` : target} into ssh-agent (${ttlText()}).`),
+						const ok = await dialog((signal) =>
+							ctx.ui.confirm("Load SSH key?", `The agent asks to load SSH key(s) ${params.host ? `for host ${target}` : target} into ssh-agent (${ttlText()}).`, { signal }),
 						);
 						if (!ok) return text("The user declined loading the key(s).", true);
 						const r = await loadKeys(ctx, await targetSelector(target));
@@ -1055,7 +1153,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 						const opts = (params.options ?? {}) as OptionValues;
 						const blocks = parseConfig(source ?? "");
 						addHost(blocks, patterns, opts);
-						const summary = await applySource(ctx, serializeConfig(blocks));
+						const summary = await applySource(ctx, source, serializeConfig(blocks));
 						return text(`Added Host ${patterns.join(" ")}.\n${summary}`);
 					}
 					case "update":
@@ -1076,17 +1174,17 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 						} else found = removeHost(blocks, host);
 						if (!found) return text(`No Host block lists ${host}`, true);
 						const next = serializeConfig(blocks);
-						const ok = await dialog(() =>
-							ctx.ui.confirm(`The agent wants to ${params.action} SSH host ${host}`, lineDiff(source, next, 30)),
+						const ok = await dialog((signal) =>
+							ctx.ui.confirm(`The agent wants to ${params.action} SSH host ${host}`, lineDiff(source, next, 30), { signal }),
 						);
 						if (!ok) return text("The user declined the change.", true);
-						const summary = await applySource(ctx, next);
+						const summary = await applySource(ctx, source, next);
 						return text(`${params.action === "update" ? "Updated" : "Removed"} ${host}:\n${lineDiff(source, next, 30)}\n${summary}`);
 					}
 					case "pull": {
 						if (!ctx.hasUI) return text("ssh_config pull needs interactive pi", true);
-						const ok = await dialog(() =>
-							ctx.ui.confirm("Pull SSH config?", `The agent asks to fetch the SSH config from the Bitwarden note "${settings.configNote}" and regenerate ${P().generatedFile}.`),
+						const ok = await dialog((signal) =>
+							ctx.ui.confirm("Pull SSH config?", `The agent asks to fetch the SSH config from the Bitwarden note "${settings.configNote}" and regenerate ${P().generatedFile}.`, { signal }),
 						);
 						if (!ok) return text("The user declined the pull.", true);
 						return text(await pullFlow(ctx));

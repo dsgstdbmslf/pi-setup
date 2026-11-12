@@ -142,7 +142,8 @@ Do not install both ways at once, or the extension loads twice.
   - `/ssh list` (vault SSH keys, ● loaded / ○ not; from a cache while locked),
     `/ssh add [name|all|host]` (a host loads the keys its config uses), `/ssh rm [name]`,
     `/ssh clear`, `/ssh test [host]` (`ssh -T`, 10 s connect timeout), `/ssh hosts`.
-  - `/ssh config pull` (note -> local config, maps keys, regenerates, adds the Include),
+  - `/ssh config pull` (note -> local config, maps keys, regenerates, adds the Include;
+    a note that fails the `ssh -G` syntax check is refused and the local config kept),
     `/ssh config push` (local -> note, asks first), `/ssh config edit`, `/ssh config show`,
     `/ssh config map` (choose the Bitwarden key for each `IdentityFile`).
   - Footer: `🔐 unlocked · N keys`, `🔒 locked · N keys`, `bw: logged out` or
@@ -150,7 +151,10 @@ Do not install both ways at once, or the extension loads twice.
 
   Tools for the agent: `ssh_keys` (status, list, load, unload) and `ssh_config` (list,
   get, add, update, remove, pull, push). Loading a key, changing or removing a host, pull
-  and push open a confirm dialog; adding a host does not. Results carry names and
+  and push open a confirm dialog; adding a host does not. Two pi processes share the
+  config: a change confirmed in one while another already wrote the file is refused with
+  "SSH config changed in another pi session; retry" (writes, state and regeneration run
+  under a lock file, `config.lock`). Results carry names and
   fingerprints, never key material. When a `bash` command or a `!` command names a
   configured host whose key is not loaded (`ssh web`, `git clone ssh://git@web/x`,
   `rsync f web:`), pi offers to load it first; declining runs the command anyway.
@@ -180,17 +184,27 @@ Do not install both ways at once, or the extension loads twice.
   Password prompts: `SSH_ASKPASS`, `SUDO_ASKPASS` and `GIT_ASKPASS` point to a small node
   client (`run/askpass`, with `SSH_ASKPASS_REQUIRE=force`) that asks pi over a private
   Unix socket; pi shows a masked dialog (host key questions as yes/no, `Username` prompts
-  visible) naming the program that asks, and the answer goes straight back to it. Plain
-  `sudo` runs `sudo -A` through a shim in `run/bin`, first in `PATH`. Without a UI (print
-  mode) prompts fail instead of hanging.
+  visible) with "Requested by (unverified): <command line>" and the warning "the program
+  that asked will receive what you type", and the answer goes straight back to the client
+  that asked. Plain `sudo` runs `sudo -A` through a shim in `run/bin`, first in `PATH`.
+  Without a UI (print mode) prompts fail instead of hanging. Dialogs of a session that
+  ends (`/reload`, `/new`, `/resume`, `/fork`, quit) are cancelled.
+
+  Secret input (master password, API client secret, passphrases and passwords asked through
+  askpass) needs the interactive TUI: in RPC mode pi only has an unmasked input, so these
+  prompts fail closed ("secret input needs the interactive TUI"): unlock and login are
+  refused, tools return that error and askpass prompts are cancelled. Visible prompts
+  (`Username`, emails, confirmations) still work there.
 
   Files: `~/.pi/agent/bitwarden-ssh/` holds `state.json` (identity mapping and a cache of
   key names, fingerprints and public keys) and `config` (the synced config as on your
   computer). `~/.ssh/pi-bitwarden/` holds the generated `config`, public keys in `keys/`
   (private keys only go into the agent) and ControlMaster sockets in `cm/`. Files are
   mode 600, directories 700. `~/.ssh/config` gets one line at the top,
-  `Include ~/.ssh/pi-bitwarden/config` (absolute path), created if missing; nothing else in
-  it changes. When generating, `IdentityFile` paths mapped to a Bitwarden key become the
+  `Include ~/.ssh/pi-bitwarden/config` (absolute path), created if missing; only such an
+  Include before the first `Host`/`Match` counts (a copy inside a block is left alone and
+  the line is still added); nothing else in it changes. The config is read like OpenSSH
+  does: `# comments` after values and single or double quotes are understood. When generating, `IdentityFile` paths mapped to a Bitwarden key become the
   key's `.pub` file plus `IdentitiesOnly yes`; macOS-only `UseKeychain`, an `IdentityAgent`
   path missing here, and an `Include` of the generated file are commented out; unless the
   config sets `ControlMaster`, a `Host *` block with `ControlMaster auto`, `ControlPath
@@ -216,9 +230,13 @@ Do not install both ways at once, or the extension loads twice.
   exist only in local variables and in the stdin or environment of the one child that
   needs them (`bw`, `ssh-add`). Not covered: a process of the same user can read a `bw`
   child's environment while it runs (well under a second) and can use the shared agent
-  socket like any ssh-agent; an askpass answer goes to the program that asked, which the
-  dialog names (with a warning for programs other than ssh, ssh-add, sudo, git, scp, sftp
-  and rsync). A two-step login code is passed to `bw` as an argument (bw has no other way);
+  socket like any ssh-agent. The askpass socket is just as open: any process of the same
+  user, including commands the agent runs in its `bash` tool, can connect and ask, and it
+  receives what you type. The requester shown in the dialog is what the client claims (a
+  pid and its command line, which the starter of a process chooses), so it is labelled
+  unverified and the warning is always shown; "not started from this pi session" is added
+  when the claimed process does not descend from this pi, but its absence proves nothing.
+  Only answer prompts you expect. A two-step login code is passed to `bw` as an argument (bw has no other way);
   it is single-use.
 
   Limitations: one bw session per account across processes (see above); ControlPersist

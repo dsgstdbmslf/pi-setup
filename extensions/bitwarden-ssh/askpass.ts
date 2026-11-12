@@ -15,13 +15,17 @@ export function classifyPrompt(prompt: string, confirm: boolean): PromptKind {
 	return "secret";
 }
 
-export const KNOWN_PROGRAMS = new Set(["ssh", "ssh-add", "sudo", "git", "git-remote-https", "git-remote-http", "scp", "sftp", "rsync"]);
-
+/**
+ * What the askpass client CLAIMS about its requester. Unverified: any process of this user can connect to
+ * the socket and name any pid (and argv[0] is chosen by whoever starts a process), so this is only a hint
+ * for the dialog and must never decide whether a warning is shown.
+ */
 export interface Requester {
-	/** Command line of the requesting process (truncated to 200 chars). */
+	/** Command line of the claimed requesting process (truncated to 200 chars). */
 	cmdline: string;
 	program: string;
-	known: boolean;
+	/** Whether the claimed pid descends from this pi process (undefined when unknown). Also only a hint. */
+	fromThisPi?: boolean;
 }
 
 export function parseCmdline(raw: string): Requester {
@@ -29,16 +33,43 @@ export function parseCmdline(raw: string): Requester {
 	const program = (parts[0] ?? "").split("/").pop() ?? "";
 	let cmdline = parts.join(" ");
 	if (cmdline.length > 200) cmdline = `${cmdline.slice(0, 199)}…`;
-	return { cmdline: cmdline || "(unknown)", program, known: KNOWN_PROGRAMS.has(program) };
+	return { cmdline: cmdline || "(unknown)", program };
 }
 
-export function describeRequester(ppid: number, procRoot = "/proc"): Requester {
-	if (!Number.isInteger(ppid) || ppid <= 0) return { cmdline: "(unknown)", program: "", known: false };
+/** Parent pid from /proc/<pid>/stat (the command name in parentheses may contain spaces). */
+export function parentPid(pid: number, procRoot = "/proc"): number | undefined {
 	try {
-		return parseCmdline(readFileSync(join(procRoot, String(ppid), "cmdline"), "latin1"));
+		const stat = readFileSync(join(procRoot, String(pid), "stat"), "latin1");
+		const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+		return Number.isInteger(ppid) ? ppid : undefined;
 	} catch {
-		return { cmdline: `(pid ${ppid})`, program: "", known: false };
+		return undefined;
 	}
+}
+
+/** Whether `ancestor` is in the parent chain of `pid` (undefined when /proc cannot tell). */
+export function descendsFrom(pid: number, ancestor: number, procRoot = "/proc"): boolean | undefined {
+	let cur = pid;
+	for (let i = 0; i < 64; i++) {
+		if (cur === ancestor) return true;
+		if (cur <= 1) return false;
+		const next = parentPid(cur, procRoot);
+		if (next === undefined) return i === 0 ? undefined : false;
+		cur = next;
+	}
+	return false;
+}
+
+export function describeRequester(ppid: number, procRoot = "/proc", self = process.pid): Requester {
+	if (!Number.isInteger(ppid) || ppid <= 0) return { cmdline: "(unknown)", program: "" };
+	let r: Requester;
+	try {
+		r = parseCmdline(readFileSync(join(procRoot, String(ppid), "cmdline"), "latin1"));
+	} catch {
+		return { cmdline: `(pid ${ppid})`, program: "" };
+	}
+	r.fromThisPi = descendsFrom(ppid, self, procRoot);
+	return r;
 }
 
 export interface AskRequest {
@@ -55,29 +86,54 @@ export interface AskpassServer {
 	close(): void;
 }
 
-const MAX_REQUEST = 64 * 1024;
+/** Longest accepted request line. */
+export const MAX_REQUEST = 16 * 1024;
+/** A client must send its request line within this time. */
+export const REQUEST_DEADLINE_MS = 10_000;
 
-export function startAskpassServer(sockPath: string, getHandler: () => AskHandler | undefined): Promise<AskpassServer> {
+export function startAskpassServer(
+	sockPath: string,
+	getHandler: () => AskHandler | undefined,
+	opts: { deadlineMs?: number } = {},
+): Promise<AskpassServer> {
+	const deadlineMs = opts.deadlineMs ?? REQUEST_DEADLINE_MS;
 	return new Promise((resolve, reject) => {
 		try {
 			if (existsSync(sockPath)) unlinkSync(sockPath);
 		} catch {}
+		// Accepted connections and their request controllers: close() destroys and aborts them all
+		// (server.close() alone keeps accepted sockets open).
+		const clients = new Map<Socket, AbortController>();
 		const server: Server = createServer((sock: Socket) => {
 			let buf = "";
 			let handled = false;
 			const ac = new AbortController();
+			clients.set(sock, ac);
+			const deadline = setTimeout(() => {
+				if (!handled) sock.destroy();
+			}, deadlineMs);
+			deadline.unref?.();
+			const gone = () => {
+				clearTimeout(deadline);
+				clients.delete(sock);
+				ac.abort();
+			};
 			sock.setEncoding("utf8");
-			sock.on("close", () => ac.abort());
-			sock.on("error", () => ac.abort());
+			sock.on("close", gone);
+			sock.on("error", gone);
 			sock.on("data", (chunk: string) => {
 				if (handled) return;
 				buf += chunk;
-				if (buf.length > MAX_REQUEST) return sock.destroy();
 				const nl = buf.indexOf("\n");
-				if (nl < 0) return;
+				if (nl < 0) {
+					if (buf.length > MAX_REQUEST) sock.destroy();
+					return;
+				}
 				handled = true;
+				clearTimeout(deadline);
 				const line = buf.slice(0, nl);
 				buf = "";
+				if (line.length > MAX_REQUEST) return sock.destroy();
 				void answer(line, sock, ac.signal);
 			});
 		});
@@ -88,9 +144,10 @@ export function startAskpassServer(sockPath: string, getHandler: () => AskHandle
 				const prompt = typeof req.prompt === "string" ? req.prompt.slice(0, 2000) : "";
 				const confirm = req.confirm === true;
 				const handler = getHandler();
-				if (handler) {
+				if (handler && !signal.aborted) {
 					const res = await handler({ prompt, kind: classifyPrompt(prompt, confirm), requester: describeRequester(Number(req.ppid)) }, signal);
-					if (typeof res === "string") reply = { ok: true, value: res };
+					if (signal.aborted) reply = { ok: false };
+					else if (typeof res === "string") reply = { ok: true, value: res };
 					else if (res === true) reply = { ok: true, value: "" };
 				}
 			} catch {
@@ -118,6 +175,11 @@ export function startAskpassServer(sockPath: string, getHandler: () => AskHandle
 				close() {
 					process.removeListener("exit", cleanup);
 					server.close();
+					for (const [sock, ac] of clients) {
+						ac.abort();
+						sock.destroy();
+					}
+					clients.clear();
 					cleanup();
 				},
 			});
