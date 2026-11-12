@@ -5,6 +5,7 @@
 import { chmodSync, existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { delimiter, join } from "node:path";
+import { run } from "./exec.ts";
 
 export type PromptKind = "confirm" | "yesno" | "visible" | "secret";
 
@@ -36,39 +37,84 @@ export function parseCmdline(raw: string): Requester {
 	return { cmdline: cmdline || "(unknown)", program };
 }
 
-/** Parent pid from /proc/<pid>/stat (the command name in parentheses may contain spaces). */
-export function parentPid(pid: number, procRoot = "/proc"): number | undefined {
-	try {
-		const stat = readFileSync(join(procRoot, String(pid), "stat"), "latin1");
-		const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
-		return Number.isInteger(ppid) ? ppid : undefined;
-	} catch {
-		return undefined;
-	}
+/** Process table lookups for the requester hint: /proc on Linux, `ps` elsewhere (macOS). */
+export interface ProcInfo {
+	ppid(pid: number): Promise<number | undefined>;
+	/** Command line (NUL- or space-separated), or undefined when the process is unknown. */
+	cmdline(pid: number): Promise<string | undefined>;
 }
 
-/** Whether `ancestor` is in the parent chain of `pid` (undefined when /proc cannot tell). */
-export function descendsFrom(pid: number, ancestor: number, procRoot = "/proc"): boolean | undefined {
+/** Linux: /proc/<pid>/stat (the command name in parentheses may contain spaces) and /proc/<pid>/cmdline. */
+export function procfsInfo(procRoot = "/proc"): ProcInfo {
+	return {
+		async ppid(pid) {
+			try {
+				const stat = readFileSync(join(procRoot, String(pid), "stat"), "latin1");
+				const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+				return Number.isInteger(ppid) ? ppid : undefined;
+			} catch {
+				return undefined;
+			}
+		},
+		async cmdline(pid) {
+			try {
+				return readFileSync(join(procRoot, String(pid), "cmdline"), "latin1");
+			} catch {
+				return undefined;
+			}
+		},
+	};
+}
+
+export type PsRunner = (args: string[]) => Promise<{ code: number | null; stdout: string }>;
+const defaultPs: PsRunner = (args) => run("ps", args, { timeoutMs: 5000 });
+
+/** macOS (and any POSIX ps): `ps -o ppid= -p <pid>` and `ps -o command= -p <pid>`. */
+export function psInfo(ps: PsRunner = defaultPs): ProcInfo {
+	const query = async (field: string, pid: number): Promise<string | undefined> => {
+		if (!Number.isInteger(pid) || pid <= 0) return undefined;
+		const r = await ps(["-o", `${field}=`, "-p", String(pid)]);
+		const out = r.stdout.trim();
+		return r.code === 0 && out ? out : undefined;
+	};
+	return {
+		async ppid(pid) {
+			const v = Number(await query("ppid", pid));
+			return Number.isInteger(v) && v >= 0 ? v : undefined;
+		},
+		cmdline: (pid) => query("command", pid),
+	};
+}
+
+export function defaultProcInfo(platform: NodeJS.Platform = process.platform): ProcInfo {
+	return platform === "linux" ? procfsInfo() : psInfo();
+}
+
+/** Parent pid of `pid` (undefined when unknown). */
+export function parentPid(pid: number, info: ProcInfo = defaultProcInfo()): Promise<number | undefined> {
+	return info.ppid(pid);
+}
+
+/** Whether `ancestor` is in the parent chain of `pid` (undefined when the process table cannot tell). */
+export async function descendsFrom(pid: number, ancestor: number, info: ProcInfo = defaultProcInfo()): Promise<boolean | undefined> {
 	let cur = pid;
 	for (let i = 0; i < 64; i++) {
 		if (cur === ancestor) return true;
 		if (cur <= 1) return false;
-		const next = parentPid(cur, procRoot);
+		const next = await info.ppid(cur);
 		if (next === undefined) return i === 0 ? undefined : false;
 		cur = next;
 	}
 	return false;
 }
 
-export function describeRequester(ppid: number, procRoot = "/proc", self = process.pid): Requester {
+export async function describeRequester(ppid: number, info: ProcInfo = defaultProcInfo(), self = process.pid): Promise<Requester> {
 	if (!Number.isInteger(ppid) || ppid <= 0) return { cmdline: "(unknown)", program: "" };
-	let r: Requester;
-	try {
-		r = parseCmdline(readFileSync(join(procRoot, String(ppid), "cmdline"), "latin1"));
-	} catch {
-		return { cmdline: `(pid ${ppid})`, program: "" };
-	}
-	r.fromThisPi = descendsFrom(ppid, self, procRoot);
+	const raw = await info.cmdline(ppid);
+	if (raw === undefined) return { cmdline: `(pid ${ppid})`, program: "" };
+	// ps prints the command line space-separated; /proc separates arguments with NUL.
+	const r = parseCmdline(raw.includes("\0") ? raw : raw.replace(/ +/g, "\0"));
+	r.fromThisPi = await descendsFrom(ppid, self, info);
 	return r;
 }
 
@@ -145,7 +191,7 @@ export function startAskpassServer(
 				const confirm = req.confirm === true;
 				const handler = getHandler();
 				if (handler && !signal.aborted) {
-					const res = await handler({ prompt, kind: classifyPrompt(prompt, confirm), requester: describeRequester(Number(req.ppid)) }, signal);
+					const res = await handler({ prompt, kind: classifyPrompt(prompt, confirm), requester: await describeRequester(Number(req.ppid)) }, signal);
 					if (signal.aborted) reply = { ok: false };
 					else if (typeof res === "string") reply = { ok: true, value: res };
 					else if (res === true) reply = { ok: true, value: "" };

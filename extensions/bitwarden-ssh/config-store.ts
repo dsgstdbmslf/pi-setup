@@ -3,7 +3,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { ensureDir, type Paths } from "./paths.ts";
 import { type GenerateResult, generateConfig, hostNames, parseConfig } from "./sshconfig.ts";
 import type { CachedKey, State } from "./state.ts";
@@ -93,6 +93,7 @@ export function buildGenerated(paths: Paths, state: State, source: string, opts:
 export function publishGenerated(paths: Paths, built: BuiltConfig): RegenerateResult {
 	ensureDir(paths.sshDir);
 	ensureDir(paths.keysDir);
+	ensureDir(dirname(paths.cmDir)); // the /tmp fallback parent for long homes: ours, mode 700
 	ensureDir(paths.cmDir);
 	for (const [file, content] of built.pubFiles) writeFileAtomic(file, content, 0o600);
 	for (const f of readdirSync(paths.keysDir)) {

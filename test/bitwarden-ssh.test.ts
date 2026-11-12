@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyPrompt, describeRequester, descendsFrom, parseCmdline } from "../extensions/bitwarden-ssh/askpass.ts";
+import { classifyPrompt, defaultProcInfo, describeRequester, descendsFrom, parseCmdline, procfsInfo, psInfo } from "../extensions/bitwarden-ssh/askpass.ts";
 import { parseList } from "../extensions/bitwarden-ssh/agent.ts";
 import { fingerprintOf } from "../extensions/bitwarden-ssh/keyutil.ts";
-import { resolvePaths } from "../extensions/bitwarden-ssh/paths.ts";
+import { CM_SOCKET_NAME, MAX_SOCKET_PATH, resolvePaths } from "../extensions/bitwarden-ssh/paths.ts";
 import { DEFAULTS, parseSettings } from "../extensions/bitwarden-ssh/settings.ts";
 import {
 	addHost,
@@ -250,6 +250,16 @@ test("paths: layout and long runDir fallback", () => {
 	assert.equal(long.runDir, "/tmp/pi-bw-1000");
 	assert.equal(long.agentSock, "/tmp/pi-bw-1000/ssh-agent.sock");
 	assert.equal(long.stateFile, `/home/u/${"x".repeat(80)}/bitwarden-ssh/state.json`);
+	// Socket paths fit macOS (104 bytes incl. NUL) as well as Linux (108).
+	assert.ok(MAX_SOCKET_PATH <= 103);
+	// ControlPath: cm/<40 hex %C> plus ssh's temporary ".<16 chars>" suffix must fit too.
+	const mac = resolvePaths({ agentDir: "/Users/someone/.pi/agent", home: "/Users/someone", uid: 501 });
+	assert.equal(mac.cmDir, "/Users/someone/.ssh/pi-bitwarden/cm");
+	assert.ok(Buffer.byteLength(mac.cmDir) + CM_SOCKET_NAME <= MAX_SOCKET_PATH);
+	const longHome = `/Users/${"n".repeat(40)}`;
+	const lh = resolvePaths({ agentDir: `${longHome}/.pi/agent`, home: longHome, uid: 501 });
+	assert.equal(lh.cmDir, "/tmp/pi-bw-501/cm");
+	assert.equal(lh.generatedFile, `${longHome}/.ssh/pi-bitwarden/config`);
 });
 
 test("classifyPrompt and requester parsing", () => {
@@ -265,7 +275,7 @@ test("classifyPrompt and requester parsing", () => {
 	assert.equal(parseCmdline(`x\0${"a".repeat(300)}`).cmdline.length, 200);
 });
 
-test("requester parent chain from /proc (hint only)", () => {
+test("requester parent chain from /proc (hint only)", async () => {
 	const proc = mkdtempSync(join(tmpdir(), "pi-bw-proc-"));
 	try {
 		const fake = (pid: number, ppid: number, comm: string, cmdline: string) => {
@@ -277,15 +287,51 @@ test("requester parent chain from /proc (hint only)", () => {
 		fake(200, 100, "ba sh)", "bash\0");
 		fake(300, 200, "ssh", "/usr/bin/ssh\0host\0");
 		fake(400, 1, "ssh", "/usr/bin/ssh\0forged\0"); // claims to be ssh, not below pi
-		assert.equal(descendsFrom(300, 100, proc), true);
-		assert.equal(descendsFrom(400, 100, proc), false);
-		assert.equal(descendsFrom(999, 100, proc), undefined);
-		assert.deepEqual(describeRequester(300, proc, 100), { cmdline: "/usr/bin/ssh host", program: "ssh", fromThisPi: true });
-		assert.deepEqual(describeRequester(400, proc, 100), { cmdline: "/usr/bin/ssh forged", program: "ssh", fromThisPi: false });
-		assert.deepEqual(describeRequester(999, proc, 100), { cmdline: "(pid 999)", program: "" });
+		const info = procfsInfo(proc);
+		assert.equal(await descendsFrom(300, 100, info), true);
+		assert.equal(await descendsFrom(400, 100, info), false);
+		assert.equal(await descendsFrom(999, 100, info), undefined);
+		assert.deepEqual(await describeRequester(300, info, 100), { cmdline: "/usr/bin/ssh host", program: "ssh", fromThisPi: true });
+		assert.deepEqual(await describeRequester(400, info, 100), { cmdline: "/usr/bin/ssh forged", program: "ssh", fromThisPi: false });
+		assert.deepEqual(await describeRequester(999, info, 100), { cmdline: "(pid 999)", program: "" });
 	} finally {
 		rmSync(proc, { recursive: true, force: true });
 	}
+});
+
+test("requester parent chain via ps (macOS path, injected ps)", async () => {
+	const table: Record<number, { ppid: number; command: string }> = {
+		100: { ppid: 1, command: "pi" },
+		200: { ppid: 100, command: "/bin/zsh -l" },
+		300: { ppid: 200, command: "/usr/bin/ssh -T host" },
+		400: { ppid: 1, command: "/usr/bin/ssh forged" },
+	};
+	const calls: string[][] = [];
+	const info = psInfo(async (args) => {
+		calls.push(args);
+		const [o, field, p, pid] = args;
+		assert.equal(o, "-o");
+		assert.equal(p, "-p");
+		const row = table[Number(pid)];
+		if (!row) return { code: 1, stdout: "" };
+		return { code: 0, stdout: field === "ppid=" ? `  ${row.ppid}\n` : `${row.command}\n` };
+	});
+	assert.equal(await descendsFrom(300, 100, info), true);
+	assert.equal(await descendsFrom(400, 100, info), false);
+	assert.equal(await descendsFrom(999, 100, info), undefined);
+	assert.deepEqual(calls[0], ["-o", "ppid=", "-p", "300"]);
+	assert.deepEqual(await describeRequester(300, info, 100), { cmdline: "/usr/bin/ssh -T host", program: "ssh", fromThisPi: true });
+	assert.deepEqual(await describeRequester(400, info, 100), { cmdline: "/usr/bin/ssh forged", program: "ssh", fromThisPi: false });
+	assert.deepEqual(await describeRequester(999, info, 100), { cmdline: "(pid 999)", program: "" });
+	assert.ok(calls.some((c) => c[1] === "command="));
+	// The real ps (here) gives the same answer as /proc for this process.
+	const real = psInfo();
+	assert.equal(await real.ppid(process.pid), process.ppid);
+	assert.equal(await descendsFrom(process.pid, process.ppid, real), true);
+	assert.match((await describeRequester(process.pid, real, process.ppid)).program, /node/);
+	if (process.platform === "linux") assert.equal(await procfsInfo().ppid(process.pid), process.ppid);
+	// darwin -> ps (works here too).
+	assert.equal(await defaultProcInfo("darwin").ppid(process.pid), process.ppid);
 });
 
 test("tokenize like OpenSSH: comments, both quote kinds, fragments, escapes", () => {

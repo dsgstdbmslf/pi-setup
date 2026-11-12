@@ -143,7 +143,9 @@ Do not install both ways at once, or the extension loads twice.
     `/ssh add [name|all|host]` (a host loads the keys its config uses), `/ssh rm [name]`,
     `/ssh clear`, `/ssh test [host]` (`ssh -T`, 10 s connect timeout), `/ssh hosts`.
   - `/ssh config pull` (note -> local config, maps keys, regenerates, adds the Include;
-    a note that fails the `ssh -G` syntax check is refused and the local config kept),
+    the exact generated config that would be installed is checked with `ssh -G` first, and
+    a note with unterminated quotes, an `IdentityFile` with extra arguments or any error
+    `ssh -G` reports is refused with the local and generated config kept; edits too),
     `/ssh config push` (local -> note, asks first), `/ssh config edit`, `/ssh config show`,
     `/ssh config map` (choose the Bitwarden key for each `IdentityFile`).
   - Footer: `🔐 unlocked · N keys`, `🔒 locked · N keys`, `bw: logged out` or
@@ -154,7 +156,10 @@ Do not install both ways at once, or the extension loads twice.
   and push open a confirm dialog; adding a host does not. Two pi processes share the
   config: a change confirmed in one while another already wrote the file is refused with
   "SSH config changed in another pi session; retry" (writes, state and regeneration run
-  under a lock file, `config.lock`). Results carry names and
+  under an OS advisory lock on `config.lock`, held by a small `flock`/`lockf`/`perl` child
+  process; the kernel drops it when pi exits or crashes, a stopped pi keeps it and others
+  give up after 30 s with "another pi session holds config.lock; try again"; lock files
+  are kept, never deleted). Results carry names and
   fingerprints, never key material. When a `bash` command or a `!` command names a
   configured host whose key is not loaded (`ssh web`, `git clone ssh://git@web/x`,
   `rsync f web:`), pi offers to load it first; declining runs the command anyway.
@@ -171,7 +176,8 @@ Do not install both ways at once, or the extension loads twice.
   Note, `controlPersist` (`false` = off) is used by the generated connection-sharing block.
 
   Lifetimes: one `ssh-agent` per user at `~/.pi/agent/bitwarden-ssh/run/ssh-agent.sock`
-  (or `/tmp/pi-bw-<uid>/` when that path is too long for a socket), shared by all pi
+  (or `/tmp/pi-bw-<uid>/` when that path is too long for a socket: 104 bytes on macOS, 108 on
+  Linux; `/tmp`, not macOS's long `$TMPDIR`), shared by all pi
   processes and kept after pi quits; pi sets `SSH_AUTH_SOCK` to it, so an agent that was
   set before (such as a forwarded one) is not used inside pi (`/bw status` shows it). Keys
   expire by `keyTtl`. The Bitwarden session key lives only in the memory of each pi process
@@ -199,7 +205,8 @@ Do not install both ways at once, or the extension loads twice.
   Files: `~/.pi/agent/bitwarden-ssh/` holds `state.json` (identity mapping and a cache of
   key names, fingerprints and public keys) and `config` (the synced config as on your
   computer). `~/.ssh/pi-bitwarden/` holds the generated `config`, public keys in `keys/`
-  (private keys only go into the agent) and ControlMaster sockets in `cm/`. Files are
+  (private keys only go into the agent) and ControlMaster sockets in `cm/` (in
+  `/tmp/pi-bw-<uid>/cm/` when the home path is too long for a socket path). Files are
   mode 600, directories 700. `~/.ssh/config` gets one line at the top,
   `Include ~/.ssh/pi-bitwarden/config` (absolute path), created if missing; only such an
   Include before the first `Host`/`Match` counts (a copy inside a block is left alone and
@@ -280,5 +287,9 @@ restore your previous one), revert the merged settings fields, then `/reload`.
 
 - pi (`@earendil-works/pi-coding-agent`) 1.5+; tested on 1.5.2
 - `git` (for `pi install git:...`)
-- `bitwarden-ssh.ts`: the Bitwarden CLI `bw` (tested with 2026.10.1) and the OpenSSH
-  client (`ssh`, `ssh-add`, `ssh-agent`; tested with 9.6)
+- `bitwarden-ssh.ts`: Linux and macOS. The Bitwarden CLI `bw` (tested with 2026.10.1), the
+  OpenSSH client (`ssh`, `ssh-add`, `ssh-agent`; 8.4+ for `SSH_ASKPASS_REQUIRE`; tested
+  with 9.6) and, for the cross-process lock, `flock` (Linux, util-linux), `/usr/bin/lockf`
+  (macOS, built in) or `perl` (fallback on either); without one of them config changes and
+  agent startup fail with a clear error. `ps` is used on macOS for the askpass requester
+  hint (`/proc` on Linux). Tested on Linux only; macOS paths are covered by unit tests

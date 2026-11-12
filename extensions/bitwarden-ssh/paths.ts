@@ -21,16 +21,22 @@ export interface Paths {
 	home: string;
 }
 
-/** Linux sun_path holds 108 bytes; keep a margin. */
+/** sun_path holds 108 bytes on Linux and 104 on macOS (both including the NUL); keep a margin for both. */
 export const MAX_SOCKET_PATH = 100;
-// Longest askpass socket name (pid_max is at most 2^22 on Linux).
+// Longest askpass socket name (pid_max is at most 2^22 on Linux, 99998 on macOS).
 const LONGEST_SOCK = "askpass-4194304.sock";
+/** ControlPath socket name: "/" + %C (40 hex chars) + the temporary ".<16 chars>" suffix ssh adds while binding. */
+export const CM_SOCKET_NAME = 1 + 40 + 17;
 
 export function resolvePaths(opts: { agentDir: string; home: string; uid: number }): Paths {
 	const dataDir = join(opts.agentDir, "bitwarden-ssh");
 	let runDir = join(dataDir, "run");
-	if (Buffer.byteLength(join(runDir, LONGEST_SOCK)) > MAX_SOCKET_PATH) runDir = `/tmp/pi-bw-${opts.uid}`;
+	// /tmp, not $TMPDIR: on macOS $TMPDIR is a long /var/folders/... path (and /tmp is short on both).
+	const shortDir = `/tmp/pi-bw-${opts.uid}`;
+	if (Buffer.byteLength(join(runDir, LONGEST_SOCK)) > MAX_SOCKET_PATH) runDir = shortDir;
 	const sshDir = join(opts.home, ".ssh", "pi-bitwarden");
+	let cmDir = join(sshDir, "cm");
+	if (Buffer.byteLength(cmDir) + CM_SOCKET_NAME > MAX_SOCKET_PATH) cmDir = join(shortDir, "cm");
 	return {
 		dataDir,
 		stateFile: join(dataDir, "state.json"),
@@ -42,7 +48,7 @@ export function resolvePaths(opts: { agentDir: string; home: string; uid: number
 		sshDir,
 		generatedFile: join(sshDir, "config"),
 		keysDir: join(sshDir, "keys"),
-		cmDir: join(sshDir, "cm"),
+		cmDir,
 		userConfig: join(opts.home, ".ssh", "config"),
 		home: opts.home,
 	};
