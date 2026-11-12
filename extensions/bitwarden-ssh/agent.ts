@@ -32,7 +32,7 @@ export interface EnsureResult {
 
 /**
  * Reuse a live agent at `sock` or start one there (`ssh-agent -a sock`, it daemonizes itself). Startup is
- * serialized across pi processes with the lock file `<sock>.lock`: the probe is repeated under the lock, and
+ * serialized across pi processes with the advisory lock on `<sock>.lock`: the probe is repeated under the lock, and
  * the socket is only unlinked when that probe still cannot connect, so a concurrent pi that just started the
  * agent (and maybe loaded keys) never loses its socket.
  */

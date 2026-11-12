@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, fork, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +13,6 @@ import { clientScript, setupAskpassEnv, startAskpassServer, writeClientScript } 
 import { Bitwarden, BwError, shared } from "../extensions/bitwarden-ssh/bw.ts";
 import { ensureInclude, keyForPubPath, readSource, regenerate, writeSource } from "../extensions/bitwarden-ssh/config-store.ts";
 import { fingerprintOf } from "../extensions/bitwarden-ssh/keyutil.ts";
-import { withFileLock } from "../extensions/bitwarden-ssh/lock.ts";
 import { ensureDir, resolvePaths } from "../extensions/bitwarden-ssh/paths.ts";
 import { generateConfig } from "../extensions/bitwarden-ssh/sshconfig.ts";
 import { emptyState, loadState, saveState } from "../extensions/bitwarden-ssh/state.ts";
@@ -382,36 +381,6 @@ test("generated config with comments and single quotes matches ssh -G", { skip: 
 	}
 });
 
-test("file lock: serializes holders, breaks a lock of a dead pid or a stale one", async () => {
-	const dir = mkdtempSync(join(root, "lock-"));
-	const lock = join(dir, "x.lock");
-	const order: string[] = [];
-	const hold = (name: string, ms: number) =>
-		withFileLock(lock, async () => {
-			order.push(`${name}+`);
-			await new Promise((r) => setTimeout(r, ms));
-			order.push(`${name}-`);
-		});
-	await Promise.all([hold("a", 100), hold("b", 10)]);
-	assert.deepEqual(order, ["a+", "a-", "b+", "b-"]);
-	assert.equal(existsSync(lock), false);
-	// Dead holder: broken at once.
-	const dead = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout;
-	writeFileSync(lock, `${dead} tok\n`);
-	const t0 = Date.now();
-	assert.equal(await withFileLock(lock, () => 1), 1);
-	assert.ok(Date.now() - t0 < 2000);
-	// Live pid but not refreshed for longer than staleMs: broken.
-	writeFileSync(lock, `${process.ppid} tok\n`);
-	const old = new Date(Date.now() - 60_000);
-	utimesSync(lock, old, old);
-	assert.equal(await withFileLock(lock, () => 2, { staleMs: 10_000 }), 2);
-	// Live and fresh: waits, then times out.
-	writeFileSync(lock, `${process.ppid} tok\n`);
-	await assert.rejects(withFileLock(lock, () => 3, { timeoutMs: 200 }), /timed out waiting for the lock/);
-	rmSync(lock);
-});
-
 test("ensureAgent: concurrent startup from two processes keeps one live agent", { skip: !has("ssh-agent") || !has("ssh-keygen") }, async () => {
 	// Replays the review race: A's first probe fails after B probed, B's first probe fails after A started the
 	// agent and loaded a key. Without the lock B unlinked A's socket and started an empty second agent.
@@ -460,7 +429,7 @@ writeFileSync(d + "/" + process.env.RACE_ROLE + ".json", JSON.stringify({ ...r, 
 		assert.equal(a.started, true);
 		assert.equal(b.started, false, "B reuses A's agent instead of replacing its socket");
 		assert.equal(b.keys, 1, "B sees the key A loaded");
-		assert.equal(existsSync(join(dir, "agent.sock.lock")), false);
+		assert.equal(existsSync(join(dir, "agent.sock.lock")), true, "lock files are kept (deleting one breaks mutual exclusion)");
 	} finally {
 		for (const pid of pids) {
 			try {

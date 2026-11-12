@@ -1,108 +1,220 @@
-// Cross-process lock: an exclusive lock file created with O_EXCL ("wx"). The holder refreshes its mtime
-// while it holds the lock; a lock whose holder pid is gone or whose mtime is older than staleMs is broken.
+// Cross-process lock: a kernel advisory lock (flock(2)) on a lock file, held by a small child process for as
+// long as it lives. The child prints "locked" once it holds the lock and then blocks reading its stdin;
+// release = end its stdin (kill as fallback). If pi dies, the pipe closes, the child exits and the kernel
+// drops the lock. A live holder is never broken (a stopped or slow pi keeps its lock; waiters time out),
+// and lock files are never renamed or deleted, so there is no staleness logic and no recovery race.
 // Used for the shared ssh-agent startup and for source config / state writes shared by pi processes.
+//
+// Backends (chosen once per process, by availability): Linux `flock` (util-linux), macOS `/usr/bin/lockf`
+// (BSD; -k keeps the file), else `perl` (Fcntl flock). All three take flock(2) locks.
 
-import { closeSync, openSync, readFileSync, renameSync, statSync, unlinkSync, utimesSync, writeSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { accessSync, closeSync, constants, fchmodSync, fstatSync, mkdirSync, openSync } from "node:fs";
+import { basename, dirname } from "node:path";
+
+export type LockBackend = "flock" | "lockf" | "perl";
 
 export interface LockOptions {
-	/** A lock file not refreshed for this long counts as stale (default 10 s). */
-	staleMs?: number;
-	/** Give up waiting after this long (default 30 s). */
+	/** Give up waiting after this long (default 30 s). The holder is never broken. */
 	timeoutMs?: number;
-	/** Poll interval while waiting (default 50 ms). */
-	pollMs?: number;
+	/** Force a backend (tests); default: detected once per process. */
+	backend?: LockBackend;
 }
 
 export class LockTimeoutError extends Error {}
 
-function pidAlive(pid: number): boolean {
-	if (!Number.isInteger(pid) || pid <= 0) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (err) {
-		return (err as NodeJS.ErrnoException).code === "EPERM";
+/** Marker the lock child prints once it holds the lock. */
+export const LOCKED_MARKER = "locked";
+const HOLD_SH = `echo ${LOCKED_MARKER}; exec cat >/dev/null`;
+export const MACOS_LOCKF = "/usr/bin/lockf";
+// Non-blocking attempts every 50 ms until the deadline; then hold until stdin ends.
+const PERL_SCRIPT =
+	'use strict; use Fcntl qw(:flock); my ($p, $t) = @ARGV; open(my $f, ">>", $p) or die "open $p: $!\\n"; ' +
+	"my $end = time + $t; until (flock($f, LOCK_EX | LOCK_NB)) { if (time >= $end) { print STDERR \"timeout\\n\"; exit 75 } " +
+	`select(undef, undef, undef, 0.05) } $| = 1; print "${LOCKED_MARKER}\\n"; 1 while <STDIN>;`;
+
+export interface LockCommand {
+	cmd: string;
+	args: string[];
+}
+
+/** The command that takes and holds the lock on `path`, waiting at most `timeoutSec` (backstop timeout). */
+export function lockCommand(backend: LockBackend, path: string, timeoutSec: number): LockCommand {
+	const t = String(Math.max(1, Math.ceil(timeoutSec)));
+	switch (backend) {
+		case "flock":
+			return { cmd: "flock", args: ["-x", "-w", t, "-E", "75", path, "/bin/sh", "-c", HOLD_SH] };
+		case "lockf":
+			// BSD lockf exits 75 on timeout. -k: keep the lock file (deleting it would break mutual exclusion), -s: silent, -t: timeout.
+			return { cmd: MACOS_LOCKF, args: ["-k", "-s", "-t", t, path, "/bin/sh", "-c", HOLD_SH] };
+		case "perl":
+			return { cmd: "perl", args: ["-e", PERL_SCRIPT, path, t] };
 	}
 }
 
-function tryCreate(path: string, token: string): boolean {
-	try {
-		const fd = openSync(path, "wx", 0o600);
-		try {
-			writeSync(fd, `${process.pid} ${token}\n`);
-		} finally {
-			closeSync(fd);
+export const NO_BACKEND = "Cross-process locking needs flock (Linux, util-linux), lockf (macOS) or perl; none was found on PATH";
+
+/** Preferred backend for a platform among the available ones; throws when none exists. */
+export function chooseBackend(platform: NodeJS.Platform, available: (b: LockBackend) => boolean): LockBackend {
+	const order: LockBackend[] = platform === "linux" ? ["flock", "perl"] : platform === "darwin" ? ["lockf", "perl"] : ["perl"];
+	for (const b of order) if (available(b)) return b;
+	throw new Error(NO_BACKEND);
+}
+
+function minimalEnv(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { PATH: process.env.PATH || "/usr/bin:/bin" };
+	if (process.env.HOME) env.HOME = process.env.HOME;
+	if (process.env.LANG) env.LANG = process.env.LANG;
+	return env;
+}
+
+/** Real availability probe. util-linux flock only: busybox flock has no -w. */
+export function backendAvailable(b: LockBackend): boolean {
+	const opts = { env: minimalEnv(), encoding: "utf8" as const, timeout: 5000, stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"] };
+	switch (b) {
+		case "flock": {
+			const r = spawnSync("flock", ["--version"], opts);
+			return r.status === 0 && /util-linux/.test(`${r.stdout}${r.stderr}`);
 		}
-		return true;
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
-		throw err;
+		case "lockf":
+			try {
+				accessSync(MACOS_LOCKF, constants.X_OK);
+				return true;
+			} catch {
+				return false;
+			}
+		case "perl":
+			return spawnSync("perl", ["-MFcntl=:flock", "-e", "1"], opts).status === 0;
 	}
 }
 
-/** Remove a stale lock. Rename first, so two waiters cannot both break it and delete a fresh lock. */
-function breakIfStale(path: string, staleMs: number): void {
-	let st: ReturnType<typeof statSync>;
-	let pid: number;
+let detected: LockBackend | undefined;
+/** The backend of this process (probed once, cached). */
+export function lockBackend(): LockBackend {
+	detected ??= chooseBackend(process.platform, backendAvailable);
+	return detected;
+}
+
+// Lock children of this process (waiting or holding): killed when the process exits.
+const children = new Set<ChildProcess>();
+let exitHook = false;
+function killGroup(child: ChildProcess): void {
+	if (!child.pid) return;
 	try {
-		st = statSync(path);
-		pid = Number(readFileSync(path, "utf8").split(" ")[0]);
+		process.kill(-child.pid, "SIGKILL"); // detached: the child leads its own process group (sh, cat)
 	} catch {
-		return; // gone already: retry the create
+		try {
+			child.kill("SIGKILL");
+		} catch {}
 	}
-	const age = Date.now() - st.mtimeMs;
-	// A just-created file may not have its pid yet: only a fresh-enough mtime protects it then.
-	const dead = Number.isInteger(pid) && pid > 0 && pid !== process.pid && !pidAlive(pid);
-	if (!dead && age < staleMs) return;
-	const aside = `${path}.stale-${randomBytes(4).toString("hex")}`;
-	try {
-		renameSync(path, aside);
-	} catch {
-		return;
+}
+function track(child: ChildProcess): void {
+	children.add(child);
+	if (!exitHook) {
+		exitHook = true;
+		process.on("exit", () => {
+			for (const c of children) killGroup(c);
+		});
 	}
+}
+
+/** Create the lock file (mode 600, never deleted). Refuses a symlink. */
+function prepareLockFile(path: string): void {
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW, 0o600);
 	try {
-		const st2 = statSync(aside);
-		// Someone replaced the lock between our stat and the rename: we moved a live lock. Put it back
-		// unless the path is taken again (then the live holder lost it; it re-checks nothing, accept that).
-		if (st2.ino !== st.ino) {
-			try {
-				renameSync(aside, path);
-			} catch {}
+		const st = fstatSync(fd);
+		if (!st.isFile()) throw new Error(`${path} is not a regular file`);
+		if ((st.mode & 0o777) !== 0o600) fchmodSync(fd, 0o600);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+interface Held {
+	release(): Promise<void>;
+}
+
+function acquire(path: string, timeoutMs: number, backend: LockBackend): Promise<Held> {
+	prepareLockFile(path);
+	const { cmd, args } = lockCommand(backend, path, timeoutMs / 1000 + 2);
+	const name = basename(path);
+	return new Promise((resolve, reject) => {
+		let child: ChildProcess;
+		try {
+			// Own process group (terminal signals such as Ctrl+C do not reach it), minimal env, pipes only.
+			child = spawn(cmd, args, { env: minimalEnv(), stdio: ["pipe", "pipe", "pipe"], detached: true });
+		} catch (err) {
+			reject(new Error(`lock helper ${cmd}: ${err instanceof Error ? err.message : String(err)}`));
 			return;
 		}
-		unlinkSync(aside);
-	} catch {}
+		track(child);
+		let out = "";
+		let err = "";
+		let state: "waiting" | "held" | "done" = "waiting";
+		const closed = new Promise<void>((res) => child.once("close", () => res()));
+		closed.then(() => children.delete(child));
+		const stop = () => {
+			try {
+				child.stdin?.end();
+			} catch {}
+			killGroup(child);
+		};
+		const fail = (e: Error) => {
+			if (state !== "waiting") return;
+			state = "done";
+			clearTimeout(timer);
+			stop();
+			reject(e);
+		};
+		const timer = setTimeout(() => fail(new LockTimeoutError(`another pi session holds ${name}; try again`)), timeoutMs);
+		child.stdin?.on("error", () => {});
+		child.stderr?.on("data", (d: Buffer) => {
+			if (err.length < 4096) err += d.toString("utf8");
+		});
+		child.stdout?.on("data", (d: Buffer) => {
+			if (state !== "waiting") return;
+			out += d.toString("utf8");
+			if (!out.split("\n").slice(0, -1).includes(LOCKED_MARKER)) return;
+			state = "held";
+			clearTimeout(timer);
+			let releasing: Promise<void> | undefined;
+			resolve({
+				release: () => {
+					releasing ??= (async () => {
+						state = "done";
+						try {
+							child.stdin?.end();
+						} catch {}
+						// Normally the child exits at once on EOF; kill the group if it does not.
+						const t = setTimeout(() => killGroup(child), 1000);
+						await closed;
+						clearTimeout(t);
+					})();
+					return releasing;
+				},
+			});
+		});
+		child.on("error", (e: NodeJS.ErrnoException) =>
+			fail(new Error(e.code === "ENOENT" ? `lock helper ${cmd} not found. ${NO_BACKEND}` : `lock helper ${cmd}: ${e.message}`)),
+		);
+		child.on("exit", (code, signal) => {
+			const line = err.split("\n").map((l) => l.trim()).filter(Boolean).pop();
+			fail(
+				code === 75 // EX_TEMPFAIL: flock -E 75, BSD lockf and our perl script on timeout
+					? new LockTimeoutError(`another pi session holds ${name}; try again`)
+					: new Error(`lock helper ${backend} exited (${signal ?? code})${line ? `: ${line.slice(0, 200)}` : ""}`),
+			);
+		});
+	});
 }
 
-/** Run fn while holding the lock file `path`. */
+/** Run fn while holding the advisory lock on `path`. The lock is released when fn settles (also on throw). */
 export async function withFileLock<T>(path: string, fn: () => Promise<T> | T, opts: LockOptions = {}): Promise<T> {
-	const staleMs = opts.staleMs ?? 10_000;
-	const timeoutMs = opts.timeoutMs ?? 30_000;
-	const pollMs = opts.pollMs ?? 50;
-	const start = Date.now();
-	const token = randomBytes(8).toString("hex");
-	while (!tryCreate(path, token)) {
-		breakIfStale(path, staleMs);
-		if (Date.now() - start > timeoutMs) throw new LockTimeoutError(`timed out waiting for the lock ${path} (another pi session holds it)`);
-		await new Promise((r) => setTimeout(r, pollMs));
-	}
-	const beat = setInterval(
-		() => {
-			try {
-				const now = new Date();
-				utimesSync(path, now, now);
-			} catch {}
-		},
-		Math.max(200, Math.floor(staleMs / 3)),
-	);
-	beat.unref?.();
+	const held = await acquire(path, opts.timeoutMs ?? 30_000, opts.backend ?? lockBackend());
 	try {
 		return await fn();
 	} finally {
-		clearInterval(beat);
-		try {
-			if (readFileSync(path, "utf8").trim() === `${process.pid} ${token}`) unlinkSync(path);
-		} catch {}
+		await held.release();
 	}
 }
