@@ -60,21 +60,17 @@ export interface RegenerateResult extends GenerateResult {
 	generatedFile: string;
 }
 
+export interface BuiltConfig extends GenerateResult {
+	/** Public key files of mapped keys: path -> content. */
+	pubFiles: Map<string, string>;
+}
+
 /**
- * Write public key files of mapped keys and the generated config. Mapped identities without a cached public
- * key count as unmatched. Returns undefined when there is no source config yet.
+ * The exact generated config for `source` and `state`, without writing anything. Mapped identities without
+ * a cached public key count as unmatched. Throws ConfigSyntaxError for lexical/arity errors in the source.
  */
-export function regenerate(
-	paths: Paths,
-	state: State,
-	opts: { controlPersist: string | false; sourceText?: string },
-): RegenerateResult | undefined {
-	const source = opts.sourceText ?? readSource(paths);
-	if (source === undefined) return undefined;
-	ensureDir(paths.sshDir);
-	ensureDir(paths.keysDir);
-	ensureDir(paths.cmDir);
-	const written = new Set<string>();
+export function buildGenerated(paths: Paths, state: State, source: string, opts: { controlPersist: string | false }): BuiltConfig {
+	const pubFiles = new Map<string, string>();
 	const result = generateConfig(source, {
 		mapIdentity: (p) => {
 			const m = state.identityMap[p];
@@ -82,10 +78,7 @@ export function regenerate(
 			const key = state.keys.find((k) => k.id === m.itemId);
 			if (!key?.publicKey) return undefined;
 			const file = pubPath(paths, key, state.keys);
-			if (!written.has(file)) {
-				writeFileAtomic(file, `${key.publicKey.trim()}\n`, 0o600);
-				written.add(file);
-			}
+			pubFiles.set(file, `${key.publicKey.trim()}\n`);
 			return file;
 		},
 		pathExists: (p) => existsSync(expandHome(p, paths.home)),
@@ -93,17 +86,37 @@ export function regenerate(
 		cmDir: paths.cmDir,
 		header: HEADER(paths.sourceFile),
 	});
-	// Drop .pub files of keys no longer mapped.
+	return { ...result, pubFiles };
+}
+
+/** Write the public key files and the generated config of `built`; drop .pub files no longer mapped. */
+export function publishGenerated(paths: Paths, built: BuiltConfig): RegenerateResult {
+	ensureDir(paths.sshDir);
+	ensureDir(paths.keysDir);
+	ensureDir(paths.cmDir);
+	for (const [file, content] of built.pubFiles) writeFileAtomic(file, content, 0o600);
 	for (const f of readdirSync(paths.keysDir)) {
 		const full = join(paths.keysDir, f);
-		if (f.endsWith(".pub") && !written.has(full)) {
+		if (f.endsWith(".pub") && !built.pubFiles.has(full)) {
 			try {
 				unlinkSync(full);
 			} catch {}
 		}
 	}
-	writeFileAtomic(paths.generatedFile, result.text, 0o600);
+	writeFileAtomic(paths.generatedFile, built.text, 0o600);
+	const { pubFiles: _, ...result } = built;
 	return { ...result, generatedFile: paths.generatedFile };
+}
+
+/** buildGenerated + publishGenerated (no ssh -G check). Returns undefined when there is no source config yet. */
+export function regenerate(
+	paths: Paths,
+	state: State,
+	opts: { controlPersist: string | false; sourceText?: string },
+): RegenerateResult | undefined {
+	const source = opts.sourceText ?? readSource(paths);
+	if (source === undefined) return undefined;
+	return publishGenerated(paths, buildGenerated(paths, state, source, opts));
 }
 
 /**

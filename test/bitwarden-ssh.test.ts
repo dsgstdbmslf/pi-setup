@@ -7,6 +7,8 @@ import { resolvePaths } from "../extensions/bitwarden-ssh/paths.ts";
 import { DEFAULTS, parseSettings } from "../extensions/bitwarden-ssh/settings.ts";
 import {
 	addHost,
+	ConfigSyntaxError,
+	configErrors,
 	generateConfig,
 	getHostBlockText,
 	hostNames,
@@ -177,6 +179,38 @@ test("generateConfig: existing IdentitiesOnly, existing paths, ControlMaster ski
 
 test("invalidLines", () => {
 	assert.deepEqual(invalidLines("Host a\n  User b\n# c\n\n  ???\n"), [5]);
+});
+
+test("N3: configErrors reports unterminated quotes and IdentityFile arity; the generator refuses them", () => {
+	assert.equal(tokenize('"~/.ssh/known').unterminated, true);
+	assert.equal(tokenize("'a b").unterminated, true);
+	assert.equal(tokenize('"a b" c # "x').unterminated, undefined);
+	const text = 'Host a\n  IdentityFile ~/.ssh/known unexpected-extra\n  IdentityFile "~/.ssh/known\n  IdentityFile\n  User "x\n  IdentityFile "/p q" # ok\n  ???\n';
+	assert.deepEqual(configErrors(text), [
+		"line 2: IdentityFile takes exactly 1 argument (got 2)",
+		"line 3: unterminated quote",
+		"line 4: IdentityFile takes exactly 1 argument (got 0)",
+		"line 5: unterminated quote",
+		'line 7: not "Keyword value"',
+	]);
+	assert.deepEqual(configErrors("Host a\n  IdentityFile ~/.ssh/k # c\n  IdentityFile 'a b'\n"), []);
+	// Even with a mapping that would replace the line, the malformed source is refused (no masking).
+	const opts = { mapIdentity: () => "/k.pub", pathExists: () => true, controlPersist: false as const, cmDir: "/cm", header: "h" };
+	for (const bad of ["Host a\n IdentityFile ~/.ssh/known unexpected-extra\n", 'Host a\n IdentityFile "~/.ssh/known\n'])
+		assert.throws(() => generateConfig(bad, opts), (e: unknown) => e instanceof ConfigSyntaxError && /line 2/.test((e as Error).message));
+});
+
+test("generateConfig: sourceLines maps generated line numbers back to the source", () => {
+	const src = "Host a\n  IdentityFile ~/.ssh/k\n  Bogus x\n";
+	const r = generateConfig(src, { mapIdentity: () => "/k.pub", pathExists: () => true, controlPersist: "10m", cmDir: "/cm", header: "one\ntwo" });
+	const lines = r.text.split("\n");
+	const at = (re: RegExp) => lines.findIndex((l) => re.test(l)) + 1;
+	assert.equal(r.sourceLines[at(/^Host a$/)], 1);
+	assert.equal(r.sourceLines[at(/IdentityFile "\/k\.pub"/)], 2);
+	assert.equal(r.sourceLines[at(/IdentitiesOnly yes/)], 2);
+	assert.equal(r.sourceLines[at(/Bogus x/)], 3);
+	assert.equal(r.sourceLines[at(/^# one$/)], 0);
+	assert.equal(r.sourceLines[at(/ControlMaster auto/)] ?? 0, 0);
 });
 
 test("matchKeyName", () => {

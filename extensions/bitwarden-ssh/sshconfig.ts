@@ -14,6 +14,8 @@ export interface Line {
 	args?: string[];
 	/** Trailing comment of the line (from "#"), if any. */
 	comment?: string;
+	/** A quote was not closed: OpenSSH rejects the line ("invalid quotes"). */
+	unterminated?: boolean;
 	indent: string;
 }
 
@@ -90,7 +92,16 @@ export function parseLine(raw: string): Line {
 	if (!m) return { raw, indent };
 	const value = m[2] ?? "";
 	const t = tokenize(value);
-	return { raw, key: m[1].toLowerCase(), keyRaw: m[1], value, args: t.args, ...(t.comment ? { comment: t.comment } : {}), indent };
+	return {
+		raw,
+		key: m[1].toLowerCase(),
+		keyRaw: m[1],
+		value,
+		args: t.args,
+		...(t.comment ? { comment: t.comment } : {}),
+		...(t.unterminated ? { unterminated: true } : {}),
+		indent,
+	};
 }
 
 /** Split arguments like OpenSSH (quotes removed, trailing comment dropped). */
@@ -135,6 +146,38 @@ export function invalidLines(text: string): number[] {
 		if (!l.key && raw.trim() && !raw.trim().startsWith("#")) out.push(i + 1);
 	});
 	return out;
+}
+
+/** Directives the generator rewrites, with the exact number of arguments OpenSSH accepts for them. */
+const ARITY: Record<string, number> = { identityfile: 1 };
+
+/**
+ * Lexical and arity errors, with 1-based line numbers: lines that are not `Keyword value`, unterminated
+ * quotes, and rewritten directives (IdentityFile) with other than one argument. The generator refuses a
+ * source with any of them: rewriting such a line could hide the error from the `ssh -G` check.
+ */
+export function configErrors(text: string): string[] {
+	const out: string[] = [];
+	(text.match(/[^\n]*\n|[^\n]+$/g) ?? []).forEach((raw, i) => {
+		const l = parseLine(raw);
+		const at = `line ${i + 1}`;
+		if (!l.key) {
+			if (raw.trim() && !raw.trim().startsWith("#")) out.push(`${at}: not "Keyword value"`);
+			return;
+		}
+		if (l.unterminated) out.push(`${at}: unterminated quote`);
+		else if (l.key in ARITY && (l.args ?? []).length !== ARITY[l.key])
+			out.push(`${at}: ${l.keyRaw} takes exactly ${ARITY[l.key]} argument (got ${(l.args ?? []).length})`);
+	});
+	return out;
+}
+
+export class ConfigSyntaxError extends Error {
+	readonly errors: string[];
+	constructor(errors: string[]) {
+		super(errors.join("; "));
+		this.errors = errors;
+	}
 }
 
 export function serializeConfig(blocks: Block[]): string {
@@ -375,17 +418,26 @@ export interface GenerateResult {
 	mapped: string[];
 	unmatched: string[];
 	disabled: string[];
+	/** Source line number (1-based) of each generated line, indexed by generated line number; 0 = added. */
+	sourceLines: number[];
 }
 
 const DISABLED = "# [pi-bw disabled] ";
 
+/** Throws ConfigSyntaxError for a source with lexical or arity errors (see configErrors). */
 export function generateConfig(sourceText: string, opts: GenerateOptions): GenerateResult {
+	const errors = configErrors(sourceText);
+	if (errors.length) throw new ConfigSyntaxError(errors);
 	const blocks = parseConfig(sourceText);
 	const eol = eolOf(blocks);
 	const mapped = new Set<string>();
 	const unmatched = new Set<string>();
 	const disabled: string[] = [];
 	const hasControlMaster = blocks.some((b) => b.lines.some((l) => l.key === "controlmaster"));
+	// Source line number of every line object, also for the lines that replace or follow a source line.
+	const srcNo = new Map<Line, number>();
+	let no = 0;
+	for (const b of blocks) for (const l of b.lines) srcNo.set(l, ++no);
 
 	for (const b of blocks) {
 		const hasIdOnly = b.lines.some((l) => l.key === "identitiesonly");
@@ -393,19 +445,24 @@ export function generateConfig(sourceText: string, opts: GenerateOptions): Gener
 		const out: Line[] = [];
 		for (const l of b.lines) {
 			const lineEol = /\r?\n$/.exec(l.raw)?.[0] ?? eol;
+			const n = srcNo.get(l) ?? 0;
+			const push = (x: Line) => {
+				srcNo.set(x, n);
+				out.push(x);
+			};
 			const disable = () => {
 				const text = l.raw.replace(/\r?\n$/, "");
 				disabled.push(text.trim());
-				out.push(parseLine(`${l.indent}${DISABLED}${text.trimStart()}${lineEol}`));
+				push(parseLine(`${l.indent}${DISABLED}${text.trimStart()}${lineEol}`));
 			};
 			const value = firstArg(l);
 			if (l.key === "identityfile") {
 				const pub = opts.mapIdentity(value);
 				if (pub) {
 					mapped.add(value);
-					out.push(parseLine(`${l.indent}${l.keyRaw} "${pub}"${lineEol}`));
+					push(parseLine(`${l.indent}${l.keyRaw} "${pub}"${lineEol}`));
 					if (!hasIdOnly && !addedIdOnly) {
-						out.push(parseLine(`${l.indent}IdentitiesOnly yes${lineEol}`));
+						push(parseLine(`${l.indent}IdentitiesOnly yes${lineEol}`));
 						addedIdOnly = true;
 					}
 					continue;
@@ -427,10 +484,9 @@ export function generateConfig(sourceText: string, opts: GenerateOptions): Gener
 		b.lines = out;
 	}
 
-	const header = opts.header
-		.split("\n")
-		.map((l) => `# ${l}`.trimEnd() + eol)
-		.join("");
+	const headerLines = opts.header.split("\n");
+	const header = headerLines.map((l) => `# ${l}`.trimEnd() + eol).join("");
+	const sourceLines = [0, ...headerLines.map(() => 0), 0, ...blocks.flatMap((b) => b.lines.map((l) => srcNo.get(l) ?? 0))];
 	let body = serializeConfig(blocks);
 	if (body && !body.endsWith("\n")) body += eol;
 	let text = `${header}${eol}${body}`;
@@ -443,5 +499,5 @@ export function generateConfig(sourceText: string, opts: GenerateOptions): Gener
 			`    ControlPath "${opts.cmDir}/%C"${eol}` +
 			`    ControlPersist ${opts.controlPersist}${eol}`;
 	}
-	return { text, mapped: [...mapped], unmatched: [...unmatched], disabled };
+	return { text, mapped: [...mapped], unmatched: [...unmatched], disabled, sourceLines };
 }

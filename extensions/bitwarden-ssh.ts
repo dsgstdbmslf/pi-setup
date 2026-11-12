@@ -3,6 +3,7 @@
 // Modules live in extensions/bitwarden-ssh/. Secrets stay in local variables and in the stdin/env of
 // the one child process that needs them: never in tool results, notifications, logs or files.
 
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -13,11 +14,13 @@ import { addKey, clearKeys, ensureAgent, listLoaded, type LoadedKey, removeKey }
 import { type AskHandler, type AskpassServer, setupAskpassEnv, startAskpassServer, writeClientScript } from "./bitwarden-ssh/askpass.ts";
 import { Bitwarden, BwError, type SshKeyItem, shared as bwShared, type StatusInfo } from "./bitwarden-ssh/bw.ts";
 import {
+	type BuiltConfig,
+	buildGenerated,
 	ensureInclude,
 	expandHome,
 	keyForPubPath,
+	publishGenerated,
 	readSource,
-	regenerate,
 	type RegenerateResult,
 	sha256,
 	writeSource,
@@ -30,11 +33,11 @@ import { askSecret, SECRET_INPUT_NEEDS_TUI, secretInputAvailable } from "./bitwa
 import { parseSettings, type Settings } from "./bitwarden-ssh/settings.ts";
 import {
 	addHost,
-	generateConfig,
+	ConfigSyntaxError,
+	configErrors,
 	getHostBlockText,
 	hostNames,
 	identityPaths,
-	invalidLines,
 	listHosts,
 	matchKeyName,
 	type OptionValues,
@@ -93,6 +96,8 @@ function msg(err: unknown): string {
 }
 
 class UserError extends Error {}
+/** The config failed validation (lexical/arity errors or `ssh -G`); nothing was written. */
+class InvalidConfig extends UserError {}
 
 const CONFIG_CHANGED = "SSH config changed in another pi session; retry";
 
@@ -441,14 +446,9 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 	// --- SSH config sync --------------------------------------------------------------------------
 
 	type Regen = (RegenerateResult & { include?: "created" | "added" | "present" }) | undefined;
-	/** Regenerate the generated config and .pub files from the current source and state (under the lock). */
+	/** Regenerate the generated config and .pub files from the current source and state (validated first). */
 	function regen(opts: { include?: boolean } = {}): Promise<Regen> {
-		return withConfigLock(() => {
-			const r = regenerate(P(), readState(), { controlPersist: settings.controlPersist });
-			hostKeyCache.clear();
-			if (r && opts.include) return { ...r, include: ensureInclude(P().userConfig, P().generatedFile) };
-			return r;
-		});
+		return publish({ include: opts.include });
 	}
 	const includeNote = (r: Regen): string[] =>
 		r?.include && r.include !== "present" ? [`${r.include === "created" ? "Created" : "Added an Include line to"} ${P().userConfig}`] : [];
@@ -462,34 +462,30 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 		return lines.join("\n");
 	}
 
-	/** Syntax check with ssh itself: generate the config into a temp file and run `ssh -G -F`. */
-	async function checkSyntax(source: string): Promise<string | undefined> {
-		const bad = invalidLines(source);
-		if (bad.length) return `line ${bad.join(", ")}: not "Keyword value"`;
-		const tmp = join(P().runDir, `check-${process.pid}.conf`);
+	/** `ssh -G -F` on exactly `text` (the final generated config); the first error lines, or undefined if valid. */
+	async function sshCheck(built: BuiltConfig): Promise<string | undefined> {
+		const text = built.text;
+		ensureDir(P().runDir);
+		const tmp = join(P().runDir, `check-${process.pid}-${randomBytes(4).toString("hex")}.conf`);
 		try {
-			const state = readState();
-			const text = generateConfig(source, {
-				mapIdentity: (p) => (state.identityMap[p]?.itemId ? `/nonexistent/${encodeURIComponent(p)}.pub` : undefined),
-				pathExists: () => true,
-				controlPersist: settings.controlPersist,
-				cmDir: P().cmDir,
-				header: "syntax check",
-			}).text;
-			ensureDir(P().runDir);
-			writeFileSync(tmp, text, { mode: 0o600 });
+			writeFileSync(tmp, text, { mode: 0o600, flag: "wx" });
 			const r = await run("ssh", ["-G", "-F", tmp, "pi-bw-syntax-check.invalid"], { timeoutMs: 10_000 });
 			if (r.error) return undefined; // ssh missing: skip the check
-			if (r.code !== 0) {
-				const line = r.stderr
-					.split("\n")
-					.map((l) => l.replace(tmp, "config").trim())
-					.filter((l) => l && !/^Pseudo-terminal/.test(l))
-					.slice(0, 3)
-					.join("; ");
-				return line || `ssh -G exit ${r.code}`;
-			}
-			return undefined;
+			if (r.code === 0) return undefined;
+			const line = r.stderr
+				.split("\n")
+				.map((l) =>
+					l
+						.split(tmp)
+						.join("generated config")
+						// Point at the source line the user wrote, where there is one.
+						.replace(/generated config:? line (\d+)/g, (m, n) => (built.sourceLines[Number(n)] ? `line ${built.sourceLines[Number(n)]}` : m))
+						.trim(),
+				)
+				.filter((l) => l && !/^Pseudo-terminal/.test(l))
+				.slice(0, 3)
+				.join("; ");
+			return line || `ssh -G exit ${r.code}`;
 		} finally {
 			try {
 				unlinkSync(tmp);
@@ -497,13 +493,70 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 		}
 	}
 
+	/** The exact generated config for `source` with `state`; lexical/arity errors become InvalidConfig. */
+	function build(source: string, state: State): BuiltConfig {
+		try {
+			return buildGenerated(P(), state, source, { controlPersist: settings.controlPersist });
+		} catch (err) {
+			if (err instanceof ConfigSyntaxError) throw new InvalidConfig(err.message);
+			throw err;
+		}
+	}
+
+	/**
+	 * Validate, then publish. Builds the exact final generated config from `source` (default: the current
+	 * source) with the current state plus `identity` and `mutate`, checks that exact text with `ssh -G -F`,
+	 * and only then, under the config lock, re-checks that the source is still `base` (default: what was
+	 * read here), writes the source (if given), state.json, the .pub files and the generated config, and
+	 * ensures the Include. If the state changed meanwhile, the rebuilt text is checked again. On any
+	 * failure nothing is written: the old source and generated files stay in place.
+	 */
+	async function publish(opts: {
+		source?: string;
+		base?: string | undefined;
+		identity?: State["identityMap"];
+		mutate?: (s: State) => void;
+		include?: boolean;
+	}): Promise<Regen> {
+		const current = readSource(P());
+		const base = "base" in opts ? opts.base : current;
+		if (base !== current) throw new UserError(CONFIG_CHANGED);
+		const source = opts.source ?? current;
+		if (source === undefined) return undefined;
+		const stateFor = (s: State): State => {
+			Object.assign(s.identityMap, opts.identity ?? {});
+			opts.mutate?.(s);
+			return s;
+		};
+		const built = build(source, stateFor(readState()));
+		const bad = await sshCheck(built);
+		if (bad) throw new InvalidConfig(`ssh: ${bad}`);
+		return withConfigLock(async () => {
+			if (readSource(P()) !== base) throw new UserError(CONFIG_CHANGED);
+			const st = stateFor(readState());
+			const final = build(source, st);
+			if (final.text !== built.text) {
+				const again = await sshCheck(final);
+				if (again) throw new InvalidConfig(`ssh: ${again}`);
+			}
+			if (opts.source !== undefined) writeSource(P(), source);
+			saveState(P().stateFile, st);
+			const r = publishGenerated(P(), final);
+			hostKeyCache.clear();
+			return opts.include ? { ...r, include: ensureInclude(P().userConfig, P().generatedFile) } : r;
+		});
+	}
+
 	/** Map IdentityFile paths to vault keys: auto-match by name, ask for the rest (or for all with `all`). */
-	async function mapIdentities(ctx: ExtensionContext, opts: { askAll?: boolean } = {}): Promise<string[]> {
-		const source = readSource(P()) ?? "";
+	async function mapIdentities(
+		ctx: ExtensionContext,
+		source: string,
+		opts: { askAll?: boolean } = {},
+	): Promise<{ notes: string[]; changes: State["identityMap"] }> {
 		const state = readState();
 		const notes: string[] = [];
-		// Only the entries decided here are merged into a fresh state.json at the end (dialogs take time;
-		// another pi may have written meanwhile).
+		// Only the entries decided here are returned; publish() merges them into a fresh state.json under
+		// the lock (dialogs take time; another pi may have written meanwhile).
 		const changes: State["identityMap"] = {};
 		const set = (path: string, v: { itemId: string; name: string }) => {
 			state.identityMap[path] = v;
@@ -536,11 +589,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 				}
 			}
 		}
-		if (Object.keys(changes).length)
-			await updateState((s) => {
-				Object.assign(s.identityMap, changes);
-			});
-		return notes;
+		return { notes, changes };
 	}
 
 	function existsHere(path: string): boolean {
@@ -557,9 +606,9 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 		}
 		const note = await bw.findNote(settings.configNote);
 		if (!note) throw new UserError(`No Bitwarden secure note named "${settings.configNote}". Create it on your computer (see README) or run /ssh config push.`);
-		// Same check as for edits, before anything is replaced: a broken note must not disable SSH.
-		const bad = await checkSyntax(note.notes);
-		if (bad) throw new UserError(`The note "${note.name}" is not a valid SSH config; kept the local config. ssh: ${bad}`);
+		// Lexical errors first (cheap, with source line numbers); the full check runs on the final text below.
+		const lexical = configErrors(note.notes);
+		if (lexical.length) throw new UserError(`The note "${note.name}" is not a valid SSH config; kept the local config. ${lexical.join("; ")}`);
 		const local = readSource(P());
 		const state = readState();
 		if (local !== undefined && local !== note.notes && (!state.syncedHash || sha256(local) !== state.syncedHash)) {
@@ -573,19 +622,28 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 			if (!ok) throw new UserError("Pull cancelled; local config kept (use /ssh config push to upload it)");
 		}
 		if (note.notes.length > NOTE_LIMIT_WARN) warnings.push(`the note has ${note.notes.length} characters; Bitwarden notes are limited to 10000`);
-		await withConfigLock(() => {
-			if (readSource(P()) !== local) throw new UserError(CONFIG_CHANGED);
-			writeSource(P(), note.notes);
-			const st2 = readState();
-			st2.note = { id: note.id, name: note.name };
-			st2.syncedHash = sha256(note.notes);
-			saveState(P().stateFile, st2);
-		});
+		// Refresh the key cache, then map identities with the real current keys, then validate exactly the
+		// config that will be installed, and only then replace anything (publish).
 		let items: SshKeyItem[] | undefined = await bw.listSshKeys();
 		await cacheKeys(items);
 		items = undefined;
-		const mapped = await mapIdentities(ctx);
-		const r = await regen({ include: true });
+		const { notes: mapped, changes } = await mapIdentities(ctx, note.notes);
+		let r: Regen;
+		try {
+			r = await publish({
+				source: note.notes,
+				base: local,
+				identity: changes,
+				mutate: (st) => {
+					st.note = { id: note.id, name: note.name };
+					st.syncedHash = sha256(note.notes);
+				},
+				include: true,
+			});
+		} catch (err) {
+			if (err instanceof InvalidConfig) throw new UserError(`The note "${note.name}" is not a valid SSH config; kept the local config. ${err.message}`);
+			throw err;
+		}
 		const extra = [...mapped.map((m) => `mapped ${m}`), ...includeNote(r)];
 		return [`Pulled "${note.name}" (${note.notes.length} chars).`, regenSummary(r, extra), ...warnings.map((w) => `Warning: ${w}`)].join("\n");
 	}
@@ -622,14 +680,16 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 	 * since, nothing is written and the caller is told to retry.
 	 */
 	async function applySource(ctx: ExtensionContext, base: string | undefined, next: string): Promise<string> {
-		const err = await checkSyntax(next);
-		if (err) throw new UserError(`Invalid SSH config: ${err}`);
-		await withConfigLock(() => {
-			if (readSource(P()) !== base) throw new UserError(CONFIG_CHANGED);
-			writeSource(P(), next);
-		});
-		const mapped = await mapIdentities(ctx);
-		const r = await regen({ include: true });
+		const lexical = configErrors(next);
+		if (lexical.length) throw new UserError(`Invalid SSH config: ${lexical.join("; ")}`);
+		const { notes: mapped, changes } = await mapIdentities(ctx, next);
+		let r: Regen;
+		try {
+			r = await publish({ source: next, base, identity: changes, include: true });
+		} catch (err) {
+			if (err instanceof InvalidConfig) throw new UserError(`Invalid SSH config: ${err.message}`);
+			throw err;
+		}
 		const extra = [...mapped.map((m) => `mapped ${m}`), ...includeNote(r)];
 		extra.push("Not yet in Bitwarden: /ssh config push (or ssh_config push) uploads it.");
 		return regenSummary(r, extra);
@@ -983,8 +1043,9 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 					await cacheKeys(items);
 					items = undefined;
 				}
-				const notes = await mapIdentities(ctx, { askAll: true });
-				return { text: regenSummary(await regen(), notes.map((n) => `mapped ${n}`)) };
+				const source = readSource(P()) ?? "";
+				const { notes, changes } = await mapIdentities(ctx, source, { askAll: true });
+				return { text: regenSummary(await publish({ base: source, identity: changes }), notes.map((n) => `mapped ${n}`)) };
 			}
 			case "show": {
 				const source = readSource(P());
@@ -996,7 +1057,13 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 					`Bitwarden note: ${settings.configNote}${st.note ? ` (id ${st.note.id})` : ""}`,
 					`local changes since last pull/push: ${source === undefined ? "-" : st.syncedHash ? (sha256(source) === st.syncedHash ? "no" : "yes") : "unknown"}`,
 				];
-				if (source !== undefined) lines.push(regenSummary(await regen()));
+				if (source !== undefined) {
+					try {
+						lines.push(regenSummary(await regen()));
+					} catch (err) {
+						lines.push(`Not regenerated (kept ${P().generatedFile}): ${msg(err)}`);
+					}
+				}
 				return { text: lines.join("\n") };
 			}
 			default:

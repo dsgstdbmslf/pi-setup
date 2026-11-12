@@ -440,8 +440,91 @@ writeFileSync(d + "/" + role + ".json", JSON.stringify({ isError: !!r.isError, t
 		const final = readFileSync(source, "utf8");
 		assert.match(final, /Port 2222/, "B's confirmed edit survives");
 		assert.doesNotMatch(final, /User alice/);
-		assert.equal(existsSync(join(dir, "agent", "bitwarden-ssh", "config.lock")), false);
+		// The advisory lock file stays (deleting it would break mutual exclusion).
+		assert.equal(existsSync(join(dir, "agent", "bitwarden-ssh", "config.lock")), true);
 	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("N3: pull and edit validate the exact final config; a cached mapping of a deleted key cannot hide errors", { skip: (!available && "pi packages not installed") || (!has("ssh") && "no OpenSSH") }, async () => {
+	// Review N3: the preview substituted any cached mapping, so `IdentityFile ~/.ssh/known extra` and an
+	// unterminated quote passed the check; after the key cache refresh (key deleted) the malformed line
+	// itself was installed into the globally included config.
+	const dir = mkdtempSync("/tmp/pi-bw-n3-");
+	const saved = { ...process.env };
+	const bwShared = () => ((globalThis as any)[Symbol.for("pi.bitwarden-ssh.bw")] ??= {});
+	try {
+		const { commands, ctx, log } = await setup(dir, "tui");
+		const home = join(dir, "home");
+		const db = join(dir, "db.json");
+		const dataDir = join(home, ".pi", "agent", "bitwarden-ssh");
+		const source = join(dataDir, "config");
+		const state = join(dataDir, "state.json");
+		const generated = join(home, ".ssh", "pi-bitwarden", "config");
+		const userConfig = join(home, ".ssh", "config");
+		mkdirSync(dataDir, { recursive: true });
+		mkdirSync(dirname(generated), { recursive: true });
+		const OLD = "Host original\n User original\n";
+		const { createHash } = await import("node:crypto");
+		const reset = (note: string) => {
+			// The vault has only the note now: the key "known" was deleted, but state.json still maps it.
+			writeFileSync(db, JSON.stringify({ items: [{ id: "note-1", type: 2, name: "ssh-config", notes: note, secureNote: { type: 0 } }] }));
+			writeFileSync(source, OLD);
+			writeFileSync(generated, OLD);
+			writeFileSync(userConfig, `Include ${generated}\n`);
+			writeFileSync(
+				state,
+				JSON.stringify({
+					version: 1,
+					identityMap: { "~/.ssh/known": { itemId: "old-key", name: "known" } },
+					keys: [{ id: "old-key", name: "known", publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOld", fingerprint: "" }],
+					syncedHash: createHash("sha256").update(OLD).digest("hex"),
+				}),
+			);
+			log.notes.length = 0;
+		};
+		bwShared().session = "SESS";
+		const sshG = () => spawnSync("ssh", ["-G", "-F", generated, "target"], { encoding: "utf8", input: "" });
+		for (const [name, note, why] of [
+			["extra argument", "Host target\n IdentityFile ~/.ssh/known unexpected-extra\n", /line 2: IdentityFile takes exactly 1 argument \(got 2\)/],
+			["unterminated quote", 'Host target\n IdentityFile "~/.ssh/known\n', /line 2: unterminated quote/],
+			["unknown directive", "Host target\n BogusOption yes\n", /ssh: line 2: Bad configuration option: bogusoption/],
+		] as const) {
+			reset(note);
+			await commands.get("ssh").handler("config pull", ctx);
+			const out = log.notes.join("\n");
+			assert.match(out, /is not a valid SSH config; kept the local config/, `${name}: ${out}`);
+			assert.match(out, why, name);
+			assert.doesNotMatch(out, /Pulled/);
+			assert.equal(readFileSync(source, "utf8"), OLD, `${name}: source kept`);
+			assert.equal(readFileSync(generated, "utf8"), OLD, `${name}: generated kept`);
+			assert.equal(JSON.parse(readFileSync(state, "utf8")).note, undefined, `${name}: state not marked as pulled`);
+			assert.equal(sshG().status, 0);
+		}
+		// /ssh config edit with the same malformed line: refused, nothing written.
+		reset("Host target\n HostName t.invalid\n");
+		ctx.ui.editor = async () => "Host original\n IdentityFile ~/.ssh/known unexpected-extra\n";
+		await commands.get("ssh").handler("config edit", ctx);
+		assert.match(log.notes.join("\n"), /Invalid SSH config: line 2: IdentityFile takes exactly 1 argument/);
+		assert.equal(readFileSync(source, "utf8"), OLD);
+		assert.equal(readFileSync(generated, "utf8"), OLD);
+		// A valid pull still succeeds; the unmapped identity stays as written.
+		reset("Host target\n HostName t.invalid\n IdentityFile ~/.ssh/known\n");
+		await commands.get("ssh").handler("config pull", ctx);
+		assert.match(log.notes.join("\n"), /Pulled "ssh-config"/);
+		assert.equal(readFileSync(source, "utf8"), "Host target\n HostName t.invalid\n IdentityFile ~/.ssh/known\n");
+		const r = sshG();
+		assert.equal(r.status, 0, r.stderr);
+		assert.match(r.stdout, /^hostname t\.invalid$/m);
+		assert.match(readFileSync(generated, "utf8"), /IdentityFile ~\/\.ssh\/known\n/);
+		assert.equal(JSON.parse(readFileSync(state, "utf8")).note.id, "note-1");
+	} finally {
+		const sh = bwShared();
+		sh.session = undefined;
+		if (sh.lockTimer) clearTimeout(sh.lockTimer);
+		for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+		Object.assign(process.env, saved);
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
