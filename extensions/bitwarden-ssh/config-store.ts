@@ -3,9 +3,9 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { ensureDir, type Paths } from "./paths.ts";
-import { type GenerateResult, generateConfig, hostNames, parseConfig, unquote } from "./sshconfig.ts";
+import { type GenerateResult, generateConfig, hostNames, parseConfig } from "./sshconfig.ts";
 import type { CachedKey, State } from "./state.ts";
 import { writeFileAtomic } from "./state.ts";
 
@@ -108,11 +108,13 @@ export function regenerate(
 
 /**
  * Make ~/.ssh/config include the generated file. Creates the file if missing; otherwise prepends the
- * Include line (an Include must come before any Host block to apply to all hosts). Nothing else changes.
+ * Include line (an Include must come before any Host block to apply to all hosts). Only an unconditional
+ * Include in the preamble (before the first Host/Match) counts as present; a copy inside a Host or Match
+ * block is left alone and the global line is still prepended. Nothing else changes.
  */
 export function ensureInclude(userConfig: string, generatedFile: string): "created" | "added" | "present" {
 	const sshDir = join(userConfig, "..");
-	const includeLine = `Include ${/\s/.test(generatedFile) ? `"${generatedFile}"` : generatedFile}`;
+	const includeLine = `Include ${/[\s#'"\\]/.test(generatedFile) ? `"${generatedFile.replace(/(["\\])/g, "\\$1")}"` : generatedFile}`;
 	let text: string;
 	try {
 		text = readFileSync(userConfig, "utf8");
@@ -123,16 +125,13 @@ export function ensureInclude(userConfig: string, generatedFile: string): "creat
 		return "created";
 	}
 	const home = join(sshDir, "..");
-	const present = parseConfig(text).some((b) =>
-		b.lines.some(
-			(l) =>
-				l.key === "include" &&
-				(l.value ?? "")
-					.split(/\s+/)
-					.map((v) => expandHome(unquote(v), home))
-					.includes(generatedFile),
-		),
-	);
+	// OpenSSH resolves relative Include paths of the user config against ~/.ssh.
+	const resolve = (v: string) => {
+		const p = expandHome(v, home);
+		return isAbsolute(p) ? p : join(sshDir, p);
+	};
+	const preamble = parseConfig(text)[0];
+	const present = preamble.lines.some((l) => l.key === "include" && (l.args ?? []).map(resolve).includes(generatedFile));
 	if (present) return "present";
 	// Write through a symlinked ~/.ssh/config (dotfile setups) and keep the file's mode.
 	const real = realpathSync(userConfig);

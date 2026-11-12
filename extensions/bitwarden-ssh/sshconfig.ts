@@ -8,8 +8,12 @@ export interface Line {
 	key?: string;
 	/** Keyword as written. */
 	keyRaw?: string;
-	/** Argument text as written (quotes kept). */
+	/** Argument text as written (quotes and any trailing comment kept). */
 	value?: string;
+	/** Arguments as OpenSSH reads them: quotes removed, a trailing `# comment` dropped. */
+	args?: string[];
+	/** Trailing comment of the line (from "#"), if any. */
+	comment?: string;
 	indent: string;
 }
 
@@ -32,28 +36,77 @@ const LINE_RE = /^\s*([A-Za-z][A-Za-z0-9]*)\s*(?:=\s*|\s+)(.*?)\s*$/;
 const BARE_RE = /^\s*([A-Za-z][A-Za-z0-9]*)\s*$/;
 const KEY_RE = /^[A-Za-z][A-Za-z0-9]*$/;
 
+export interface Tokens {
+	args: string[];
+	/** The trailing comment starting with "#", if any. */
+	comment?: string;
+	/** True when a quote was not closed (OpenSSH rejects such a line). */
+	unterminated?: boolean;
+}
+
+/**
+ * Split an argument string like OpenSSH's argv_split(): whitespace separates arguments; double and single
+ * quotes group (quoted fragments join the surrounding text, e.g. a"b c"d is one argument); a backslash
+ * escapes a quote, a backslash and (outside quotes) a space; a "#" at the start of an argument (outside
+ * quotes) starts a comment that runs to the end of the line.
+ */
+export function tokenize(value: string): Tokens {
+	const args: string[] = [];
+	let i = 0;
+	const n = value.length;
+	while (i < n) {
+		const c = value[i];
+		if (c === " " || c === "\t") {
+			i++;
+			continue;
+		}
+		if (c === "#") return { args, comment: value.slice(i) };
+		let arg = "";
+		let quote = "";
+		for (; i < n; i++) {
+			const ch = value[i];
+			if (ch === "\\") {
+				const nx = value[i + 1];
+				if (nx === "'" || nx === '"' || nx === "\\" || (!quote && nx === " ")) {
+					i++;
+					arg += nx;
+				} else arg += ch;
+			} else if (!quote && (ch === " " || ch === "\t")) break;
+			else if (!quote && (ch === '"' || ch === "'")) quote = ch;
+			else if (quote && ch === quote) quote = "";
+			else arg += ch;
+		}
+		if (quote) return { args: [...args, arg], unterminated: true };
+		args.push(arg);
+	}
+	return { args };
+}
+
 export function parseLine(raw: string): Line {
 	const body = raw.replace(/\r?\n$/, "");
 	const indent = /^\s*/.exec(body)![0];
 	if (/^\s*(#|$)/.test(body)) return { raw, indent };
 	const m = LINE_RE.exec(body) ?? BARE_RE.exec(body);
 	if (!m) return { raw, indent };
-	return { raw, key: m[1].toLowerCase(), keyRaw: m[1], value: m[2] ?? "", indent };
+	const value = m[2] ?? "";
+	const t = tokenize(value);
+	return { raw, key: m[1].toLowerCase(), keyRaw: m[1], value, args: t.args, ...(t.comment ? { comment: t.comment } : {}), indent };
 }
 
-/** Split arguments on whitespace, honoring double quotes (quotes removed). */
+/** Split arguments like OpenSSH (quotes removed, trailing comment dropped). */
 export function splitArgs(value: string): string[] {
-	const out: string[] = [];
-	const re = /"([^"]*)"|(\S+)/g;
-	let m: RegExpExecArray | null;
-	while ((m = re.exec(value))) out.push(m[1] ?? m[2]);
-	return out;
+	return tokenize(value).args;
 }
 
 /** A value with one pair of surrounding double quotes removed. */
 export function unquote(value: string): string {
 	const v = value.trim();
 	return v.length >= 2 && v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1) : v;
+}
+
+/** First argument of a directive as OpenSSH reads it (e.g. the path of IdentityFile). */
+export function firstArg(line: Line): string {
+	return line.args?.[0] ?? "";
 }
 
 export function parseConfig(text: string): Block[] {
@@ -64,7 +117,7 @@ export function parseConfig(text: string): Block[] {
 		if (line.key === "host" || line.key === "match") {
 			blocks.push({
 				kind: line.key,
-				patterns: line.key === "host" ? splitArgs(line.value ?? "") : [],
+				patterns: line.key === "host" ? [...(line.args ?? [])] : [],
 				lines: [line],
 			});
 		} else {
@@ -101,7 +154,7 @@ function options(block: Block): Record<string, string[]> {
 	const out: Record<string, string[]> = {};
 	for (const l of block.lines.slice(block.kind === "preamble" ? 0 : 1)) {
 		if (!l.key) continue;
-		(out[l.key] ??= []).push(unquote(l.value ?? ""));
+		(out[l.key] ??= []).push((l.args ?? []).join(" "));
 	}
 	return out;
 }
@@ -265,8 +318,9 @@ export function removeHost(blocks: Block[], name: string): boolean {
 		}
 		const head = b.lines[0];
 		const eol = /\r?\n$/.exec(head.raw)?.[0] ?? "";
-		const quoted = rest.map((p) => (/\s/.test(p) ? `"${p}"` : p));
-		b.lines[0] = parseLine(`${head.indent}${head.keyRaw ?? "Host"} ${quoted.join(" ")}${eol}`);
+		const quoted = rest.map((p) => (/[\s#'"\\]/.test(p) ? `"${p.replace(/(["\\])/g, "\\$1")}"` : p));
+		const comment = head.comment ? ` ${head.comment}` : "";
+		b.lines[0] = parseLine(`${head.indent}${head.keyRaw ?? "Host"} ${quoted.join(" ")}${comment}${eol}`);
 		b.patterns = rest;
 	}
 	return found;
@@ -275,7 +329,7 @@ export function removeHost(blocks: Block[], name: string): boolean {
 /** Distinct IdentityFile values (unquoted, as written). */
 export function identityPaths(blocks: Block[]): string[] {
 	const out = new Set<string>();
-	for (const b of blocks) for (const l of b.lines) if (l.key === "identityfile") out.add(unquote(l.value ?? ""));
+	for (const b of blocks) for (const l of b.lines) if (l.key === "identityfile") out.add(firstArg(l));
 	return [...out].filter(Boolean);
 }
 
@@ -344,7 +398,7 @@ export function generateConfig(sourceText: string, opts: GenerateOptions): Gener
 				disabled.push(text.trim());
 				out.push(parseLine(`${l.indent}${DISABLED}${text.trimStart()}${lineEol}`));
 			};
-			const value = unquote(l.value ?? "");
+			const value = firstArg(l);
 			if (l.key === "identityfile") {
 				const pub = opts.mapIdentity(value);
 				if (pub) {
@@ -364,7 +418,7 @@ export function generateConfig(sourceText: string, opts: GenerateOptions): Gener
 				const v = value;
 				if (v === "none" || v === "SSH_AUTH_SOCK" || v.startsWith("$") || opts.pathExists(v)) out.push(l);
 				else disable();
-			} else if (l.key === "include" && /pi-bitwarden/.test(l.value ?? "")) {
+			} else if (l.key === "include" && (l.args ?? []).some((a) => /pi-bitwarden/.test(a))) {
 				disable();
 			} else {
 				out.push(l);
