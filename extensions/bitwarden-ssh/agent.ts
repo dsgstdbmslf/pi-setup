@@ -3,6 +3,7 @@
 
 import { lstatSync, unlinkSync } from "node:fs";
 import { failure, run } from "./exec.ts";
+import { type LockOptions, withFileLock } from "./lock.ts";
 
 export interface LoadedKey {
 	fingerprint: string;
@@ -29,32 +30,41 @@ export interface EnsureResult {
 	pid?: number;
 }
 
-/** Reuse a live agent at `sock` or start one there (`ssh-agent -a sock`, it daemonizes itself). */
-export async function ensureAgent(sock: string): Promise<EnsureResult> {
+/**
+ * Reuse a live agent at `sock` or start one there (`ssh-agent -a sock`, it daemonizes itself). Startup is
+ * serialized across pi processes with the lock file `<sock>.lock`: the probe is repeated under the lock, and
+ * the socket is only unlinked when that probe still cannot connect, so a concurrent pi that just started the
+ * agent (and maybe loaded keys) never loses its socket.
+ */
+export async function ensureAgent(sock: string, lockOpts: LockOptions = {}): Promise<EnsureResult> {
 	const first = await probe(sock);
 	if (first === null) throw new Error("ssh-add not found (install OpenSSH client)");
 	if (first === 0 || first === 1) return { sock, started: false };
-	// Stale socket from a dead agent: remove it (only if it really is a socket).
-	try {
-		const st = lstatSync(sock);
-		if (st.isSocket()) unlinkSync(sock);
-		else throw new Error(`${sock} exists and is not a socket`);
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-	}
-	const r = await run("ssh-agent", ["-a", sock, "-s"], { timeoutMs: 15_000 });
-	const again = await probe(sock);
-	if (again === 0 || again === 1) {
-		const pid = Number(/SSH_AGENT_PID=(\d+)/.exec(r.stdout)?.[1]);
-		return { sock, started: r.code === 0, pid: Number.isFinite(pid) ? pid : undefined };
-	}
-	// Another pi may have won a race ("Address already in use"): give it a moment.
-	if (/already in use/i.test(r.stderr)) {
-		await new Promise((res) => setTimeout(res, 300));
-		const third = await probe(sock);
-		if (third === 0 || third === 1) return { sock, started: false };
-	}
-	throw new Error(failure(r, "ssh-agent"));
+	return withFileLock(
+		`${sock}.lock`,
+		async () => {
+			const again = await probe(sock);
+			if (again === null) throw new Error("ssh-add not found (install OpenSSH client)");
+			if (again === 0 || again === 1) return { sock, started: false };
+			if (again !== 2) throw new Error(`ssh-add -l exit ${again} for ${sock}`);
+			// Stale socket from a dead agent: remove it (only if it really is a socket).
+			try {
+				const st = lstatSync(sock);
+				if (st.isSocket()) unlinkSync(sock);
+				else throw new Error(`${sock} exists and is not a socket`);
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			}
+			const r = await run("ssh-agent", ["-a", sock, "-s"], { timeoutMs: 15_000 });
+			const third = await probe(sock);
+			if (third === 0 || third === 1) {
+				const pid = Number(/SSH_AGENT_PID=(\d+)/.exec(r.stdout)?.[1]);
+				return { sock, started: r.code === 0, pid: Number.isFinite(pid) ? pid : undefined };
+			}
+			throw new Error(failure(r, "ssh-agent"));
+		},
+		lockOpts,
+	);
 }
 
 /** Parse `ssh-add -l -E sha256` output. */
