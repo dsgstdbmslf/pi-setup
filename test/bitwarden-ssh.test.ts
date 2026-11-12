@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyPrompt, parseCmdline } from "../extensions/bitwarden-ssh/askpass.ts";
+import { classifyPrompt, describeRequester, descendsFrom, parseCmdline } from "../extensions/bitwarden-ssh/askpass.ts";
 import { parseList } from "../extensions/bitwarden-ssh/agent.ts";
 import { fingerprintOf } from "../extensions/bitwarden-ssh/keyutil.ts";
 import { resolvePaths } from "../extensions/bitwarden-ssh/paths.ts";
@@ -18,7 +18,11 @@ import {
 	removeHost,
 	serializeConfig,
 	setHostOptions,
+	tokenize,
 } from "../extensions/bitwarden-ssh/sshconfig.ts";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { footerText, formatDuration, hostsInCommand, lineDiff, mentionsNetworkCommand } from "../extensions/bitwarden-ssh/ui-text.ts";
 
 const SAMPLE = `# global
@@ -222,9 +226,61 @@ test("classifyPrompt and requester parsing", () => {
 	assert.equal(classifyPrompt("Enter passphrase for key '(stdin)': ", false), "secret");
 	assert.equal(classifyPrompt("[sudo] password for orca: ", false), "secret");
 	const r = parseCmdline("/usr/bin/ssh\0-T\0host\0");
-	assert.deepEqual(r, { cmdline: "/usr/bin/ssh -T host", program: "ssh", known: true });
-	assert.equal(parseCmdline("/tmp/evil\0").known, false);
+	// No "known"/trusted flag: the claimed requester is only a hint and never suppresses the warning.
+	assert.deepEqual(r, { cmdline: "/usr/bin/ssh -T host", program: "ssh" });
 	assert.equal(parseCmdline(`x\0${"a".repeat(300)}`).cmdline.length, 200);
+});
+
+test("requester parent chain from /proc (hint only)", () => {
+	const proc = mkdtempSync(join(tmpdir(), "pi-bw-proc-"));
+	try {
+		const fake = (pid: number, ppid: number, comm: string, cmdline: string) => {
+			mkdirSync(join(proc, String(pid)));
+			writeFileSync(join(proc, String(pid), "stat"), `${pid} (${comm}) S ${ppid} 1 1 0 -1`);
+			writeFileSync(join(proc, String(pid), "cmdline"), cmdline);
+		};
+		fake(100, 1, "pi", "pi\0");
+		fake(200, 100, "ba sh)", "bash\0");
+		fake(300, 200, "ssh", "/usr/bin/ssh\0host\0");
+		fake(400, 1, "ssh", "/usr/bin/ssh\0forged\0"); // claims to be ssh, not below pi
+		assert.equal(descendsFrom(300, 100, proc), true);
+		assert.equal(descendsFrom(400, 100, proc), false);
+		assert.equal(descendsFrom(999, 100, proc), undefined);
+		assert.deepEqual(describeRequester(300, proc, 100), { cmdline: "/usr/bin/ssh host", program: "ssh", fromThisPi: true });
+		assert.deepEqual(describeRequester(400, proc, 100), { cmdline: "/usr/bin/ssh forged", program: "ssh", fromThisPi: false });
+		assert.deepEqual(describeRequester(999, proc, 100), { cmdline: "(pid 999)", program: "" });
+	} finally {
+		rmSync(proc, { recursive: true, force: true });
+	}
+});
+
+test("tokenize like OpenSSH: comments, both quote kinds, fragments, escapes", () => {
+	assert.deepEqual(tokenize("target # comment"), { args: ["target"], comment: "# comment" });
+	assert.deepEqual(tokenize("a#b c"), { args: ["a#b", "c"] });
+	assert.deepEqual(tokenize(`"~/.ssh/my key" # this key`), { args: ["~/.ssh/my key"], comment: "# this key" });
+	assert.deepEqual(tokenize(`'~/.ssh/foo'`), { args: ["~/.ssh/foo"] });
+	assert.deepEqual(tokenize(`a"b c"d 'e "f'`), { args: ["ab cd", `e "f`] });
+	assert.deepEqual(tokenize(`"#not comment" x`), { args: ["#not comment", "x"] });
+	assert.deepEqual(tokenize(String.raw`a\ b \"c`), { args: ["a b", `"c`] });
+	assert.equal(tokenize(`"open`).unterminated, true);
+});
+
+test("comments and single quotes in directives: patterns, identities, removeHost", () => {
+	const text = "Host target other # comment\n IdentityFile ~/.ssh/foo # this key\nHost q\n IdentityFile '~/.ssh/bar'\n IdentityFile \"~/.ssh/baz\" # c\n";
+	const blocks = parseConfig(text);
+	assert.equal(serializeConfig(blocks), text);
+	assert.deepEqual(hostNames(blocks), ["target", "other", "q"]);
+	assert.deepEqual(identityPaths(blocks), ["~/.ssh/foo", "~/.ssh/bar", "~/.ssh/baz"]);
+	assert.deepEqual(listHosts(blocks)[0].options.identityfile, ["~/.ssh/foo"]);
+	const gen = generateConfig(text, { mapIdentity: (p) => `/k/${p.split("/").pop()}.pub`, pathExists: () => false, controlPersist: false, cmDir: "/cm", header: "t" });
+	assert.deepEqual(gen.mapped, ["~/.ssh/foo", "~/.ssh/bar", "~/.ssh/baz"]);
+	assert.deepEqual(gen.unmatched, []);
+	// Removing one pattern keeps the comment; removing the last removes the block.
+	assert.equal(removeHost(blocks, "other"), true);
+	assert.match(serializeConfig(blocks), /^Host target # comment\n/);
+	const one = parseConfig("Host target # comment\n User bob\nHost x\n");
+	assert.equal(removeHost(one, "target"), true);
+	assert.equal(serializeConfig(one), "Host x\n");
 });
 
 test("ssh-add -l parsing and fingerprints", () => {

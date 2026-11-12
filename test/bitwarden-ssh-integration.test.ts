@@ -2,17 +2,20 @@
 // the askpass bridge and the bw wrapper against a fake `bw`. Never touches ~/.ssh or the real vault.
 
 import assert from "node:assert/strict";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, fork, spawn, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import { addKey, clearKeys, ensureAgent, listLoaded, removeKey } from "../extensions/bitwarden-ssh/agent.ts";
 import { clientScript, setupAskpassEnv, startAskpassServer, writeClientScript } from "../extensions/bitwarden-ssh/askpass.ts";
 import { Bitwarden, BwError, shared } from "../extensions/bitwarden-ssh/bw.ts";
 import { ensureInclude, keyForPubPath, readSource, regenerate, writeSource } from "../extensions/bitwarden-ssh/config-store.ts";
 import { fingerprintOf } from "../extensions/bitwarden-ssh/keyutil.ts";
+import { withFileLock } from "../extensions/bitwarden-ssh/lock.ts";
 import { ensureDir, resolvePaths } from "../extensions/bitwarden-ssh/paths.ts";
+import { generateConfig } from "../extensions/bitwarden-ssh/sshconfig.ts";
 import { emptyState, loadState, saveState } from "../extensions/bitwarden-ssh/state.ts";
 
 const root = mkdtempSync(join(tmpdir(), "pi-bw-test-"));
@@ -182,7 +185,7 @@ test("askpass bridge: answer, cancel, confirm, missing socket", async () => {
 		assert.equal(r.status, 0, r.stderr);
 		assert.equal(r.stdout, "s3cret value\n");
 		assert.equal(seen.kind, "secret");
-		assert.equal(seen.requester.known, false); // spawned by node, not by ssh
+		assert.equal(seen.requester.fromThisPi, true); // the client's parent is this test process
 		answer = undefined;
 		r = await runClient("Password: ");
 		assert.equal(r.status, 1);
@@ -316,4 +319,232 @@ esac
 	}
 	const missing = new Bitwarden({ bin: join(dir, "nope") });
 	await assert.rejects(missing.status(), (e: any) => e.kind === "missing");
+});
+
+test("ensureInclude: a host-scoped Include does not count; quoted path with spaces is found", { skip: !has("ssh") }, () => {
+	const p = tempPaths("include-scoped");
+	mkdirSync(join(p.home, ".ssh", "pi-bitwarden"), { recursive: true });
+	writeFileSync(p.generatedFile, "Host target\n    HostName example.com\n");
+	const manual = `Host only-this\n    Include ${p.generatedFile}\n`;
+	writeFileSync(p.userConfig, manual);
+	assert.equal(ensureInclude(p.userConfig, p.generatedFile), "added");
+	assert.equal(readFileSync(p.userConfig, "utf8"), `# Added by pi bitwarden-ssh\nInclude ${p.generatedFile}\n\n${manual}`);
+	assert.equal(ensureInclude(p.userConfig, p.generatedFile), "present");
+	const g = spawnSync("ssh", ["-G", "-F", p.userConfig, "target"], { encoding: "utf8", input: "" });
+	assert.equal(g.status, 0, g.stderr);
+	assert.match(g.stdout, /^hostname example\.com$/m);
+
+	// A path with a space: written quoted, recognized on later runs (no duplicates).
+	const spaced = join(root, "with space", "home");
+	mkdirSync(join(spaced, ".ssh"), { recursive: true });
+	const gen = join(spaced, ".ssh", "pi-bitwarden", "config");
+	const user = join(spaced, ".ssh", "config");
+	writeFileSync(user, "Host mine\n    User me\n");
+	assert.equal(ensureInclude(user, gen), "added");
+	assert.equal(ensureInclude(user, gen), "present");
+	assert.equal(ensureInclude(user, gen), "present");
+	assert.equal(readFileSync(user, "utf8").match(/^Include /gm)?.length, 1);
+	assert.match(readFileSync(user, "utf8"), new RegExp(`^Include "${gen}"$`, "m"));
+	// Single-quoted and relative forms count as present too.
+	writeFileSync(user, `Include '${gen}'\n`);
+	assert.equal(ensureInclude(user, gen), "present");
+	writeFileSync(user, "Include pi-bitwarden/config # managed\n");
+	assert.equal(ensureInclude(user, gen), "present");
+});
+
+test("generated config with comments and single quotes matches ssh -G", { skip: !has("ssh") }, () => {
+	const dir = mkdtempSync(join(root, "sshg-"));
+	const cases = [
+		"Host target # comment\n IdentityFile ~/.ssh/foo # this key\n",
+		'Host target\n IdentityFile "~/.ssh/foo" # this key\n',
+		"Host target\n IdentityFile '~/.ssh/foo'\n",
+	];
+	for (const [i, source] of cases.entries()) {
+		const gen = generateConfig(source, {
+			mapIdentity: (p) => (p === "~/.ssh/foo" ? "/tmp/foo.pub" : undefined),
+			pathExists: () => false,
+			controlPersist: false,
+			cmDir: join(dir, "cm"),
+			header: "t",
+		});
+		assert.deepEqual(gen.mapped, ["~/.ssh/foo"], source);
+		const src = join(dir, `src-${i}`);
+		const out = join(dir, `gen-${i}`);
+		writeFileSync(src, source);
+		writeFileSync(out, gen.text);
+		const a = spawnSync("ssh", ["-G", "-F", src, "target"], { encoding: "utf8", input: "" });
+		const b = spawnSync("ssh", ["-G", "-F", out, "target"], { encoding: "utf8", input: "" });
+		assert.equal(a.status, 0, a.stderr);
+		assert.equal(b.status, 0, b.stderr);
+		assert.match(a.stdout, /^identityfile ~\/\.ssh\/foo$/m); // what ssh reads from the source
+		assert.match(b.stdout, /^identityfile \/tmp\/foo\.pub$/m);
+		assert.match(b.stdout, /^identitiesonly yes$/m);
+	}
+});
+
+test("file lock: serializes holders, breaks a lock of a dead pid or a stale one", async () => {
+	const dir = mkdtempSync(join(root, "lock-"));
+	const lock = join(dir, "x.lock");
+	const order: string[] = [];
+	const hold = (name: string, ms: number) =>
+		withFileLock(lock, async () => {
+			order.push(`${name}+`);
+			await new Promise((r) => setTimeout(r, ms));
+			order.push(`${name}-`);
+		});
+	await Promise.all([hold("a", 100), hold("b", 10)]);
+	assert.deepEqual(order, ["a+", "a-", "b+", "b-"]);
+	assert.equal(existsSync(lock), false);
+	// Dead holder: broken at once.
+	const dead = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout;
+	writeFileSync(lock, `${dead} tok\n`);
+	const t0 = Date.now();
+	assert.equal(await withFileLock(lock, () => 1), 1);
+	assert.ok(Date.now() - t0 < 2000);
+	// Live pid but not refreshed for longer than staleMs: broken.
+	writeFileSync(lock, `${process.ppid} tok\n`);
+	const old = new Date(Date.now() - 60_000);
+	utimesSync(lock, old, old);
+	assert.equal(await withFileLock(lock, () => 2, { staleMs: 10_000 }), 2);
+	// Live and fresh: waits, then times out.
+	writeFileSync(lock, `${process.ppid} tok\n`);
+	await assert.rejects(withFileLock(lock, () => 3, { timeoutMs: 200 }), /timed out waiting for the lock/);
+	rmSync(lock);
+});
+
+test("ensureAgent: concurrent startup from two processes keeps one live agent", { skip: !has("ssh-agent") || !has("ssh-keygen") }, async () => {
+	// Replays the review race: A's first probe fails after B probed, B's first probe fails after A started the
+	// agent and loaded a key. Without the lock B unlinked A's socket and started an empty second agent.
+	const dir = mkdtempSync("/tmp/pi-bw-race-");
+	const realSshAdd = spawnSync("sh", ["-c", "command -v ssh-add"], { encoding: "utf8" }).stdout.trim();
+	writeFileSync(
+		join(dir, "ssh-add"),
+		`#!/bin/sh
+if [ ! -e "$RACE_DIR/$RACE_ROLE-probed" ]; then
+ touch "$RACE_DIR/$RACE_ROLE-probed"
+ if [ "$RACE_ROLE" = A ]; then while [ ! -e "$RACE_DIR/B-probed" ]; do sleep 0.01; done
+ else while [ ! -e "$RACE_DIR/A-added" ]; do sleep 0.01; done; fi
+ exit 2
+fi
+exec ${realSshAdd} "$@"
+`,
+		{ mode: 0o700 },
+	);
+	execFileSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", join(dir, "key")]);
+	const agentTs = join(dirname(fileURLToPath(import.meta.url)), "..", "extensions", "bitwarden-ssh", "agent.ts");
+	const child = join(dir, "child.mjs");
+	writeFileSync(
+		child,
+		`import { readFileSync, writeFileSync } from "node:fs";
+import { addKey, ensureAgent, listLoaded } from ${JSON.stringify(agentTs)};
+const d = process.env.RACE_DIR;
+const r = await ensureAgent(d + "/agent.sock");
+if (process.env.RACE_ROLE === "A") { await addKey(d + "/agent.sock", readFileSync(d + "/key", "utf8"), "60s"); writeFileSync(d + "/A-added", ""); }
+const keys = (await listLoaded(d + "/agent.sock")).length;
+writeFileSync(d + "/" + process.env.RACE_ROLE + ".json", JSON.stringify({ ...r, keys }));
+`,
+	);
+	const pids: number[] = [];
+	try {
+		const run = (role: string) =>
+			new Promise<number | null>((res) => {
+				const c = fork(child, [], { env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, RACE_DIR: dir, RACE_ROLE: role }, execArgv: ["--no-warnings"], stdio: "inherit" });
+				c.on("exit", res);
+			});
+		const codes = await Promise.all([run("A"), run("B")]);
+		assert.deepEqual(codes, [0, 0]);
+		const a = JSON.parse(readFileSync(join(dir, "A.json"), "utf8"));
+		const b = JSON.parse(readFileSync(join(dir, "B.json"), "utf8"));
+		if (a.pid) pids.push(a.pid);
+		if (b.pid) pids.push(b.pid);
+		assert.equal(a.started, true);
+		assert.equal(b.started, false, "B reuses A's agent instead of replacing its socket");
+		assert.equal(b.keys, 1, "B sees the key A loaded");
+		assert.equal(existsSync(join(dir, "agent.sock.lock")), false);
+	} finally {
+		for (const pid of pids) {
+			try {
+				process.kill(pid);
+			} catch {}
+		}
+		spawnSync("pkill", ["-f", join(dir, "agent.sock")]);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("askpass server: close destroys accepted clients and aborts handlers; deadline and size limits", async () => {
+	const dir = mkdtempSync("/tmp/pi-bw-ask-");
+	const sockPath = join(dir, "a.sock");
+	let signal: AbortSignal | undefined;
+	const server = await startAskpassServer(
+		sockPath,
+		() => (_req, s) => {
+			signal = s;
+			return new Promise(() => {});
+		},
+		{ deadlineMs: 200 },
+	);
+	const net = await import("node:net");
+	const connect = async () => {
+		const c = net.createConnection(sockPath);
+		c.on("error", () => {});
+		await new Promise((r) => c.on("connect", r));
+		return c;
+	};
+	const closed = (c: import("node:net").Socket) => new Promise<void>((r) => (c.destroyed ? r() : c.on("close", () => r())));
+	try {
+		// A client that never sends its request line is dropped after the deadline.
+		const idle = await connect();
+		const t0 = Date.now();
+		await closed(idle);
+		assert.ok(Date.now() - t0 < 2000);
+		// An over-long request line is refused.
+		const big = await connect();
+		big.write("x".repeat(20 * 1024));
+		await closed(big);
+		// close() with an active request: client destroyed, handler aborted.
+		const active = await connect();
+		active.write('{"prompt":"p","ppid":1}\n');
+		for (let i = 0; i < 100 && !signal; i++) await new Promise((r) => setTimeout(r, 10));
+		assert.ok(signal && !signal.aborted);
+		server.close();
+		await Promise.race([closed(active), new Promise((_, rej) => setTimeout(() => rej(new Error("client not destroyed")), 2000))]);
+		assert.equal(signal!.aborted, true);
+	} finally {
+		server.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("askpass: a forged requester pid is described, but only as a claim", async () => {
+	const dir = mkdtempSync("/tmp/pi-bw-ask-");
+	const sockPath = join(dir, "a.sock");
+	// A process that only pretends to be ssh, not started below this "pi" (the test process).
+	const fakeSsh = spawn("bash", ["-c", "exec -a /usr/bin/ssh sleep 30"], { stdio: "ignore" });
+	await new Promise((r) => setTimeout(r, 100));
+	let seen: any;
+	const server = await startAskpassServer(sockPath, () => async (req) => {
+		seen = req;
+		return undefined;
+	});
+	try {
+		const net = await import("node:net");
+		const c = net.createConnection(sockPath).resume();
+		await new Promise((r) => c.on("connect", r));
+		c.write(`${JSON.stringify({ prompt: "Enter passphrase", ppid: 1 })}\n`);
+		await new Promise((r) => c.on("close", r));
+		assert.equal(seen.requester.fromThisPi, false);
+		assert.equal("known" in seen.requester, false);
+		const c2 = net.createConnection(sockPath).resume();
+		await new Promise((r) => c2.on("connect", r));
+		c2.write(`${JSON.stringify({ prompt: "Enter passphrase", ppid: fakeSsh.pid })}\n`);
+		await new Promise((r) => c2.on("close", r));
+		assert.match(seen.requester.cmdline, /^\/usr\/bin\/ssh 30$/);
+		assert.equal(seen.requester.program, "ssh");
+		assert.equal(seen.requester.fromThisPi, true); // spawned by this process: a hint, nothing more
+	} finally {
+		fakeSsh.kill();
+		server.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
 });

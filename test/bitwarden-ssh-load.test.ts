@@ -3,10 +3,13 @@
 // skipped. Never touches the real ~/.ssh, ~/.pi or the real vault.
 
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, fork, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+
+const EXTENSION = join(dirname(fileURLToPath(import.meta.url)), "..", "extensions", "bitwarden-ssh.ts");
 
 function resolves(spec: string): boolean {
 	try {
@@ -230,6 +233,215 @@ test("extension end to end with a fake pi and a fake bw", { skip: (!available &&
 		spawnSync("pkill", ["-f", sock]);
 		for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
 		Object.assign(process.env, saved);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+/** A fresh extension instance with a fake pi in a temp HOME (fake bw with an empty, locked vault). */
+async function setup(dir: string, mode: "tui" | "rpc") {
+	const home = join(dir, "home");
+	const binDir = join(dir, "fakebin");
+	mkdirSync(home, { recursive: true });
+	mkdirSync(binDir, { recursive: true });
+	const db = join(dir, "db.json");
+	writeFileSync(db, JSON.stringify({ items: [] }));
+	writeFileSync(join(binDir, "bw"), FAKE_BW(db), { mode: 0o755 });
+	process.env.HOME = home;
+	process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
+	process.env.PATH = `${binDir}:${process.env.PATH}`;
+	delete process.env.BW_SESSION;
+	const commands = new Map<string, any>();
+	const tools = new Map<string, any>();
+	const handlers = new Map<string, any[]>();
+	const pi: any = {
+		registerCommand: (name: string, def: any) => commands.set(name, def),
+		registerTool: (t: any) => tools.set(t.name, t),
+		on: (e: string, h: any) => handlers.set(e, [...(handlers.get(e) ?? []), h]),
+		getSettings: () => ({}),
+	};
+	const log = { notes: [] as string[], confirms: [] as string[], inputs: [] as string[], customs: [] as any[] };
+	const ctx: any = {
+		hasUI: true,
+		mode,
+		cwd: dir,
+		ui: {
+			notify: (m: string) => log.notes.push(m),
+			setStatus: () => {},
+			confirm: async (title: string, body: string) => {
+				log.confirms.push(`${title}\n${body}`);
+				return false;
+			},
+			select: async () => undefined,
+			input: async (title: string) => {
+				log.inputs.push(title);
+				return "typed-in-plain-input";
+			},
+			editor: async () => undefined,
+			// Like pi: the factory gets done(); the promise only resolves through done().
+			custom: (factory: any) =>
+				new Promise((resolve) => {
+					const component = factory({ requestRender() {} }, { fg: (_c: string, t: string) => t, bold: (t: string) => t, inverse: (t: string) => t }, { matches: () => false }, resolve);
+					log.customs.push(component);
+				}),
+		},
+	};
+	const mod: any = await import(EXTENSION);
+	mod.default(pi);
+	const fire = async (e: string, ev: any) => {
+		for (const h of handlers.get(e) ?? []) await h(ev, ctx);
+	};
+	return { commands, tools, fire, ctx, log, sock: join(home, ".pi", "agent", "bitwarden-ssh", "run", "ssh-agent.sock") };
+}
+
+const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms));
+const G = () => (globalThis as any)[Symbol.for("pi.bitwarden-ssh")];
+
+test("dialogs: dispose settles a secret dialog, the queued one runs; session end cancels and clears askpass", { skip: (!available && "pi packages not installed") || (!has("ssh-agent") && "no OpenSSH") }, async () => {
+	const dir = mkdtempSync("/tmp/pi-bw-dlg-");
+	const saved = { ...process.env };
+	let sock = "";
+	try {
+		const x = await setup(dir, "tui");
+		sock = x.sock;
+		await x.fire("session_start", { reason: "startup" });
+		const notified = (n: number) => x.log.notes.length >= n;
+		const unlock = () => x.commands.get("bw").handler("unlock", x.ctx);
+		const first = unlock();
+		for (let i = 0; i < 100 && x.log.customs.length < 1; i++) await tick();
+		assert.equal(x.log.customs.length, 1, "first master password dialog open");
+		const second = unlock();
+		await tick(100);
+		assert.equal(x.log.customs.length, 1, "second dialog waits for the UI lock");
+		// pi disposes dialogs on /reload without calling done(): the promise must still settle.
+		x.log.customs[0].dispose();
+		await first;
+		assert.ok(x.log.notes.some((n) => /still locked/.test(n)));
+		for (let i = 0; i < 100 && x.log.customs.length < 2; i++) await tick();
+		assert.equal(x.log.customs.length, 2, "queued dialog runs after the disposed one");
+
+		// Askpass dialogs say the requester is unverified and always warn.
+		const handler = G().handler;
+		assert.ok(handler);
+		const ac = new AbortController();
+		const confirmed = handler({ prompt: "Allow use of key?", kind: "confirm", requester: { cmdline: "/usr/bin/ssh host", program: "ssh", fromThisPi: false } }, ac.signal);
+		// Session shutdown (reload) cancels the open secret dialog and the queued askpass dialog.
+		await x.fire("session_shutdown", { reason: "reload" });
+		await Promise.race([Promise.all([second, confirmed]), tick(2000).then(() => assert.fail("dialogs not cancelled by session_shutdown"))]);
+		assert.equal(await confirmed, undefined);
+		assert.equal(G().handler, undefined, "askpass handler cleared on every shutdown");
+		// The askpass server stays (process-wide) but answers "not ok" right away without a session.
+		const net = await import("node:net");
+		const c = net.createConnection(process.env.PI_BW_ASKPASS_SOCK!);
+		let reply = "";
+		c.on("data", (d) => (reply += d));
+		await new Promise((r) => c.on("connect", r));
+		c.write('{"prompt":"Password:","ppid":1}\n');
+		await Promise.race([new Promise((r) => c.on("close", r)), tick(2000)]);
+		assert.equal(reply.trim(), '{"ok":false}');
+
+		// A new session installs a fresh handler; its confirm text marks the requester unverified.
+		await x.fire("session_start", { reason: "reload" });
+		const h2 = G().handler;
+		assert.ok(h2 && h2 !== handler);
+		await h2({ prompt: "Allow use of key?", kind: "confirm", requester: { cmdline: "/usr/bin/ssh host", program: "ssh", fromThisPi: false } }, new AbortController().signal);
+		const body = x.log.confirms.pop()!;
+		assert.match(body, /Requested by \(unverified\): \/usr\/bin\/ssh host/);
+		assert.match(body, /not started from this pi session/);
+		assert.match(body, /the program that asked will receive what you type/);
+		await h2({ prompt: "Allow?", kind: "confirm", requester: { cmdline: "/usr/bin/ssh host", program: "ssh", fromThisPi: true } }, new AbortController().signal);
+		const body2 = x.log.confirms.pop()!;
+		assert.match(body2, /the program that asked will receive what you type/, "warning even for a plausible ssh");
+		assert.doesNotMatch(body2, /not started from this pi session/);
+		await x.fire("session_shutdown", { reason: "quit" });
+		void notified;
+	} finally {
+		if (sock) spawnSync("pkill", ["-f", sock]);
+		for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+		Object.assign(process.env, saved);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("RPC mode: secret input fails closed (no unmasked input)", { skip: (!available && "pi packages not installed") || (!has("ssh-agent") && "no OpenSSH") }, async () => {
+	const dir = mkdtempSync("/tmp/pi-bw-rpc-");
+	const saved = { ...process.env };
+	let sock = "";
+	try {
+		const x = await setup(dir, "rpc");
+		sock = x.sock;
+		await x.fire("session_start", { reason: "startup" });
+		await x.commands.get("bw").handler("unlock", x.ctx);
+		assert.match(x.log.notes.join("\n"), /secret input needs the interactive TUI/);
+		await x.commands.get("bw").handler("login", x.ctx);
+		assert.match(x.log.notes.join("\n"), /secret input needs the interactive TUI/);
+		x.ctx.ui.confirm = async () => true;
+		const r = await x.tools.get("ssh_keys").execute("id", { action: "load", name: "k" }, undefined, undefined, x.ctx);
+		assert.equal(r.isError, true);
+		assert.match(r.content[0].text, /secret input needs the interactive TUI/);
+		const ans = await G().handler({ prompt: "Password:", kind: "secret", requester: { cmdline: "sudo -A ls", program: "sudo" } }, new AbortController().signal);
+		assert.equal(ans, undefined);
+		assert.match(x.log.notes.join("\n"), /askpass prompt "Password:" cancelled: secret input needs the interactive TUI/);
+		// Visible prompts still use the normal input.
+		const user = await G().handler({ prompt: "Username for 'https://x': ", kind: "visible", requester: { cmdline: "git", program: "git" } }, new AbortController().signal);
+		assert.equal(user, "typed-in-plain-input");
+		assert.equal(x.log.inputs.length, 1, "no secret went through ctx.ui.input");
+		assert.equal(x.log.customs.length, 0);
+		await x.fire("session_shutdown", { reason: "quit" });
+	} finally {
+		if (sock) spawnSync("pkill", ["-f", sock]);
+		for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+		Object.assign(process.env, saved);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("two pi processes editing the source config: no lost update", { skip: !available && "pi packages not installed" }, async () => {
+	// Replays the review race: A waits at its confirmation, B confirms and writes, then A confirms.
+	const dir = mkdtempSync("/tmp/pi-bw-writers-");
+	mkdirSync(join(dir, "home"), { recursive: true });
+	mkdirSync(join(dir, "agent", "bitwarden-ssh"), { recursive: true });
+	const source = join(dir, "agent", "bitwarden-ssh", "config");
+	writeFileSync(source, "Host a\n HostName a.invalid\nHost b\n HostName b.invalid\n");
+	const child = join(dir, "writer.mjs");
+	writeFileSync(
+		child,
+		`import { existsSync, writeFileSync } from "node:fs";
+const d = process.env.WRITER_DIR;
+process.env.HOME = d + "/home";
+process.env.PI_CODING_AGENT_DIR = d + "/agent";
+const extension = (await import(${JSON.stringify(EXTENSION)})).default;
+const tools = {};
+extension({ registerTool: (t) => (tools[t.name] = t), registerCommand() {}, on() {} });
+const role = process.env.WRITER_ROLE;
+const ctx = { hasUI: true, mode: "tui", ui: { notify() {}, setStatus() {}, select: async () => undefined, confirm: async () => {
+	if (role === "A") { writeFileSync(d + "/A-confirm", ""); while (!existsSync(d + "/A-release")) await new Promise((r) => setTimeout(r, 10)); }
+	return true;
+} } };
+const params = role === "A" ? { action: "update", host: "a", options: { User: "alice" } } : { action: "update", host: "b", options: { Port: "2222" } };
+const r = await tools.ssh_config.execute("id", params, undefined, undefined, ctx);
+writeFileSync(d + "/" + role + ".json", JSON.stringify({ isError: !!r.isError, text: r.content[0].text }));
+`,
+	);
+	const launch = (role: string) => {
+		const c = fork(child, [], { env: { ...process.env, WRITER_DIR: dir, WRITER_ROLE: role }, execArgv: ["--no-warnings"], stdio: "inherit" });
+		return new Promise<number | null>((r) => c.on("exit", r));
+	};
+	try {
+		const a = launch("A");
+		for (let i = 0; i < 500 && !existsSync(join(dir, "A-confirm")); i++) await tick();
+		assert.equal(await launch("B"), 0);
+		writeFileSync(join(dir, "A-release"), "");
+		assert.equal(await a, 0);
+		const ra = JSON.parse(readFileSync(join(dir, "A.json"), "utf8"));
+		const rb = JSON.parse(readFileSync(join(dir, "B.json"), "utf8"));
+		assert.equal(rb.isError, false, rb.text);
+		assert.equal(ra.isError, true, "A's stale edit is rejected");
+		assert.match(ra.text, /changed in another pi session; retry/);
+		const final = readFileSync(source, "utf8");
+		assert.match(final, /Port 2222/, "B's confirmed edit survives");
+		assert.doesNotMatch(final, /User alice/);
+		assert.equal(existsSync(join(dir, "agent", "bitwarden-ssh", "config.lock")), false);
+	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
