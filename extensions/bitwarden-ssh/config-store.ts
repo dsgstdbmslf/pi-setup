@@ -2,7 +2,22 @@
 // files and the Include line in ~/.ssh/config. All paths come from Paths, so tests run in temp dirs.
 
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	constants,
+	existsSync,
+	fstatSync,
+	lstatSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	readSync,
+	realpathSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { ensureDir, type Paths } from "./paths.ts";
 import { type GenerateResult, generateConfig, hostNames, parseConfig } from "./sshconfig.ts";
@@ -67,11 +82,33 @@ export function keyForPubPath(paths: Paths, state: State, path: string): CachedK
 	if (byId) return byId;
 	const byName = state.keys.find((k) => pubPath(paths, k, state.keys) === path);
 	if (byName || !own || state.published) return byName;
-	let text: string | undefined;
-	try {
-		text = readIfExists(path)?.trim();
-	} catch {}
+	const text = readLegacyPub(paths.keysDir, path)?.trim();
 	return text ? state.keys.find((k) => k.publicKey.trim() === text) : undefined;
+}
+
+const LEGACY_PUB_MAX = 16 * 1024;
+
+/**
+ * Reads a legacy .pub file directly inside keysDir, or undefined: only a regular file owned by us, at most
+ * 16 KiB, opened without following a final symlink and without blocking (FIFOs, devices), in a keys dir that
+ * is a real directory (not a symlink). Never throws.
+ */
+function readLegacyPub(keysDir: string, path: string): string | undefined {
+	let fd: number | undefined;
+	try {
+		if (!lstatSync(keysDir).isDirectory()) return undefined;
+		fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		const st = fstatSync(fd);
+		if (!st.isFile() || st.uid !== process.getuid?.() || st.size > LEGACY_PUB_MAX) return undefined;
+		const buf = Buffer.alloc(LEGACY_PUB_MAX + 1);
+		let len = 0;
+		for (let n: number; len < buf.length && (n = readSync(fd, buf, len, buf.length - len, null)) > 0; ) len += n;
+		return len > LEGACY_PUB_MAX ? undefined : buf.toString("utf8", 0, len);
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
 }
 
 export const HEADER = (sourceFile: string) =>

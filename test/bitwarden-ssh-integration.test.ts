@@ -270,6 +270,39 @@ test("F1: reverse .pub lookup uses the last published mapping, then names, then 
 	assert.equal(keyForPubPath(p, legacy, join(p.keysDir, "x.pub")), undefined);
 });
 
+test("R5: legacy .pub fallback reads only small regular files inside a real keys dir (no symlink, FIFO, oversize)", () => {
+	const p = tempPaths("r5-legacy");
+	ensureDir(p.keysDir);
+	const k = { id: "aaaaaaaa-r5", name: "K", fingerprint: "", publicKey: "ssh-ed25519 AAAA r5" };
+	const legacy = { ...emptyState(), keys: [k] };
+	// Normal legacy file still matches.
+	writeFileSync(join(p.keysDir, "plain.pub"), `${k.publicKey}\n`);
+	assert.equal(keyForPubPath(p, legacy, join(p.keysDir, "plain.pub"))?.id, k.id);
+	// Symlink to a file outside the keys dir: not followed.
+	writeFileSync(join(p.home, "outside.pub"), `${k.publicKey}\n`);
+	symlinkSync(join(p.home, "outside.pub"), join(p.keysDir, "link.pub"));
+	assert.equal(keyForPubPath(p, legacy, join(p.keysDir, "link.pub")), undefined);
+	// Oversized file (key padded past 16 KiB): ignored.
+	writeFileSync(join(p.keysDir, "big.pub"), `${k.publicKey}${" ".repeat(17 * 1024)}\n`);
+	assert.equal(keyForPubPath(p, legacy, join(p.keysDir, "big.pub")), undefined);
+	// Keys dir itself a symlink: no legacy read through it.
+	const real = join(p.home, "realkeys");
+	mkdirSync(real);
+	writeFileSync(join(real, "plain.pub"), `${k.publicKey}\n`);
+	const linkedDir = { ...p, keysDir: join(p.home, "keyslink") };
+	symlinkSync(real, linkedDir.keysDir);
+	assert.equal(keyForPubPath(linkedDir, legacy, join(linkedDir.keysDir, "plain.pub")), undefined);
+	// FIFO: returns undefined promptly; run in a child with a timeout so a regression cannot hang the suite.
+	if (!has("mkfifo")) return;
+	const fifo = join(p.keysDir, "fifo.pub");
+	execFileSync("mkfifo", [fifo]);
+	const mod = join(dirname(fileURLToPath(import.meta.url)), "..", "extensions", "bitwarden-ssh", "config-store.ts");
+	const code = `import { keyForPubPath } from ${JSON.stringify(mod)};\nconsole.log(String(keyForPubPath(${JSON.stringify(p)}, ${JSON.stringify(legacy)}, ${JSON.stringify(fifo)})));`;
+	const r = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", timeout: 10_000, killSignal: "SIGKILL" });
+	assert.equal(r.error, undefined, `FIFO lookup hung: ${r.error}`);
+	assert.equal(r.stdout.trim(), "undefined", r.stderr);
+});
+
 test("R2: the generated config never names a .pub file before it exists (commit order)", () => {
 	const { p, built, after } = oldGeneration("r2-order");
 	const seen: string[] = [];
