@@ -3,7 +3,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { ensureDir, type Paths } from "./paths.ts";
 import { type GenerateResult, generateConfig, hostNames, parseConfig } from "./sshconfig.ts";
 import type { CachedKey, State } from "./state.ts";
@@ -54,9 +54,24 @@ export function pubPath(paths: Paths, key: CachedKey, keys: CachedKey[]): string
 	return join(paths.keysDir, pubFileName(key, keys));
 }
 
-/** The cached key whose generated .pub file is `path` (reverse of pubPath). */
+/**
+ * The cached key whose generated .pub file is `path` (reverse of pubPath). The mapping of the last
+ * successfully published generation (`state.published`) wins, so a key renamed in the vault (cache
+ * refreshed, publication refused) still maps the path the live config names. Then the name computed from
+ * the current cache, then (state without `published`, older naming schemes) the public key in that file.
+ */
 export function keyForPubPath(paths: Paths, state: State, path: string): CachedKey | undefined {
-	return state.keys.find((k) => pubPath(paths, k, state.keys) === path);
+	const own = dirname(path) === paths.keysDir;
+	const id = own ? state.published?.[basename(path)] : undefined;
+	const byId = id ? state.keys.find((k) => k.id === id) : undefined;
+	if (byId) return byId;
+	const byName = state.keys.find((k) => pubPath(paths, k, state.keys) === path);
+	if (byName || !own || state.published) return byName;
+	let text: string | undefined;
+	try {
+		text = readIfExists(path)?.trim();
+	} catch {}
+	return text ? state.keys.find((k) => k.publicKey.trim() === text) : undefined;
 }
 
 export const HEADER = (sourceFile: string) =>
@@ -69,6 +84,8 @@ export interface RegenerateResult extends GenerateResult {
 export interface BuiltConfig extends GenerateResult {
 	/** Public key files of mapped keys: path -> content. */
 	pubFiles: Map<string, string>;
+	/** .pub file name -> item id, to store as `state.published` together with this generation. */
+	published: Record<string, string>;
 }
 
 /**
@@ -77,6 +94,7 @@ export interface BuiltConfig extends GenerateResult {
  */
 export function buildGenerated(paths: Paths, state: State, source: string, opts: { controlPersist: string | false }): BuiltConfig {
 	const pubFiles = new Map<string, string>();
+	const published: Record<string, string> = {};
 	const result = generateConfig(source, {
 		mapIdentity: (p) => {
 			const m = state.identityMap[p];
@@ -85,6 +103,7 @@ export function buildGenerated(paths: Paths, state: State, source: string, opts:
 			if (!key?.publicKey) return undefined;
 			const file = pubPath(paths, key, state.keys);
 			pubFiles.set(file, `${key.publicKey.trim()}\n`);
+			published[basename(file)] = key.id;
 			return file;
 		},
 		pathExists: (p) => existsSync(expandHome(p, paths.home)),
@@ -92,7 +111,7 @@ export function buildGenerated(paths: Paths, state: State, source: string, opts:
 		cmDir: paths.cmDir,
 		header: HEADER(paths.sourceFile),
 	});
-	return { ...result, pubFiles };
+	return { ...result, pubFiles, published };
 }
 
 /** A file committed after the generated config is live (source config, state.json), in this order. */
@@ -148,7 +167,9 @@ interface Staged {
  * every target keeps its old content; on a later failure, the files already committed (.pub files,
  * generated config, source) are restored to their previous content, so source, state and generated stay
  * consistent, and the error is thrown. An Include line already added stays (it names the generated file,
- * which ssh ignores if absent). Not crash-safe across a kill in the middle of step 3 (each file is atomic).
+ * which ssh ignores if absent). If restoring the generated config itself fails, the new generated config
+ * stays live, so the .pub files are not rolled back (old and new ones are kept) and the error says so.
+ * Not crash-safe across a kill in the middle of step 3 (each file is atomic).
  */
 export function publishGenerated(paths: Paths, built: BuiltConfig, opts: PublishOptions = {}): PublishResult {
 	const fault = opts.fault ?? (() => {});
@@ -201,12 +222,16 @@ export function publishGenerated(paths: Paths, built: BuiltConfig, opts: Publish
 		}
 	} catch (err) {
 		const failed: string[] = [];
+		let keepPubs = false;
 		for (const s of committed.reverse()) {
+			// The new generated config is still live: keep every .pub file it may name (old ones are kept too).
+			if (keepPubs && built.pubFiles.has(s.file)) continue;
 			try {
 				if (s.prev === undefined) unlinkSync(s.file);
 				else writeFileAtomic(s.file, s.prev, 0o600);
 			} catch {
 				failed.push(s.file);
+				if (s.file === paths.generatedFile) keepPubs = true;
 			}
 		}
 		for (const s of staged) {
@@ -214,7 +239,9 @@ export function publishGenerated(paths: Paths, built: BuiltConfig, opts: Publish
 				unlinkSync(s.tmp);
 			} catch {}
 		}
-		if (failed.length && err instanceof Error) err.message += ` (could not restore ${failed.join(", ")})`;
+		if (failed.length && err instanceof Error) {
+			err.message += ` (rollback incomplete: could not restore ${failed.join(", ")}${keepPubs ? "; the new generated config is still live, its .pub files were kept" : ""})`;
+		}
 		throw err;
 	}
 	// 4. Obsolete .pub files (also names of the previous naming scheme), only now that nothing names them.
@@ -226,7 +253,7 @@ export function publishGenerated(paths: Paths, built: BuiltConfig, opts: Publish
 			} catch {}
 		}
 	}
-	const { pubFiles: _, ...result } = built;
+	const { pubFiles: _, published: __, ...result } = built;
 	return { ...result, generatedFile: paths.generatedFile, ...(opts.include ? { include } : {}) };
 }
 

@@ -20,6 +20,11 @@ export interface State {
 	note?: { id: string; name: string };
 	/** sha256 of the source config at the last pull/push. */
 	syncedHash?: string;
+	/**
+	 * .pub file name -> item id of the last successfully published generation (written with it). The live
+	 * generated config names these files, so reverse lookup uses this first, not names from the key cache.
+	 */
+	published?: Record<string, string>;
 }
 
 export function emptyState(): State {
@@ -50,6 +55,10 @@ export function loadState(file: string): { state: State; warning?: string } {
 			}
 			if (raw.note && typeof raw.note.id === "string") state.note = { id: raw.note.id, name: String(raw.note.name ?? "") };
 			if (typeof raw.syncedHash === "string") state.syncedHash = raw.syncedHash;
+			if (raw.published && typeof raw.published === "object") {
+				state.published = {};
+				for (const [f, id] of Object.entries(raw.published as Record<string, unknown>)) if (typeof id === "string") state.published[f] = id;
+			}
 		}
 		return { state };
 	} catch {

@@ -543,6 +543,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 				if (again) throw new InvalidConfig(`ssh: ${again}`);
 			}
 			// One generation: .pub files, generated config, Include, then source and state.json (state last).
+			st.published = final.published; // the .pub names of this generation, recorded only with it
 			const after = [...(opts.source !== undefined ? [{ file: P().sourceFile, text: source }] : []), { file: P().stateFile, text: stateText(st) }];
 			try {
 				return publishGenerated(P(), final, { include: opts.include, after });

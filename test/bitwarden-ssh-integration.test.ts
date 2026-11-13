@@ -3,7 +3,8 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, fork, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -208,6 +209,65 @@ test("R2: a failure at any publication step keeps or restores the old generation
 	assert.equal(loadState(p.stateFile).state.syncedHash, "new-hash");
 	assert.equal(readSource(p), "Host new\n  IdentityFile ~/.ssh/new\n");
 	assert.deepEqual(readdirSync(p.sshDir).sort(), before.sshDir);
+});
+
+test("F2: if the generated config cannot be restored, rollback keeps the .pub files the live config names", () => {
+	// Review 4 F2: with the generated restore failing, rollback still deleted the new .pub files that the
+	// still-live new generated config referenced.
+	const { p, built, after } = oldGeneration("f2-restore");
+	let rollback = false;
+	let n = 0;
+	const rename = fs.renameSync;
+	fs.renameSync = ((from: string, to: string) => {
+		if (rollback && to === p.generatedFile) throw Object.assign(new Error("injected generated restore EACCES"), { code: "EACCES" });
+		return rename(from, to);
+	}) as typeof fs.renameSync;
+	syncBuiltinESMExports();
+	try {
+		const fault = (s: PublishStep) => {
+			if (s === "after" && ++n === 2) {
+				rollback = true;
+				throw new Error("injected late failure");
+			}
+		};
+		assert.throws(
+			() => publishGenerated(p, built, { include: true, after, fault }),
+			/injected late failure \(rollback incomplete: could not restore .*pi-bitwarden\/config; the new generated config is still live, its \.pub files were kept\)/,
+		);
+	} finally {
+		fs.renameSync = rename;
+		syncBuiltinESMExports();
+	}
+	const live = readFileSync(p.generatedFile, "utf8");
+	assert.match(live, /Host new/);
+	const named = [...live.matchAll(/IdentityFile "([^"]+)"/g)].map((m) => m[1]);
+	assert.ok(named.length > 0);
+	for (const f of named) assert.ok(existsSync(f), `${f} named by the live config exists`);
+	assert.ok(existsSync(join(p.keysDir, "old-0ld00000.pub")), "old .pub kept too (union)");
+	assert.equal(loadState(p.stateFile).state.syncedHash, "old-hash");
+});
+
+test("F1: reverse .pub lookup uses the last published mapping, then names, then (no mapping yet) the file's key", () => {
+	const p = tempPaths("f1-lookup");
+	const k = { id: "aaaaaaaa-f1", name: "OldName", fingerprint: "", publicKey: "ssh-ed25519 AAAA f1" };
+	const s = emptyState();
+	s.keys = [k];
+	s.identityMap["~/.ssh/key"] = { itemId: k.id, name: "OldName" };
+	const built = buildGenerated(p, s, "Host t\n  IdentityFile ~/.ssh/key\n", { controlPersist: false });
+	assert.deepEqual(built.published, { "oldname-aaaaaaaa.pub": k.id });
+	publishGenerated(p, built);
+	const oldPub = join(p.keysDir, "oldname-aaaaaaaa.pub");
+	// Key renamed in the vault, cache refreshed, no new generation published.
+	const renamed = { ...k, name: "NewName" };
+	const withMap = { ...emptyState(), keys: [renamed], published: built.published };
+	assert.equal(keyForPubPath(p, withMap, oldPub)?.id, k.id);
+	// State without a mapping (written before this field existed): the public key in the owned file decides.
+	const legacy = { ...emptyState(), keys: [renamed] };
+	assert.equal(keyForPubPath(p, legacy, oldPub)?.id, k.id);
+	// Not ours (outside the keys dir) or unknown content: no match.
+	assert.equal(keyForPubPath(p, legacy, join(p.home, "elsewhere.pub")), undefined);
+	writeFileSync(join(p.keysDir, "x.pub"), "ssh-ed25519 OTHER\n");
+	assert.equal(keyForPubPath(p, legacy, join(p.keysDir, "x.pub")), undefined);
 });
 
 test("R2: the generated config never names a .pub file before it exists (commit order)", () => {

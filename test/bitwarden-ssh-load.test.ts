@@ -631,3 +631,70 @@ test("R1/R2: pull is refused when ssh -G cannot validate (timeout, ssh missing) 
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test("F1: after a vault key rename and a refused pull, the host still loads its key (last published mapping)", { skip: (!available && "pi packages not installed") || (!has("ssh-agent") && "no OpenSSH") }, async () => {
+	// Review 4 F1: reverse lookup recomputed .pub names from the refreshed key cache (new name), so the old
+	// .pub path still named by the live generated config no longer mapped to the vault item.
+	const dir = mkdtempSync("/tmp/pi-bw-f1-");
+	const saved = { ...process.env };
+	const bwShared = () => ((globalThis as any)[Symbol.for("pi.bitwarden-ssh.bw")] ??= {});
+	let sock: string | undefined;
+	let fire: ((e: string, ev: any) => Promise<void>) | undefined;
+	try {
+		const s = await setup(dir, "tui");
+		sock = s.sock;
+		fire = s.fire;
+		const { commands, tools, ctx, log } = s;
+		ctx.ui.confirm = async () => true;
+		const home = join(dir, "home");
+		const db = join(dir, "db.json");
+		const dataDir = join(home, ".pi", "agent", "bitwarden-ssh");
+		const state = join(dataDir, "state.json");
+		const generated = join(home, ".ssh", "pi-bitwarden", "config");
+		const userConfig = join(home, ".ssh", "config");
+		mkdirSync(dataDir, { recursive: true });
+		execFileSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "f1", "-f", join(dir, "k")]);
+		const key = (name: string) => ({ id: "aaaaaaaa-f1", type: 5, name, sshKey: { privateKey: readFileSync(join(dir, "k"), "utf8"), publicKey: readFileSync(join(dir, "k.pub"), "utf8").trim(), keyFingerprint: "" } });
+		const vault = (name: string, note: string) => writeFileSync(db, JSON.stringify({ items: [key(name), { id: "note-1", type: 2, name: "ssh-config", notes: note, secureNote: { type: 0 } }] }));
+		writeFileSync(state, JSON.stringify({ version: 1, identityMap: { "~/.ssh/key": { itemId: "aaaaaaaa-f1", name: "OldName" } }, keys: [] }));
+		// `ssh -G target` must read the temp config (ssh takes ~ from the passwd entry, not $HOME).
+		const wrap = join(dir, "sshwrap");
+		mkdirSync(wrap);
+		const realSsh = spawnSync("sh", ["-c", "command -v ssh"], { encoding: "utf8" }).stdout.trim();
+		writeFileSync(join(wrap, "ssh"), `#!/bin/sh\nif [ "$1" = -G ] && [ "$2" != -F ]; then shift; exec '${realSsh}' -F '${userConfig}' -G "$@"; fi\nexec '${realSsh}' "$@"\n`, { mode: 0o755 });
+		process.env.PATH = `${wrap}:${process.env.PATH}`;
+		bwShared().session = "SESS";
+		await fire("session_start", { reason: "startup" });
+
+		vault("OldName", "Host target\n HostName target.invalid\n IdentityFile ~/.ssh/key\n");
+		await commands.get("ssh").handler("config pull", ctx);
+		assert.match(log.notes.join("\n"), /Pulled "ssh-config"/);
+		const before = readFileSync(generated, "utf8");
+		const oldPub = join(home, ".ssh", "pi-bitwarden", "keys", "oldname-aaaaaaaa.pub");
+		assert.match(before, new RegExp(`IdentityFile "${oldPub}"`));
+		assert.deepEqual(JSON.parse(readFileSync(state, "utf8")).published, { "oldname-aaaaaaaa.pub": "aaaaaaaa-f1" });
+		const load = async () => (await tools.get("ssh_keys").execute("id", { action: "load", host: "target" }, undefined, undefined, ctx)).content[0].text as string;
+		assert.match(await load(), /Loaded into ssh-agent.*: OldName/);
+
+		// Rename in the vault, pull an invalid note: refused, the key cache now says NewName.
+		vault("NewName", "Host target\n BogusOption yes\n");
+		log.notes.length = 0;
+		await commands.get("ssh").handler("config pull", ctx);
+		assert.match(log.notes.join("\n"), /not a valid SSH config; kept the local config/);
+		assert.equal(readFileSync(generated, "utf8"), before);
+		assert.ok(existsSync(oldPub));
+		const st = JSON.parse(readFileSync(state, "utf8"));
+		assert.equal(st.keys[0].name, "NewName");
+		assert.deepEqual(st.published, { "oldname-aaaaaaaa.pub": "aaaaaaaa-f1" }, "published mapping only changes with a generation");
+		assert.match(await load(), /Loaded into ssh-agent.*: NewName/);
+	} finally {
+		await fire?.("session_shutdown", { reason: "quit" });
+		const sh = bwShared();
+		sh.session = undefined;
+		if (sh.lockTimer) clearTimeout(sh.lockTimer);
+		if (sock) spawnSync("pkill", ["-f", sock]);
+		for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+		Object.assign(process.env, saved);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
