@@ -145,7 +145,9 @@ Do not install both ways at once, or the extension loads twice.
   - `/ssh config pull` (note -> local config, maps keys, regenerates, adds the Include;
     the exact generated config that would be installed is checked with `ssh -G` first, and
     a note with unterminated quotes, an `IdentityFile` with extra arguments or any error
-    `ssh -G` reports is refused with the local and generated config kept; edits too),
+    `ssh -G` reports is refused with the local and generated config kept; edits too. If
+    `ssh -G` cannot run (not installed, spawn error, 10 s timeout), nothing is changed
+    either: "Could not validate the SSH config"),
     `/ssh config push` (local -> note, asks first), `/ssh config edit`, `/ssh config show`,
     `/ssh config map` (choose the Bitwarden key for each `IdentityFile`).
   - Footer: `🔐 unlocked · N keys`, `🔒 locked · N keys`, `bw: logged out` or
@@ -159,7 +161,16 @@ Do not install both ways at once, or the extension loads twice.
   under an OS advisory lock on `config.lock`, held by a small `flock`/`lockf`/`perl` child
   process; the kernel drops it when pi exits or crashes, a stopped pi keeps it and others
   give up after 30 s with "another pi session holds config.lock; try again"; lock files
-  are kept, never deleted). Results carry names and
+  are kept, never deleted. The helper watches its stdin pipe from pi, also while it still
+  waits for the lock, so a pi killed even with SIGKILL leaves no helper behind: `flock`/`lockf`
+  run under a small `sh` wrapper whose `cat` kills the helper's process group at EOF, the
+  `perl` helper polls stdin between lock attempts. One exit hook and one backend probe per
+  process, also across `/reload`). A pull or edit is published as one generation: all
+  directories are checked and the new `.pub` files and generated config staged as temp
+  files first, then renamed into place (.pub files, generated config, Include, then the
+  source config and `state.json` last, so the sync state only changes once the new config
+  is live); on a failure the staged files are removed and anything already replaced is
+  restored, and obsolete `.pub` files are deleted only after success. Results carry names and
   fingerprints, never key material. When a `bash` command or a `!` command names a
   configured host whose key is not loaded (`ssh web`, `git clone ssh://git@web/x`,
   `rsync f web:`), pi offers to load it first; declining runs the command anyway.
@@ -205,7 +216,8 @@ Do not install both ways at once, or the extension loads twice.
   Files: `~/.pi/agent/bitwarden-ssh/` holds `state.json` (identity mapping and a cache of
   key names, fingerprints and public keys) and `config` (the synced config as on your
   computer). `~/.ssh/pi-bitwarden/` holds the generated `config`, public keys in `keys/`
-  (private keys only go into the agent) and ControlMaster sockets in `cm/` (in
+  named `<key name>-<first 8 chars of the item id>.pub` in lowercase, so two keys never
+  share a file, also on case-insensitive macOS volumes (private keys only go into the agent) and ControlMaster sockets in `cm/` (in
   `/tmp/pi-bw-<uid>/cm/` when the home path is too long for a socket path). Files are
   mode 600, directories 700. `~/.ssh/config` gets one line at the top,
   `Include ~/.ssh/pi-bitwarden/config` (absolute path), created if missing; only such an
