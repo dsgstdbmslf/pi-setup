@@ -1,13 +1,21 @@
 // Cross-process lock: a kernel advisory lock (flock(2)) on a lock file, held by a small child process for as
 // long as it lives. The child prints "locked" once it holds the lock and then blocks reading its stdin;
-// release = end its stdin (kill as fallback). If pi dies, the pipe closes, the child exits and the kernel
-// drops the lock. A live holder is never broken (a stopped or slow pi keeps its lock; waiters time out),
-// and lock files are never renamed or deleted, so there is no staleness logic and no recovery race.
-// Used for the shared ssh-agent startup and for source config / state writes shared by pi processes.
+// release = end its stdin (kill as fallback). The child also watches its stdin while it is still WAITING:
+// if pi dies (even by SIGKILL), the pipe closes and the child exits at once, waiting or holding, and the
+// kernel drops any lock it held. A live holder is never broken (a stopped or slow pi keeps its lock;
+// waiters time out), and lock files are never renamed or deleted, so there is no staleness logic and no
+// recovery race. Used for the shared ssh-agent startup and for source config / state writes shared by pi processes.
 //
 // Backends (chosen once per process, by availability): Linux `flock` (util-linux), macOS `/usr/bin/lockf`
 // (BSD; -k keeps the file), else `perl` (Fcntl flock). All three take flock(2) locks.
-
+//
+// Parent-death watch while waiting:
+// - flock/lockf: run inside a `/bin/sh` wrapper (its own process group, as the child is spawned detached).
+//   The wrapper starts `cat` on a copy of the pipe in the background, then execs the locker; when `cat`
+//   sees EOF it kills the whole process group (`kill -s KILL 0`): the waiting or holding locker, its
+//   holding shell, and itself. Only POSIX sh features, so the same on Linux and macOS.
+// - perl: the acquisition loop tries LOCK_NB and, between attempts, waits up to 50 ms for stdin with
+//   select(); EOF there exits before the lock is taken.
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { accessSync, closeSync, constants, fchmodSync, fstatSync, mkdirSync, openSync } from "node:fs";
 import { basename, dirname } from "node:path";
@@ -26,12 +34,19 @@ export class LockTimeoutError extends Error {}
 /** Marker the lock child prints once it holds the lock. */
 export const LOCKED_MARKER = "locked";
 const HOLD_SH = `echo ${LOCKED_MARKER}; exec cat >/dev/null`;
+/**
+ * `/bin/sh -c WATCH_SH sh <locker...>`: fd 3 = the stdin pipe from pi (a background job's own stdin is
+ * /dev/null in a non-interactive sh); on its EOF kill the process group. The locker gets the pipe as stdin.
+ */
+export const WATCH_SH = 'exec 3<&0; { cat >/dev/null; kill -s KILL 0; } <&3 & exec 3<&- "$@"';
 export const MACOS_LOCKF = "/usr/bin/lockf";
-// Non-blocking attempts every 50 ms until the deadline; then hold until stdin ends.
+// Non-blocking attempts until the deadline, waiting up to 50 ms on stdin between them (EOF: pi is gone,
+// exit without the lock); then hold until stdin ends.
 const PERL_SCRIPT =
 	'use strict; use Fcntl qw(:flock); my ($p, $t) = @ARGV; open(my $f, ">>", $p) or die "open $p: $!\\n"; ' +
-	"my $end = time + $t; until (flock($f, LOCK_EX | LOCK_NB)) { if (time >= $end) { print STDERR \"timeout\\n\"; exit 75 } " +
-	`select(undef, undef, undef, 0.05) } $| = 1; print "${LOCKED_MARKER}\\n"; 1 while <STDIN>;`;
+	"my $end = time + $t; my $b; until (flock($f, LOCK_EX | LOCK_NB)) { if (time >= $end) { print STDERR \"timeout\\n\"; exit 75 } " +
+	"my $r = ''; vec($r, fileno(STDIN), 1) = 1; if (select($r, undef, undef, 0.05) > 0) { exit 0 unless sysread(STDIN, $b, 4096) } } " +
+	`$| = 1; print "${LOCKED_MARKER}\\n"; 1 while sysread(STDIN, $b, 4096);`;
 
 export interface LockCommand {
 	cmd: string;
@@ -43,10 +58,10 @@ export function lockCommand(backend: LockBackend, path: string, timeoutSec: numb
 	const t = String(Math.max(1, Math.ceil(timeoutSec)));
 	switch (backend) {
 		case "flock":
-			return { cmd: "flock", args: ["-x", "-w", t, "-E", "75", path, "/bin/sh", "-c", HOLD_SH] };
+			return { cmd: "/bin/sh", args: ["-c", WATCH_SH, "sh", "flock", "-x", "-w", t, "-E", "75", path, "/bin/sh", "-c", HOLD_SH] };
 		case "lockf":
 			// BSD lockf exits 75 on timeout. -k: keep the lock file (deleting it would break mutual exclusion), -s: silent, -t: timeout.
-			return { cmd: MACOS_LOCKF, args: ["-k", "-s", "-t", t, path, "/bin/sh", "-c", HOLD_SH] };
+			return { cmd: "/bin/sh", args: ["-c", WATCH_SH, "sh", MACOS_LOCKF, "-k", "-s", "-t", t, path, "/bin/sh", "-c", HOLD_SH] };
 		case "perl":
 			return { cmd: "perl", args: ["-e", PERL_SCRIPT, path, t] };
 	}
@@ -88,16 +103,25 @@ export function backendAvailable(b: LockBackend): boolean {
 	}
 }
 
-let detected: LockBackend | undefined;
-/** The backend of this process (probed once, cached). */
+// Process-wide state, shared by every module generation (pi reloads extensions without a module cache):
+// the detected backend, the lock children (waiting or holding, killed when the process exits) and the
+// one exit hook.
+interface LockGlobal {
+	backend?: LockBackend;
+	children: Set<ChildProcess>;
+	exitHook: boolean;
+}
+const G: LockGlobal = ((globalThis as Record<symbol, unknown>)[Symbol.for("pi.bitwarden-ssh.lock")] ??= {
+	children: new Set<ChildProcess>(),
+	exitHook: false,
+}) as LockGlobal;
+
+/** The backend of this process (probed once per process, cached). */
 export function lockBackend(): LockBackend {
-	detected ??= chooseBackend(process.platform, backendAvailable);
-	return detected;
+	G.backend ??= chooseBackend(process.platform, backendAvailable);
+	return G.backend;
 }
 
-// Lock children of this process (waiting or holding): killed when the process exits.
-const children = new Set<ChildProcess>();
-let exitHook = false;
 function killGroup(child: ChildProcess): void {
 	if (!child.pid) return;
 	try {
@@ -109,11 +133,17 @@ function killGroup(child: ChildProcess): void {
 	}
 }
 function track(child: ChildProcess): void {
-	children.add(child);
-	if (!exitHook) {
-		exitHook = true;
+	G.children.add(child);
+	if (!G.exitHook) {
+		G.exitHook = true;
+		const children = G.children;
 		process.on("exit", () => {
-			for (const c of children) killGroup(c);
+			for (const c of children) {
+				if (!c.pid) continue;
+				try {
+					process.kill(-c.pid, "SIGKILL");
+				} catch {}
+			}
 		});
 	}
 }
@@ -153,7 +183,7 @@ function acquire(path: string, timeoutMs: number, backend: LockBackend): Promise
 		let err = "";
 		let state: "waiting" | "held" | "done" = "waiting";
 		const closed = new Promise<void>((res) => child.once("close", () => res()));
-		closed.then(() => children.delete(child));
+		closed.then(() => G.children.delete(child));
 		const stop = () => {
 			try {
 				child.stdin?.end();
