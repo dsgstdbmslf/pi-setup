@@ -63,7 +63,13 @@ export function askpassSocket(paths: Paths, pid = process.pid): string {
  * someone else (matters for the /tmp fallback, where another user could pre-create the path).
  */
 export function ensureDir(path: string): void {
-	mkdirSync(path, { recursive: true, mode: 0o700 });
+	try {
+		mkdirSync(path, { recursive: true, mode: 0o700 });
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "EEXIST" || code === "ENOTDIR") throw new Error(`${path} is not a directory`);
+		throw err;
+	}
 	const st = lstatSync(path);
 	if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${path} is not a directory`);
 	const uid = process.getuid?.();

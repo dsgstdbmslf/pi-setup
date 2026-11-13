@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, fork, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,11 +11,21 @@ import { after, test } from "node:test";
 import { addKey, clearKeys, ensureAgent, listLoaded, removeKey } from "../extensions/bitwarden-ssh/agent.ts";
 import { clientScript, setupAskpassEnv, startAskpassServer, writeClientScript } from "../extensions/bitwarden-ssh/askpass.ts";
 import { Bitwarden, BwError, shared } from "../extensions/bitwarden-ssh/bw.ts";
-import { ensureInclude, keyForPubPath, readSource, regenerate, writeSource } from "../extensions/bitwarden-ssh/config-store.ts";
+import {
+	buildGenerated,
+	ensureInclude,
+	keyForPubPath,
+	type PublishStep,
+	publishGenerated,
+	pubFileName,
+	readSource,
+	regenerate,
+	writeSource,
+} from "../extensions/bitwarden-ssh/config-store.ts";
 import { fingerprintOf } from "../extensions/bitwarden-ssh/keyutil.ts";
 import { ensureDir, resolvePaths } from "../extensions/bitwarden-ssh/paths.ts";
 import { generateConfig } from "../extensions/bitwarden-ssh/sshconfig.ts";
-import { emptyState, loadState, saveState } from "../extensions/bitwarden-ssh/state.ts";
+import { emptyState, loadState, saveState, stateText } from "../extensions/bitwarden-ssh/state.ts";
 
 const root = mkdtempSync(join(tmpdir(), "pi-bw-test-"));
 after(() => rmSync(root, { recursive: true, force: true }));
@@ -68,7 +78,7 @@ test("regenerate writes pub files, generated config and dirs with safe modes", (
 	const r = regenerate(p, s, { controlPersist: "10m" })!;
 	assert.deepEqual(r.mapped, ["~/.ssh/web"]);
 	assert.deepEqual(r.unmatched, ["~/.ssh/other"]);
-	const pub = join(p.keysDir, "web.pub");
+	const pub = join(p.keysDir, "web-11111111.pub");
 	assert.equal(readFileSync(pub, "utf8"), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ7L web\n");
 	assert.equal(existsSync(join(p.keysDir, "old.pub")), false);
 	const gen = readFileSync(p.generatedFile, "utf8");
@@ -85,6 +95,135 @@ test("regenerate writes pub files, generated config and dirs with safe modes", (
 		assert.match(g.stdout, /identitiesonly yes/);
 		assert.match(g.stdout, /controlmaster auto/);
 	}
+});
+
+test("pub file names: lowercase with an item id suffix, never colliding case-insensitively (macOS)", () => {
+	const key = (id: string, name: string) => ({ id, name, fingerprint: "", publicKey: `ssh-ed25519 AAAA ${name}` });
+	const keys = [key("aaaaaaaa-1111", "Foo"), key("bbbbbbbb-2222", "foo"), key("cccccccc-3333", "My Key.pub"), key("aaaaaaaa-9999", "FOO")];
+	const three = keys.slice(0, 3);
+	assert.deepEqual(three.map((k) => pubFileName(k, three)), ["foo-aaaaaaaa.pub", "foo-bbbbbbbb.pub", "my_key-cccccccc.pub"]);
+	// Same name (case-folded) and same 8-char id prefix: the full ids keep them apart.
+	const names = keys.map((k) => pubFileName(k, keys));
+	assert.deepEqual(names, ["foo-aaaaaaaa-1111.pub", "foo-bbbbbbbb.pub", "my_key-cccccccc.pub", "foo-aaaaaaaa-9999.pub"]);
+	assert.equal(new Set(names.map((n) => n.toLowerCase())).size, names.length);
+	// Without a clash the name depends on the key alone (stable when other keys come and go).
+	assert.equal(pubFileName(keys[1], [keys[1]]), pubFileName(keys[1], keys));
+
+	// Regenerate with Foo and foo: two distinct files, idempotent; old-scheme names removed after success.
+	const p = tempPaths("casefold");
+	const s = emptyState();
+	s.keys = [keys[0], keys[1]];
+	s.identityMap["~/.ssh/a"] = { itemId: keys[0].id, name: "Foo" };
+	s.identityMap["~/.ssh/b"] = { itemId: keys[1].id, name: "foo" };
+	ensureDir(p.sshDir);
+	ensureDir(p.keysDir);
+	writeFileSync(join(p.keysDir, "Foo.pub"), "old scheme");
+	writeFileSync(join(p.keysDir, "foo.pub"), "old scheme");
+	const src = "Host a\n  IdentityFile ~/.ssh/a\nHost b\n  IdentityFile ~/.ssh/b\n";
+	regenerate(p, s, { controlPersist: false, sourceText: src });
+	const first = readFileSync(p.generatedFile, "utf8");
+	assert.deepEqual(readdirSync(p.keysDir).sort(), ["foo-aaaaaaaa.pub", "foo-bbbbbbbb.pub"]);
+	assert.equal(readFileSync(join(p.keysDir, "foo-aaaaaaaa.pub"), "utf8"), "ssh-ed25519 AAAA Foo\n");
+	assert.equal(readFileSync(join(p.keysDir, "foo-bbbbbbbb.pub"), "utf8"), "ssh-ed25519 AAAA foo\n");
+	regenerate(p, s, { controlPersist: false, sourceText: src });
+	assert.equal(readFileSync(p.generatedFile, "utf8"), first, "regenerate is idempotent");
+	assert.deepEqual(readdirSync(p.keysDir).sort(), ["foo-aaaaaaaa.pub", "foo-bbbbbbbb.pub"]);
+	assert.equal(keyForPubPath(p, s, join(p.keysDir, "foo-bbbbbbbb.pub"))?.id, keys[1].id);
+});
+
+/** An old, consistent generation on disk: source, state, generated config and its .pub file. */
+function oldGeneration(name: string) {
+	const p = tempPaths(name);
+	const old = emptyState();
+	old.keys = [{ id: "0ld00000-k", name: "old", fingerprint: "", publicKey: "ssh-ed25519 AAAA old" }];
+	old.identityMap["~/.ssh/old"] = { itemId: "0ld00000-k", name: "old" };
+	old.syncedHash = "old-hash";
+	writeSource(p, "Host old\n  IdentityFile ~/.ssh/old\n");
+	saveState(p.stateFile, old);
+	regenerate(p, old, { controlPersist: false });
+	mkdirSync(join(p.home, ".ssh"), { recursive: true });
+	writeFileSync(p.userConfig, `Include ${p.generatedFile}\n`);
+	const snapshot = () => ({
+		source: readFileSync(p.sourceFile, "utf8"),
+		state: readFileSync(p.stateFile, "utf8"),
+		generated: readFileSync(p.generatedFile, "utf8"),
+		keys: Object.fromEntries(readdirSync(p.keysDir).map((f) => [f, readFileSync(join(p.keysDir, f), "utf8")])),
+		sshDir: readdirSync(p.sshDir).sort(),
+		dataDir: readdirSync(p.dataDir).sort(),
+	});
+	const next = structuredClone(old);
+	next.keys = [{ id: "n3w00000-k", name: "new", fingerprint: "", publicKey: "ssh-ed25519 AAAA new" }];
+	next.identityMap = { "~/.ssh/new": { itemId: "n3w00000-k", name: "new" } };
+	next.syncedHash = "new-hash";
+	next.note = { id: "note-1", name: "ssh-config" };
+	const source = "Host new\n  IdentityFile ~/.ssh/new\n";
+	const built = buildGenerated(p, next, source, { controlPersist: false });
+	const after = [
+		{ file: p.sourceFile, text: source },
+		{ file: p.stateFile, text: stateText(next) },
+	];
+	return { p, snapshot, before: snapshot(), built, after };
+}
+
+test("R2: keys path is a regular file -> publication refused before any write", () => {
+	// Review R2 repro: source and state (note id, syncedHash) were already replaced when the keys dir failed.
+	const { p, before, built, after } = oldGeneration("r2-keysfile");
+	rmSync(p.keysDir, { recursive: true });
+	writeFileSync(p.keysDir, "blocked-directory");
+	assert.throws(() => publishGenerated(p, built, { include: true, after }), /not a directory|EEXIST|ENOTDIR/);
+	assert.equal(readFileSync(p.keysDir, "utf8"), "blocked-directory");
+	assert.equal(readFileSync(p.sourceFile, "utf8"), before.source);
+	assert.equal(readFileSync(p.stateFile, "utf8"), before.state);
+	assert.equal(readFileSync(p.generatedFile, "utf8"), before.generated);
+	assert.equal(loadState(p.stateFile).state.syncedHash, "old-hash");
+	assert.deepEqual(readdirSync(p.sshDir).sort(), before.sshDir, "no temp files left");
+});
+
+test("R2: a failure at any publication step keeps or restores the old generation; state is not marked synced", () => {
+	for (const step of ["stage", "pub", "generated", "include", "after"] as PublishStep[]) {
+		const { p, snapshot, before, built, after } = oldGeneration(`r2-${step}`);
+		let n = 0;
+		const fault = (s: PublishStep) => {
+			// "after" fails at the second file (state.json), i.e. after the source was already committed.
+			if (s === step && (s !== "after" || ++n === 2)) throw new Error(`injected ${s} failure`);
+		};
+		assert.throws(() => publishGenerated(p, built, { include: true, after, fault }), new RegExp(`injected ${step} failure`));
+		assert.deepEqual(snapshot(), before, `${step}: old generation intact (source, state, generated, .pub files, no temps)`);
+		assert.equal(loadState(p.stateFile).state.syncedHash, "old-hash", step);
+		if (has("ssh")) assert.equal(spawnSync("ssh", ["-G", "-F", p.generatedFile, "old"], { encoding: "utf8", input: "" }).status, 0);
+	}
+	// A real ensureInclude failure (~/.ssh/config is a directory) after the generated file was replaced: rolled back.
+	const { p, snapshot, before, built, after } = oldGeneration("r2-include-real");
+	rmSync(p.userConfig);
+	mkdirSync(p.userConfig);
+	assert.throws(() => publishGenerated(p, built, { include: true, after }), /EISDIR/);
+	assert.deepEqual(snapshot(), before);
+	// Success: new generation live, state last, obsolete .pub removed only now.
+	rmSync(p.userConfig, { recursive: true });
+	writeFileSync(p.userConfig, `Include ${p.generatedFile}\n`);
+	const r = publishGenerated(p, built, { include: true, after });
+	assert.equal(r.include, "present");
+	assert.deepEqual(Object.keys(snapshot().keys), ["new-n3w00000.pub"]);
+	assert.match(readFileSync(p.generatedFile, "utf8"), /new-n3w00000\.pub/);
+	assert.equal(loadState(p.stateFile).state.syncedHash, "new-hash");
+	assert.equal(readSource(p), "Host new\n  IdentityFile ~/.ssh/new\n");
+	assert.deepEqual(readdirSync(p.sshDir).sort(), before.sshDir);
+});
+
+test("R2: the generated config never names a .pub file before it exists (commit order)", () => {
+	const { p, built, after } = oldGeneration("r2-order");
+	const seen: string[] = [];
+	publishGenerated(p, built, {
+		include: true,
+		after,
+		fault: (s) => {
+			const gen = readFileSync(p.generatedFile, "utf8");
+			for (const m of gen.matchAll(/IdentityFile "([^"]+)"/g)) assert.ok(existsSync(m[1]), `${s}: ${m[1]} named but missing`);
+			seen.push(`${s}:${loadState(p.stateFile).state.syncedHash}`);
+		},
+	});
+	// The state (sync metadata) is still the old one at every step before the last commit.
+	assert.deepEqual(seen, ["stage:old-hash", "pub:old-hash", "generated:old-hash", "include:old-hash", "after:old-hash", "after:old-hash"]);
 });
 
 test("ensureInclude: create, prepend once, keep mode, follow symlink", () => {

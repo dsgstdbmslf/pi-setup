@@ -16,14 +16,12 @@ import { Bitwarden, BwError, type SshKeyItem, shared as bwShared, type StatusInf
 import {
 	type BuiltConfig,
 	buildGenerated,
-	ensureInclude,
 	expandHome,
 	keyForPubPath,
 	publishGenerated,
 	readSource,
 	type RegenerateResult,
 	sha256,
-	writeSource,
 } from "./bitwarden-ssh/config-store.ts";
 import { run } from "./bitwarden-ssh/exec.ts";
 import { findByName, keyFingerprint } from "./bitwarden-ssh/keyutil.ts";
@@ -48,7 +46,7 @@ import {
 	unquote,
 	validateOptions,
 } from "./bitwarden-ssh/sshconfig.ts";
-import { type CachedKey, loadState, saveState, type State } from "./bitwarden-ssh/state.ts";
+import { type CachedKey, loadState, saveState, type State, stateText } from "./bitwarden-ssh/state.ts";
 import { footerText, formatDuration, formatKeyRows, hostsInCommand, lineDiff, mentionsNetworkCommand, truncate } from "./bitwarden-ssh/ui-text.ts";
 
 const STATUS_KEY = "bitwarden-ssh";
@@ -462,7 +460,10 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 		return lines.join("\n");
 	}
 
-	/** `ssh -G -F` on exactly `text` (the final generated config); the first error lines, or undefined if valid. */
+	/**
+	 * `ssh -G -F` on exactly `text` (the final generated config); the first error lines, or undefined if valid.
+	 * Fails closed: when ssh cannot run (missing, timeout, spawn error) this throws, so nothing is published.
+	 */
 	async function sshCheck(built: BuiltConfig): Promise<string | undefined> {
 		const text = built.text;
 		ensureDir(P().runDir);
@@ -470,7 +471,7 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 		try {
 			writeFileSync(tmp, text, { mode: 0o600, flag: "wx" });
 			const r = await run("ssh", ["-G", "-F", tmp, "pi-bw-syntax-check.invalid"], { timeoutMs: 10_000 });
-			if (r.error) return undefined; // ssh missing: skip the check
+			if (r.error) throw new UserError(`Could not validate the SSH config (${r.error.replace(/^ssh\b:? ?/, "ssh -G ").trim()}); nothing was changed`);
 			if (r.code === 0) return undefined;
 			const line = r.stderr
 				.split("\n")
@@ -507,9 +508,11 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 	 * Validate, then publish. Builds the exact final generated config from `source` (default: the current
 	 * source) with the current state plus `identity` and `mutate`, checks that exact text with `ssh -G -F`,
 	 * and only then, under the config lock, re-checks that the source is still `base` (default: what was
-	 * read here), writes the source (if given), state.json, the .pub files and the generated config, and
-	 * ensures the Include. If the state changed meanwhile, the rebuilt text is checked again. On any
-	 * failure nothing is written: the old source and generated files stay in place.
+	 * read here), publishes one generation with publishGenerated: .pub files, the generated config, the
+	 * Include, then the source (if given) and state.json last. If the state changed meanwhile, the rebuilt
+	 * text is checked again. A validation failure (or ssh not runnable) writes nothing; a write failure
+	 * removes staged files or rolls back what was already replaced, so source, state.json and the generated
+	 * config stay one consistent generation (see publishGenerated for the exact guarantee).
 	 */
 	async function publish(opts: {
 		source?: string;
@@ -539,11 +542,13 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 				const again = await sshCheck(final);
 				if (again) throw new InvalidConfig(`ssh: ${again}`);
 			}
-			if (opts.source !== undefined) writeSource(P(), source);
-			saveState(P().stateFile, st);
-			const r = publishGenerated(P(), final);
-			hostKeyCache.clear();
-			return opts.include ? { ...r, include: ensureInclude(P().userConfig, P().generatedFile) } : r;
+			// One generation: .pub files, generated config, Include, then source and state.json (state last).
+			const after = [...(opts.source !== undefined ? [{ file: P().sourceFile, text: source }] : []), { file: P().stateFile, text: stateText(st) }];
+			try {
+				return publishGenerated(P(), final, { include: opts.include, after });
+			} finally {
+				hostKeyCache.clear();
+			}
 		});
 	}
 

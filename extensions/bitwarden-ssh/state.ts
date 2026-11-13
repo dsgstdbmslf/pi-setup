@@ -71,6 +71,11 @@ export function writeFileAtomic(file: string, text: string, mode = 0o600): void 
 	}
 }
 
+/** The serialized form of state.json. */
+export function stateText(state: State): string {
+	return `${JSON.stringify(state, null, "\t")}\n`;
+}
+
 export function saveState(file: string, state: State): void {
-	writeFileAtomic(file, `${JSON.stringify(state, null, "\t")}\n`, 0o600);
+	writeFileAtomic(file, stateText(state), 0o600);
 }

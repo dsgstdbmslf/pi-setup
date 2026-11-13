@@ -1,8 +1,8 @@
 // Files of the SSH config sync: the source config (original form), the generated config, public key
 // files and the Include line in ~/.ssh/config. All paths come from Paths, so tests run in temp dirs.
 
-import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { ensureDir, type Paths } from "./paths.ts";
 import { type GenerateResult, generateConfig, hostNames, parseConfig } from "./sshconfig.ts";
@@ -37,11 +37,17 @@ function safeName(name: string): string {
 	return name.trim().replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^\.+/, "").slice(0, 80) || "key";
 }
 
-/** File name of a key's .pub file; keys whose safe names collide get an id suffix. */
-export function pubFileName(key: CachedKey, keys: CachedKey[]): string {
+/**
+ * File name of a key's .pub file: `<sanitized name>-<first 8 chars of the item id>.pub`, all lowercase, so
+ * two items never share a path, also on case-insensitive filesystems (macOS: `Foo` and `foo`). Depends
+ * only on the key itself (stable across regenerations); if two ids share their first 8 chars and the names
+ * fold to the same text, the full id is used.
+ */
+export function pubFileName(key: CachedKey, keys: CachedKey[] = []): string {
 	const base = safeName(key.name).replace(/\.pub$/i, "");
-	const clash = keys.some((k) => k.id !== key.id && safeName(k.name).replace(/\.pub$/i, "") === base);
-	return clash ? `${base}-${key.id.slice(0, 8)}.pub` : `${base}.pub`;
+	const short = (k: CachedKey) => `${safeName(k.name).replace(/\.pub$/i, "")}-${safeName(k.id.slice(0, 8))}`.toLowerCase();
+	const clash = keys.some((k) => k.id !== key.id && short(k) === short(key));
+	return `${clash ? `${base}-${safeName(key.id)}` : short(key)}`.toLowerCase() + ".pub";
 }
 
 export function pubPath(paths: Paths, key: CachedKey, keys: CachedKey[]): string {
@@ -89,13 +95,129 @@ export function buildGenerated(paths: Paths, state: State, source: string, opts:
 	return { ...result, pubFiles };
 }
 
-/** Write the public key files and the generated config of `built`; drop .pub files no longer mapped. */
-export function publishGenerated(paths: Paths, built: BuiltConfig): RegenerateResult {
+/** A file committed after the generated config is live (source config, state.json), in this order. */
+export interface AfterFile {
+	file: string;
+	text: string;
+}
+
+/** Steps of publishGenerated, for failure injection in tests. */
+export type PublishStep = "stage" | "pub" | "generated" | "include" | "after";
+
+export interface PublishOptions {
+	/** Also make ~/.ssh/config include the generated file (after the generated file is in place). */
+	include?: boolean;
+	/** Written only once the new generation is live (state last: sync metadata only after success). */
+	after?: AfterFile[];
+	/** Tests only: called before each step; a throw simulates a failure there. */
+	fault?: (step: PublishStep) => void;
+}
+
+export interface PublishResult extends RegenerateResult {
+	include?: "created" | "added" | "present";
+}
+
+function readIfExists(file: string): string | undefined {
+	try {
+		return readFileSync(file, "utf8");
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw err;
+	}
+}
+
+interface Staged {
+	file: string;
+	tmp: string;
+	/** Content before this publication (undefined: did not exist), for rollback. */
+	prev: string | undefined;
+}
+
+/**
+ * Publish `built` (public key files + generated config) and then the `after` files, as one generation:
+ *
+ * 1. Prepare: create/verify every directory (keys, cm, generated, after files) and read the current
+ *    content of every target; a wrong path (e.g. `keys` is a regular file) fails here, before any write.
+ * 2. Stage: write every new file as a temp file next to its target (`wx`, mode 600).
+ * 3. Commit by renames, in an order where ssh never sees a generated config that names a missing .pub
+ *    file: .pub files, the generated config, the Include in ~/.ssh/config, then the `after` files (source
+ *    config, state.json last, so sync metadata is only recorded once the generation is live).
+ * 4. Remove .pub files no longer referenced (best effort, only after success).
+ *
+ * Guarantee: on a failure before the generated config is renamed, staged temp files are removed and
+ * every target keeps its old content; on a later failure, the files already committed (.pub files,
+ * generated config, source) are restored to their previous content, so source, state and generated stay
+ * consistent, and the error is thrown. An Include line already added stays (it names the generated file,
+ * which ssh ignores if absent). Not crash-safe across a kill in the middle of step 3 (each file is atomic).
+ */
+export function publishGenerated(paths: Paths, built: BuiltConfig, opts: PublishOptions = {}): PublishResult {
+	const fault = opts.fault ?? (() => {});
+	const after = opts.after ?? [];
+	// 1. Prepare.
 	ensureDir(paths.sshDir);
 	ensureDir(paths.keysDir);
 	ensureDir(dirname(paths.cmDir)); // the /tmp fallback parent for long homes: ours, mode 700
 	ensureDir(paths.cmDir);
-	for (const [file, content] of built.pubFiles) writeFileAtomic(file, content, 0o600);
+	for (const a of after) ensureDir(dirname(a.file));
+	const targets: [string, string][] = [...built.pubFiles, [paths.generatedFile, built.text], ...after.map((a): [string, string] => [a.file, a.text])];
+	const prev = new Map<string, string | undefined>();
+	for (const [file] of targets) {
+		const st = lstatSync(file, { throwIfNoEntry: false });
+		if (st?.isDirectory()) throw new Error(`${file} is a directory`);
+		prev.set(file, readIfExists(file));
+	}
+	// 2. Stage, 3. commit.
+	const staged: Staged[] = [];
+	const committed: Staged[] = [];
+	const stage = (file: string, text: string): Staged | undefined => {
+		if (prev.get(file) === text && file !== paths.generatedFile) return undefined; // unchanged .pub/source/state
+		const s: Staged = { file, tmp: join(dirname(file), `.${randomBytes(6).toString("hex")}.tmp`), prev: prev.get(file) };
+		staged.push(s);
+		writeFileSync(s.tmp, text, { mode: 0o600, flag: "wx" });
+		return s;
+	};
+	const commit = (s: Staged | undefined) => {
+		if (!s) return;
+		renameSync(s.tmp, s.file);
+		committed.push(s);
+	};
+	let include: PublishResult["include"];
+	try {
+		fault("stage");
+		const pubs = [...built.pubFiles].map(([f, t]) => stage(f, t));
+		const gen = stage(paths.generatedFile, built.text);
+		const rest = after.map((a) => stage(a.file, a.text));
+		fault("pub");
+		for (const s of pubs) commit(s);
+		fault("generated");
+		commit(gen);
+		if (opts.include) {
+			fault("include");
+			include = ensureInclude(paths.userConfig, paths.generatedFile);
+		}
+		for (const s of rest) {
+			fault("after");
+			commit(s);
+		}
+	} catch (err) {
+		const failed: string[] = [];
+		for (const s of committed.reverse()) {
+			try {
+				if (s.prev === undefined) unlinkSync(s.file);
+				else writeFileAtomic(s.file, s.prev, 0o600);
+			} catch {
+				failed.push(s.file);
+			}
+		}
+		for (const s of staged) {
+			try {
+				unlinkSync(s.tmp);
+			} catch {}
+		}
+		if (failed.length && err instanceof Error) err.message += ` (could not restore ${failed.join(", ")})`;
+		throw err;
+	}
+	// 4. Obsolete .pub files (also names of the previous naming scheme), only now that nothing names them.
 	for (const f of readdirSync(paths.keysDir)) {
 		const full = join(paths.keysDir, f);
 		if (f.endsWith(".pub") && !built.pubFiles.has(full)) {
@@ -104,9 +226,8 @@ export function publishGenerated(paths: Paths, built: BuiltConfig): RegenerateRe
 			} catch {}
 		}
 	}
-	writeFileAtomic(paths.generatedFile, built.text, 0o600);
 	const { pubFiles: _, ...result } = built;
-	return { ...result, generatedFile: paths.generatedFile };
+	return { ...result, generatedFile: paths.generatedFile, ...(opts.include ? { include } : {}) };
 }
 
 /** buildGenerated + publishGenerated (no ssh -G check). Returns undefined when there is no source config yet. */

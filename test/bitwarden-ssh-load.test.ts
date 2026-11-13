@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, fork, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -170,8 +170,8 @@ test("extension end to end with a fake pi and a fake bw", { skip: (!available &&
 		assert.match(pulled, /1 IdentityFile\(s\) mapped/);
 		assert.match(pulled, /Disabled \(unusable here\): UseKeychain yes/);
 		const gen = readFileSync(join(home, ".ssh", "pi-bitwarden", "config"), "utf8");
-		assert.match(gen, /IdentityFile ".*\/keys\/testkey\.pub"\n {4}IdentitiesOnly yes/);
-		assert.equal(readFileSync(join(home, ".ssh", "pi-bitwarden", "keys", "testkey.pub"), "utf8"), `${pub}\n`);
+		assert.match(gen, /IdentityFile ".*\/keys\/testkey-key-1\.pub"\n {4}IdentitiesOnly yes/);
+		assert.equal(readFileSync(join(home, ".ssh", "pi-bitwarden", "keys", "testkey-key-1.pub"), "utf8"), `${pub}\n`);
 		assert.match(readFileSync(join(home, ".ssh", "config"), "utf8"), /^# Added by pi bitwarden-ssh\nInclude .*pi-bitwarden\/config\n/);
 
 		// Agent edits hosts.
@@ -519,6 +519,109 @@ test("N3: pull and edit validate the exact final config; a cached mapping of a d
 		assert.match(r.stdout, /^hostname t\.invalid$/m);
 		assert.match(readFileSync(generated, "utf8"), /IdentityFile ~\/\.ssh\/known\n/);
 		assert.equal(JSON.parse(readFileSync(state, "utf8")).note.id, "note-1");
+	} finally {
+		const sh = bwShared();
+		sh.session = undefined;
+		if (sh.lockTimer) clearTimeout(sh.lockTimer);
+		for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+		Object.assign(process.env, saved);
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("R1/R2: pull is refused when ssh -G cannot validate (timeout, ssh missing) or a path cannot be prepared; nothing changes", { skip: (!available && "pi packages not installed") || (!has("ssh") && "no OpenSSH"), timeout: 90_000 }, async () => {
+	// Review R1: a validator timeout or spawn failure counted as "valid" and the unchecked config was installed.
+	// Review R2: with ~/.ssh/pi-bitwarden/keys a regular file, source and state (note id, syncedHash) were
+	// replaced before the generated output failed.
+	const dir = mkdtempSync("/tmp/pi-bw-r1r2-");
+	const saved = { ...process.env };
+	const bwShared = () => ((globalThis as any)[Symbol.for("pi.bitwarden-ssh.bw")] ??= {});
+	try {
+		const { commands, ctx, log } = await setup(dir, "tui");
+		ctx.ui.confirm = async () => true;
+		const home = join(dir, "home");
+		const db = join(dir, "db.json");
+		const dataDir = join(home, ".pi", "agent", "bitwarden-ssh");
+		const source = join(dataDir, "config");
+		const state = join(dataDir, "state.json");
+		const sshDir = join(home, ".ssh", "pi-bitwarden");
+		const generated = join(sshDir, "config");
+		const keysDir = join(sshDir, "keys");
+		const userConfig = join(home, ".ssh", "config");
+		mkdirSync(dataDir, { recursive: true });
+		mkdirSync(keysDir, { recursive: true });
+		const OLD = "Host original\n User original\n";
+		const STATE = JSON.stringify({ version: 1, identityMap: {}, keys: [], syncedHash: "old-hash" });
+		const reset = (note: string) => {
+			writeFileSync(db, JSON.stringify({ items: [{ id: "note-1", type: 2, name: "ssh-config", notes: note, secureNote: { type: 0 } }] }));
+			writeFileSync(source, OLD);
+			writeFileSync(generated, OLD);
+			writeFileSync(join(keysDir, "old-0ld00000.pub"), "ssh-ed25519 AAAA old\n");
+			writeFileSync(userConfig, `Include ${generated}\n`);
+			writeFileSync(state, STATE);
+			log.notes.length = 0;
+		};
+		const unchanged = (what: string) => {
+			assert.equal(readFileSync(source, "utf8"), OLD, `${what}: source kept`);
+			assert.equal(readFileSync(generated, "utf8"), OLD, `${what}: generated kept`);
+			// (The key cache refresh may rewrite state.json; the sync metadata must stay old.)
+			const st = JSON.parse(readFileSync(state, "utf8"));
+			assert.deepEqual([st.syncedHash, st.note], ["old-hash", undefined], `${what}: state not marked as pulled`);
+			assert.equal(readFileSync(userConfig, "utf8"), `Include ${generated}\n`, what);
+			assert.doesNotMatch(log.notes.join("\n"), /Pulled/, what);
+		};
+		bwShared().session = "SESS";
+		const basePath = process.env.PATH!;
+
+		// R1a: ssh -G hangs past the 10 s validation timeout.
+		const slow = join(dir, "slowssh");
+		mkdirSync(slow);
+		writeFileSync(join(slow, "ssh"), "#!/bin/sh\nsleep 30\nexit 0\n", { mode: 0o755 });
+		process.env.PATH = `${slow}:${basePath}`;
+		reset("Host target\n BogusOption yes\n");
+		await commands.get("ssh").handler("config pull", ctx);
+		assert.match(log.notes.join("\n"), /Could not validate the SSH config \(ssh -G timed out after 10s\); nothing was changed/);
+		unchanged("timeout");
+		// /ssh config edit too.
+		reset("Host target\n HostName t.invalid\n");
+		ctx.ui.editor = async () => "Host original\n User changed\n";
+		await commands.get("ssh").handler("config edit", ctx);
+		assert.match(log.notes.join("\n"), /Could not validate the SSH config \(ssh -G timed out after 10s\)/);
+		unchanged("edit with timeout");
+
+		// R1b: no ssh on PATH at all (only what the lock helper needs).
+		const tools = join(dir, "tools");
+		mkdirSync(tools);
+		for (const t of ["flock", "perl", "cat", "sh", "sleep"]) {
+			const w = spawnSync("sh", ["-c", `command -v ${t}`], { encoding: "utf8" }).stdout.trim();
+			if (w.startsWith("/")) symlinkSync(w, join(tools, t));
+		}
+		process.env.PATH = `${join(dir, "fakebin")}:${tools}`;
+		reset("Host target\n HostName t.invalid\n");
+		await commands.get("ssh").handler("config pull", ctx);
+		assert.match(log.notes.join("\n"), /Could not validate the SSH config \(ssh -G command not found\); nothing was changed/);
+		unchanged("ssh missing");
+
+		// R2: keys path is a regular file -> refused before anything is written.
+		process.env.PATH = basePath;
+		reset("Host target\n HostName new.invalid\n");
+		rmSync(keysDir, { recursive: true });
+		writeFileSync(keysDir, "blocked-directory");
+		await commands.get("ssh").handler("config pull", ctx);
+		assert.match(log.notes.join("\n"), /keys is not a directory|EEXIST/);
+		assert.equal(readFileSync(source, "utf8"), OLD);
+		assert.equal(readFileSync(keysDir, "utf8"), "blocked-directory");
+		unchanged("keys path is a file");
+
+		// Fixed paths: the same pull succeeds; the obsolete .pub file is removed only now.
+		rmSync(keysDir);
+		mkdirSync(keysDir);
+		reset("Host target\n HostName new.invalid\n");
+		await commands.get("ssh").handler("config pull", ctx);
+		assert.match(log.notes.join("\n"), /Pulled "ssh-config"/);
+		assert.equal(readFileSync(source, "utf8"), "Host target\n HostName new.invalid\n");
+		assert.equal(JSON.parse(readFileSync(state, "utf8")).note.id, "note-1");
+		assert.equal(existsSync(join(keysDir, "old-0ld00000.pub")), false);
 	} finally {
 		const sh = bwShared();
 		sh.session = undefined;
