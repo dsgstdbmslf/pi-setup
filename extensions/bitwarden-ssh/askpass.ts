@@ -69,11 +69,14 @@ export function procfsInfo(procRoot = "/proc"): ProcInfo {
 export type PsRunner = (args: string[]) => Promise<{ code: number | null; stdout: string }>;
 const defaultPs: PsRunner = (args) => run("ps", args, { timeoutMs: 5000 });
 
-/** macOS (and any POSIX ps): `ps -o ppid= -p <pid>` and `ps -o command= -p <pid>`. */
+/**
+ * macOS (and any POSIX ps): `ps -ww -o ppid= -p <pid>` and `ps -ww -o command= -p <pid>`. `-ww`: BSD ps
+ * otherwise cuts the command at the terminal (or default) width.
+ */
 export function psInfo(ps: PsRunner = defaultPs): ProcInfo {
 	const query = async (field: string, pid: number): Promise<string | undefined> => {
 		if (!Number.isInteger(pid) || pid <= 0) return undefined;
-		const r = await ps(["-o", `${field}=`, "-p", String(pid)]);
+		const r = await ps(["-ww", "-o", `${field}=`, "-p", String(pid)]);
 		const out = r.stdout.trim();
 		return r.code === 0 && out ? out : undefined;
 	};

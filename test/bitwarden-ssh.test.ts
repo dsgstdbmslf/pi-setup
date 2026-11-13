@@ -309,7 +309,8 @@ test("requester parent chain via ps (macOS path, injected ps)", async () => {
 	const calls: string[][] = [];
 	const info = psInfo(async (args) => {
 		calls.push(args);
-		const [o, field, p, pid] = args;
+		const [ww, o, field, p, pid] = args;
+		assert.equal(ww, "-ww", "BSD ps must not truncate the command");
 		assert.equal(o, "-o");
 		assert.equal(p, "-p");
 		const row = table[Number(pid)];
@@ -319,11 +320,11 @@ test("requester parent chain via ps (macOS path, injected ps)", async () => {
 	assert.equal(await descendsFrom(300, 100, info), true);
 	assert.equal(await descendsFrom(400, 100, info), false);
 	assert.equal(await descendsFrom(999, 100, info), undefined);
-	assert.deepEqual(calls[0], ["-o", "ppid=", "-p", "300"]);
+	assert.deepEqual(calls[0], ["-ww", "-o", "ppid=", "-p", "300"]);
 	assert.deepEqual(await describeRequester(300, info, 100), { cmdline: "/usr/bin/ssh -T host", program: "ssh", fromThisPi: true });
 	assert.deepEqual(await describeRequester(400, info, 100), { cmdline: "/usr/bin/ssh forged", program: "ssh", fromThisPi: false });
 	assert.deepEqual(await describeRequester(999, info, 100), { cmdline: "(pid 999)", program: "" });
-	assert.ok(calls.some((c) => c[1] === "command="));
+	assert.ok(calls.some((c) => c.join(" ") === "-ww -o command= -p 300"));
 	// The real ps (here) gives the same answer as /proc for this process.
 	const real = psInfo();
 	assert.equal(await real.ppid(process.pid), process.ppid);
