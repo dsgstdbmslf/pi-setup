@@ -7,6 +7,7 @@
 import type { Conn } from "./remote-ops.ts";
 import { ASKPASS_STATUS_CANCEL, ASKPASS_STATUS_UNAVAILABLE, rootDialogText, rootNativeWrapper, rootStdinWrapper } from "./remote.ts";
 import type { RootPrompt } from "./settings.ts";
+import { rewriteReadOnlyGit } from "./safe-git.ts";
 import { assertConnected, exec, stripSshNoise, type ExecOptions, type ExecResult, type Target } from "./ssh.ts";
 
 export type RootPath = "native" | "pi";
@@ -40,7 +41,7 @@ export interface RootRun {
 }
 
 const cleanChunk = (onData: RootRun["onData"]) => (chunk: Buffer, stream: "stdout" | "stderr") => {
-	if (stream === "stderr" && /Permanently added|ControlSocket/.test(chunk.toString("utf8"))) {
+	if (stream === "stderr" && /Permanently added|ControlSocket|mux_client_\w+:/.test(chunk.toString("utf8"))) {
 		const clean = stripSshNoise(chunk.toString("utf8"));
 		if (clean) onData(Buffer.from(clean), stream);
 		return;
@@ -54,6 +55,7 @@ export class RootCancelled extends Error {}
 export async function runRoot(c: Conn, r: RootRun): Promise<{ exitCode: number | null; path: string }> {
 	if (r.signal?.aborted) throw new Error("aborted");
 	const run = r.run ?? exec;
+	const command = rewriteReadOnlyGit(r.command, c.home) ?? r.command;
 	const base: ExecOptions = { signal: r.signal, timeoutMs: r.timeoutMs, maxBytes: 64 * 1024 * 1024, onData: cleanChunk(r.onData) };
 	const finish = (res: ExecResult, path: string) => {
 		if (res.aborted) throw new Error("aborted");
@@ -64,7 +66,7 @@ export async function runRoot(c: Conn, r: RootRun): Promise<{ exitCode: number |
 	};
 	let path: string = chooseRootPath(r.pref, r.userIsAtDevice);
 	if (path === "native") {
-		const script = rootNativeWrapper(r.command, {
+		const script = rootNativeWrapper(command, {
 			os: c.probe.os,
 			path: c.probe.path,
 			title: "Pi: root access",
@@ -97,7 +99,7 @@ export async function runRoot(c: Conn, r: RootRun): Promise<{ exitCode: number |
 	pw = undefined;
 	try {
 		if (r.signal?.aborted) throw new Error("aborted");
-		const script = rootStdinWrapper(r.command, { path: c.probe.path });
+		const script = rootStdinWrapper(command, { path: c.probe.path });
 		const res = await run(c.target, script, { ...base, stdin });
 		r.onPath?.(path);
 		return finish(res, path);

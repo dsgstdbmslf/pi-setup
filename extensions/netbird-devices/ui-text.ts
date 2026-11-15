@@ -105,7 +105,7 @@ export function confirmTitle(action: Action, device: string, decision: Decision,
 /** Dialog body: the action (diff or command), then why it is asked. */
 export function confirmBody(action: Action, device: string, decision: Decision): string {
 	const lines: string[] = [];
-	if (action.kind === "bash") lines.push(`$ [${device}] ${truncate(action.command, 1500)}`);
+	if (action.kind === "bash") lines.push(`$ [${device}] ${action.root ? "sudo " : ""}${truncate(action.command, 1500)}`);
 	else if (action.kind === "write") lines.push(truncate(action.diff, 3000));
 	else lines.push(action.path);
 	if (decision.warning) lines.push("", `⚠ ${decision.warning}`);

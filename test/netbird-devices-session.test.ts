@@ -66,7 +66,7 @@ test("authorize: table of PLAN §9 (no dialog needed)", async () => {
 		["ro", bash("ls ~"), true, false],
 		["ro", bash("touch x"), true, true],
 		["ask", write(), true, true],
-		["ask", bash("git status"), true, true],
+		["ask", bash("git status"), true, false],
 		["full", write(), true, false],
 		["full", bash("make"), true, false],
 	];

@@ -89,8 +89,14 @@ Do not install both ways at once, or the extension loads twice.
   always (this path or command) / switch the device to full / deny. Protected paths
   (`~/.ssh`, `~/.aws`, `.env`, keychains, … plus yours) and dangerous commands always ask.
   The read-only shell allowlist is conservative: embedded programs (`sed`, `awk`, `find`),
-  Git/package-manager commands, unresolved expansions and recursive content searches need
-  authorization (dynamic paths/searches ask even in `full`). The classifier sees only your
+  package-manager commands, unresolved expansions and recursive content searches need
+  authorization (dynamic paths/searches ask even in `full`). Simple read-only Git (`status`,
+  `log`, `diff`, `show`, listing-only `branch`, `rev-parse`, `ls-files`; optional `-C`) is
+  rewritten to `/usr/bin/git` with a clean environment, no pager/optional locks, external
+  diff/textconv/fsmonitor/filters/hooks/credentials/network disabled. Agent config/output/helper
+  options, pipelines and unsupported flags still ask; original unsafe commands are not whitelisted.
+  Root confirmations explicitly show `sudo`, and SSH mux diagnostics are hidden from command output.
+  The classifier sees only your
   messages and the pending action, never tool-result messages; clipped action previews ask
   instead. Its cache follows the device, login and current user intent; approvals never carry
   across devices or logins. Mode, approvals

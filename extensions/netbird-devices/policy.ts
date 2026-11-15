@@ -2,6 +2,7 @@
 // Pure: no pi imports, unit-tested.
 
 import type { Mode } from "./settings.ts";
+import { isSafeReadOnlyGit } from "./safe-git.ts";
 
 export type Action =
 	| { kind: "read"; path: string }
@@ -222,6 +223,8 @@ const READ_ONLY_SUB: Record<string, RegExp> = {
 
 /** True when every part of the command is a known read-only command without redirections or substitutions. */
 export function isReadOnlyCommand(command: string): boolean {
+	// Execution must use rewriteReadOnlyGit, not the raw agent command.
+	if (isSafeReadOnlyGit(command)) return true;
 	// `2>&1` and redirections to /dev/null are harmless (and their `&` must not look like a background job).
 	const plain = command.replace(/2>&1(?=$|[\s;&|])|(?:2)?>\s*\/dev\/null(?=$|[\s;&|])/g, " ");
 	// This is deliberately not a shell parser. Ambiguous expansion, escapes and

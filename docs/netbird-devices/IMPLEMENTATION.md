@@ -301,3 +301,22 @@ Unit (`node --test`): все pure-модули, включая регресс-к
   `-F` принудительно использует fixture config, а не passwd-home с настоящими `Match exec`.
 - Новые регрессии: `test/netbird-devices-{review,entry}.test.ts`; дополнены hub/session/tools/root
   и bitwarden load/integration тесты. Никаких подключений к устройствам пользователя при ревью.
+
+### Follow-up после Mac smoke
+
+- `safe-git.ts`: один строгий parser используется политикой и переписыванием исполнения для
+  `status/log/diff/show/branch` (только listing flags)/`rev-parse/ls-files`, с глобальным `-C`.
+  Только одна простая команда; неизвестные/сокращённые опции, `-c`, `--output`, helpers, pipelines
+  не проходят. Разрешённый вызов **всегда** переписывается в bash/root operations, сырой Git не запускается.
+- `/usr/bin/env -i` → `/usr/bin/git --no-pager --no-optional-locks` с явными config overrides:
+  fsmonitor/pager/hooks/external diff/textconv/credentials/signatures/submodules/maintenance отключены,
+  global/system config и унаследованные GIT_EXTERNAL_DIFF/GIT_PAGER/PAGER/askpass/trace не используются,
+  сеть запрещена через GIT_ALLOW_PROTOCOL, lazy fetch отключён. `git config` читает только имена
+  filter.* keys с NUL-разделителями; clean/smudge/process/required принудительно отключаются,
+  ошибки парсинга конфигурации — fail closed. Это закрывает clean/process filters, которые иначе
+  выполняются даже в status/diff с `--no-textconv`.
+- Подтверждения root в Pi явно показывают `sudo <cmd>`/`as root`; stripSshNoise и оба stream adapters
+  удаляют `mux_client_*:` diagnostics (включая Broken pipe), сохраняя обычный stderr.
+- `test/netbird-devices-git.test.ts`: policy/rewrite cases, реальный Git во временном репозитории
+  с вредоносными pager/fsmonitor/diff/textconv/filter/credential settings, hostile env/PATH,
+  отсутствие index writes, реальный remote-ops adapter и fake root stream; без устройств пользователя.

@@ -75,3 +75,18 @@ IMPLEMENTATION, README, все модули расширения, изменен
 - Здесь не было подключений к устройствам пользователя, пользовательского sudo или настоящих GUI prompts.
 
 Коммит исправлений: `fix(netbird-devices): review fixes`; хэш передан координатору после создания коммита.
+
+## Follow-up: узкий безопасный Git и root UI
+
+- После предоставленного координатором Mac smoke восстановлены простые read-only Git вызовы:
+  status/log/diff/show, branch только listing flags, rev-parse, ls-files, глобальный -C.
+  Policy разрешает их только через общий строгий parser; выполнение всегда переписывается в
+  системный Git с чистым окружением, no-pager/no-optional-locks и отключёнными внешними helpers,
+  fsmonitor/textconv/filters/hooks/credentials/submodules/сетью. Неподдерживаемые flags/пайпы → ask.
+- Регрессии `netbird-devices-git.test.ts` используют настоящий Git в локальном временном репозитории
+  с исполняемыми вредоносными config hooks/filters и hostile env/PATH: они не выполняются,
+  index не переписывается, partial clone не запускает transport и не создаёт FETCH_HEAD.
+- Root подтверждения явно показывают sudo/as root; mux_client_* diagnostics убраны из stderr
+  и root/non-root streaming adapters, обычные ошибки сохраняются.
+- `npm test`: **364 passed, 0 failed, 0 skipped**; Pi extension load повторён отдельно, без устройств
+  пользователя. Коммит: `fix(netbird-devices): safe read-only git and root dialog polish`.

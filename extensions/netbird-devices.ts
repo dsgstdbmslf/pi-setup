@@ -440,7 +440,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 					(sig) =>
 						askSecret(ctx, {
 							title: `Root password for ${name}`,
-							message: `Pi agent asks to run as root on ${name}:\n${command.length > 300 ? `${command.slice(0, 300)}…` : command}`,
+							message: `Pi agent asks to run as root on ${name}:\nsudo ${command.length > 300 ? `${command.slice(0, 300)}…` : command}`,
 							warning: "Enter your password only if you expect this.",
 							signal: sig,
 						}),

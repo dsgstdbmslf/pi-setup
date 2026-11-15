@@ -111,7 +111,7 @@ function prepare(paths: SshPaths): void {
 export function stripSshNoise(stderr: string): string {
 	return stderr
 		.split("\n")
-		.filter((l) => !/^Warning: Permanently added .* to the list of known hosts\.?$/.test(l.trim()) && !/^ControlSocket .* already exists, disabling multiplexing$/.test(l.trim()))
+		.filter((l) => !/^Warning: Permanently added .* to the list of known hosts\.?$/.test(l.trim()) && !/^ControlSocket .* already exists, disabling multiplexing$/.test(l.trim()) && !/^mux_client_\w+:/.test(l.trim()))
 		.join("\n");
 }
 

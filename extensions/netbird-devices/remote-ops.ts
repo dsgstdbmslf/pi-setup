@@ -4,6 +4,7 @@
 // to absolute device paths.
 
 import { bashWrapper, type ProbeInfo } from "./remote.ts";
+import { rewriteReadOnlyGit } from "./safe-git.ts";
 import { access, assertConnected, exec, readFile, resolveVariant, SshError, stripSshNoise, type Target, writeFile } from "./ssh.ts";
 import { imageMimeFromPath } from "./tools.ts";
 
@@ -136,13 +137,13 @@ export function createBashOps(c: Conn): BashOps {
 	return {
 		async exec(command, _cwd, { onData, signal, timeout }) {
 			const limitS = remoteTimeoutSeconds(timeout);
-			const script = bashWrapper(command, { path: c.probe.path });
+			const script = bashWrapper(rewriteReadOnlyGit(command, c.home) ?? command, { path: c.probe.path });
 			const r = await exec(c.target, script, {
 				signal,
 				timeoutMs: limitS * 1000,
 				maxBytes: BASH_MAX_BYTES,
 				onData: (chunk, stream) => {
-					if (stream === "stderr" && /Permanently added|ControlSocket/.test(chunk.toString("utf8"))) {
+					if (stream === "stderr" && /Permanently added|ControlSocket|mux_client_\w+:/.test(chunk.toString("utf8"))) {
 						const clean = stripSshNoise(chunk.toString("utf8"));
 						if (clean) onData(Buffer.from(clean));
 						return;

@@ -54,7 +54,7 @@ test("review: read-only allowlist refuses shell/utility execution and write bypa
 		"/tmp/cat file", "./ls", "PATH=/tmp ls", "LD_PRELOAD=/tmp/x.so cat x", "printf -v PATH /tmp; ls",
 		"echo x >/dev/null.out", "echo x 2>/dev/null/../out", "echo 2>&10", "cat $'secret'", "cat ${X}", "cat ~/.s*/id_rsa", "cat ~other/.ssh/id_rsa", "l\\s",
 		"sed -n '1e touch /tmp/pwned' file", "sed 'w /tmp/pwned' file", "awk 'BEGIN {printf \"x\" > \"out\"}'", "find -delete", "find . -exec touch x +",
-		"git diff --ext-diff", "git diff --no-index --output out a b", "git status", "npm view x --logfile=/tmp/out", "brew info x",
+		"git diff --ext-diff", "git diff --no-index --output out a b", "npm view x --logfile=/tmp/out", "brew info x",
 		"file -C -m magic", "file --compile", "journalctl --setup-keys", "journalctl --update-catalog", "sysctl -f settings", "dmesg -n 1",
 		"plutil -lint file -replace key -string value", "scutil --get HostName --set HostName pwned", "networksetup -getinfo Wi-Fi -setcomputername x",
 	]) assert.equal(isReadOnlyCommand(c), false, c);
