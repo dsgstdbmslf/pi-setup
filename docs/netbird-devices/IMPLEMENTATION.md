@@ -134,6 +134,39 @@
 `devices list`, `here`, `read` файла/картинки из `~/pi-nb-test/`, `bash` `ls ~/pi-nb-test` работают; блок
 `ssh sergeys-macbook-pro` в bash; тесты зелёные; коммит.
 
+### Этап B — выполнено: уточнения и отклонения
+
+Файлы: `extensions/netbird-devices.ts` (entry), `extensions/netbird-devices/{hub,tools,remote-ops}.ts`; тесты
+`test/netbird-devices-{hub,tools}.test.ts` и хелпер `test/netbird-devices-fake-ssh.ts` (фейковый `ssh`, принимает только заданных пользователей).
+
+- **`hub.ts`** (без импортов Pi, все внешние зависимости подменяются): `new Hub({paths, settings, vmUser, sshBin, hostname, confFile, run, apiToken, fetchPeers, checkPort, now})`.
+  `refresh(force?)` (кэш 60 с: `99-netbird.conf` + API + `ip addr show wt0` + `getent hosts` + `ss -tlnH`/`ss -tnH state established`; входящие пиры, которых нет в списке SSH,
+  получают имя через `getent` и `sshEnabled: false`), `devices()` (работает и до `refresh`: синхронно читает drop-in), `localNames()`/`localLabel()`/`domains()`,
+  `modeOf(d)` (settings → `defaultMode`; переопределение в сессии — этап C), `protectedGlobs(d)`, `online(devices)` (порт SSH 1.5 с параллельно или API `connected`),
+  `inboundDevices`, `connect(d, {ask})` → `Conn` (общий для параллельных вызовов; пользователь: settings → спросили раньше → автоопределение `detectUser`; кэш probe в памяти и в `state.json`:
+  30 мин для автоопределённого пользователя, 24 ч для заданного; `ask` вызывается один раз, если никто не подошёл), `setUser`, `forget` (закрывает ControlMaster всех возможных пользователей,
+  удаляет ключ хоста и кэш), `closeAll`, `resolveHere(pinned?)` (закрепление → входящие → idle → недавний выбор) и `rememberHere`.
+- **`remote-ops.ts`**: операции для `create{Read,Write,Edit,Bash}ToolDefinition(cwd, {operations})` поверх `ssh.ts`. `Conn = {device, target, user, home, probe}`. Варианты имён (U+202F, NFD/NFC, кавычки)
+  подбираются в `access` при ENOENT (один дополнительный вызов только при промахе), реальное имя запоминается на время вызова и проходит `check` (защищённые пути). Картинка определяется по расширению
+  (без обращения к устройству). `mkdir` у write — no-op: каталоги создаёт сам скрипт записи (отказ в подтверждении не оставит каталог). `bash`: `bashWrapper` (cwd = home устройства, локальный cwd
+  игнорируется), стриминг stdout/stderr, таймаут `timeout:<сек>` (по умолчанию 30 мин), `aborted`, лимит вывода 64 МБ.
+- **`tools.ts`** (pure): `parseDeviceArg` (пусто/имя этой машины/`local` → локально, `here`, имя/алиас/peer/FQDN/IP; ошибка со списком известных устройств), `isRemoteArg`,
+  **`remoteGate`** (временный шлюз этапа B, см. ниже), `displayArgs` (рендер), `imageMimeFromPath`, `osLabel`, `deviceRows`, `guardReason`.
+- **Шлюз этапа B (`remoteGate`)**: `read` — всегда, кроме защищённых путей (отказ); `write`/`edit`/`bash` — только при режиме устройства `full` (**в том числе чтение-только команды bash**, как в задаче),
+  и даже в `full` отказ для защищённых путей, опасных команд (`decide` → ask) и команд, начинающихся с `sudo` (этап D). Режим пока можно задать только в `settings.json`
+  (`netbirdDevices.devices.<name>.mode` / `defaultMode`); `/nb mode` и диалоги — этап C. Для проверок можно положить `.pi/settings.json` с настройкой в каталог проекта и запускать `pi -a` (trust проекта).
+- **Entry**: переопределение `read/write/edit/bash` — `{...create*ToolDefinition(cwd), parameters: Type.Object({...properties, device?}), execute, renderCall, renderResult}`: без `device`/с локальным именем
+  вызывается `execute` встроенного определения без изменений; с `device` путь заранее разворачивается `resolveRemotePath(path, home)` и вызывается встроенное определение с удалёнными `operations`
+  (`exposeSessionEnvironment: false` у bash). Остальное (`prepareArguments` у edit, `outputSchema`, промпт-сниппеты) наследуется из встроенных определений.
+  Рендер: `renderCall`/`renderResult` делегируют встроенным, подставляя `context.args` из `displayArgs` (`mac:~/x`, `[mac] ls`; у edit `edits` убраны, чтобы встроенное превью не читало локальный файл
+  с тем же путём — дифф берётся из `details.diff` результата). Инструмент `devices` (`list`/`here`, `promptSnippet` + 2 `promptGuidelines`), блок ssh/scp/curl… к устройствам в `tool_call` bash без `device`,
+  футер (`⌂ cloudcli` ↔ `→ mac · full`, возврат через 8 с после `agent_settled`), `/nb [list] | here [device|auto] | refresh | user <device> <user|auto> | forget <device>` с автодополнением,
+  закрытие диалогов на `session_shutdown`, закрытие ControlMaster при `quit`. API-токен читается `loadKeys(api-keys.json, "netbird")` из `tavily/keys.ts`.
+- **Изменения модулей этапа A**: `ssh.ts` — добавлен `stopMaster(t)` (`ssh -O exit`), `stripSshNoise` вырезает ещё и `ControlSocket … already exists, disabling multiplexing` (гонка параллельных первых вызовов);
+  `tools.ts`/`hub.ts` — новые. Остальные интерфейсы не менялись.
+- **Известные ограничения**: чтение текстовых файлов целиком через `cat` (до 32 МБ, без `createReadStream`); порядок `tool_call`-обработчиков: если `bitwarden-ssh` загружен раньше, он может открыть окно
+  «Load SSH key?» до того, как наш блок отклонит команду; `.pi/settings.json` доверенного проекта может задавать режим устройства (граница — trust проекта).
+
 ## Этап C — режимы, диалоги, защищённые пути, классификатор (воркер 3)
 
 - Режим на устройство: settings → `defaultMode`; переопределение в сессии `pi.appendEntry("netbird-devices-mode", …)`,

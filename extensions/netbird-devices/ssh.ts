@@ -100,11 +100,11 @@ function prepare(paths: SshPaths): void {
 	}
 }
 
-/** ssh prints this on the first connection to a host; it is not output of the remote command. */
+/** ssh prints these on the first connection to a host and when parallel calls race to open the master; not output of the remote command. */
 export function stripSshNoise(stderr: string): string {
 	return stderr
 		.split("\n")
-		.filter((l) => !/^Warning: Permanently added .* to the list of known hosts\.?$/.test(l.trim()))
+		.filter((l) => !/^Warning: Permanently added .* to the list of known hosts\.?$/.test(l.trim()) && !/^ControlSocket .* already exists, disabling multiplexing$/.test(l.trim()))
 		.join("\n");
 }
 
@@ -325,6 +325,30 @@ export async function resolveVariant(t: Target, path: string): Promise<string | 
 export async function idle(t: Target): Promise<number | undefined> {
 	const r = assertConnected(await exec(t, IDLE_PROBE, { timeoutMs: 8000 }), t.hostKeyAlias ?? t.host, t.user);
 	return parseIdle(r.stdout.toString("utf8"));
+}
+
+/** Close the ControlMaster connection of a target (best effort, bounded). */
+export function stopMaster(t: Target): Promise<void> {
+	return new Promise((resolve) => {
+		let child: ReturnType<typeof spawn> | undefined;
+		const timer = setTimeout(() => {
+			child?.kill("SIGKILL");
+			resolve();
+		}, 2000);
+		timer.unref?.();
+		const done = () => {
+			clearTimeout(timer);
+			resolve();
+		};
+		try {
+			const a = sshArgs(t);
+			child = spawn(t.sshBin ?? "ssh", [...a.slice(0, -2), "-O", "exit", ...a.slice(-2)], { stdio: "ignore" });
+			child.on("error", done);
+			child.on("close", done);
+		} catch {
+			done();
+		}
+	});
 }
 
 /** True when a TCP connection to ip:port succeeds within `timeoutMs`. */

@@ -323,3 +323,7 @@ test("detectUser: other connection errors abort at once", async () => {
 		f.cleanup();
 	}
 });
+
+test("stripSshNoise also drops the ControlSocket race warning", () => {
+	assert.equal(stripSshNoise("ControlSocket /x/cm/abc already exists, disabling multiplexing\nreal\n"), "real\n");
+});
