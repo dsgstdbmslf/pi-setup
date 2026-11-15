@@ -9,7 +9,7 @@
     "changelogPath": ""
   },
   "scripts": {
-    "test": "node --test test/*.test.ts"
+    "test": "node --import ./test/isolated-env.ts --test test/*.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

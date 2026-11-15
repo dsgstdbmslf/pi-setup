@@ -1,5 +1,6 @@
 // Root through password dialogs (root.ts) and the journal wiring. ssh is replaced by running the script
 // locally with a fake `sudo` that accepts only the password "secret" from stdin.
+import "./isolated-env.ts";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -31,7 +32,7 @@ exec "$@"
 	return (_t: Target, script: string, o: ExecOptions): Promise<ExecResult> =>
 		new Promise((resolve) => {
 			calls.push(script);
-			const p = spawn("/bin/sh", ["-c", script], { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
+			const p = spawn("/bin/sh", ["-c", script.replaceAll("/usr/bin/sudo", join(dir, "sudo"))], { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } });
 			const out: Buffer[] = [];
 			let err = "";
 			p.stdout.on("data", (b) => {

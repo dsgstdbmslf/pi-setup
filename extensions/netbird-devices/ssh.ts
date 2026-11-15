@@ -5,6 +5,8 @@
 // Scripts run through the login shell of the device user (zsh on macOS), so they are POSIX sh.
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { closeSync, constants, fchmodSync, fstatSync, openSync } from "node:fs";
 import { connect } from "node:net";
 import { dirname } from "node:path";
 import { ensureDir } from "../bitwarden-ssh/paths.ts";
@@ -30,6 +32,8 @@ export interface Target {
 	sshBin?: string;
 	/** Seconds for the TCP connect and handshake. Default 8. */
 	connectTimeout?: number;
+	/** Session namespace: do not share/close another Pi runtime's ControlMaster. */
+	controlId?: string;
 }
 
 export type SshErrorKind = "auth" | "hostkey-changed" | "jwt-required" | "timeout" | "unreachable";
@@ -53,7 +57,7 @@ export function sshArgs(t: Target): string[] {
 		...o("ServerAliveInterval", 15),
 		...o("ServerAliveCountMax", 3),
 		...o("ControlMaster", "auto"),
-		...o("ControlPath", `${t.paths.cmDir}/%C`),
+		...o("ControlPath", `${t.paths.cmDir}/${t.controlId ? createHash("sha256").update(JSON.stringify([t.controlId, t.user, t.host, t.port ?? 22, alias])).digest("hex").slice(0, 40) : "%C"}`),
 		...o("ControlPersist", "10m"),
 		...o("StrictHostKeyChecking", "accept-new"),
 		...o("UserKnownHostsFile", t.paths.knownHosts),
@@ -73,7 +77,7 @@ export interface ExecOptions {
 	timeoutMs?: number;
 	/** Called with every chunk as it arrives. */
 	onData?: (chunk: Buffer, stream: "stdout" | "stderr") => void;
-	/** Stop and flag `truncated` beyond this many stdout bytes. Default 32 MB. */
+	/** Stop and flag `truncated` beyond this many combined stdout/stderr bytes. Default 32 MB. */
 	maxBytes?: number;
 }
 
@@ -91,13 +95,16 @@ export interface ExecResult {
 	spawnError?: string;
 }
 
-const prepared = new Set<string>();
 function prepare(paths: SshPaths): void {
-	for (const d of [paths.cmDir, dirname(paths.knownHosts)]) {
-		if (prepared.has(d)) continue;
-		ensureDir(d);
-		prepared.add(d);
-	}
+	// In /tmp the parent is just as important as the leaf: another user must
+	// not be able to replace cm/ after it has passed the ownership check.
+	for (const d of [dirname(paths.cmDir), paths.cmDir, dirname(paths.knownHosts)]) ensureDir(d);
+	const fd = openSync(paths.knownHosts, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+	try {
+		const st = fstatSync(fd);
+		if (!st.isFile() || (process.getuid && st.uid !== process.getuid())) throw new Error("known_hosts is not an owned regular file");
+		fchmodSync(fd, 0o600);
+	} finally { closeSync(fd); }
 }
 
 /** ssh prints these on the first connection to a host and when parallel calls race to open the master; not output of the remote command. */
@@ -111,6 +118,10 @@ export function stripSshNoise(stderr: string): string {
 /** Run a script on the device. Never throws for remote failures: inspect the result (see `classifyError`). */
 export function exec(t: Target, script: string, opts: ExecOptions = {}): Promise<ExecResult> {
 	return new Promise((resolve) => {
+		if (opts.signal?.aborted) {
+			resolve({ code: null, stdout: Buffer.alloc(0), stderr: "", aborted: true });
+			return;
+		}
 		let args: string[];
 		try {
 			prepare(t.paths);
@@ -120,16 +131,20 @@ export function exec(t: Target, script: string, opts: ExecOptions = {}): Promise
 			return;
 		}
 		const out: Buffer[] = [];
-		let outBytes = 0;
+		let outputBytes = 0;
 		let err = "";
 		const max = opts.maxBytes ?? 32 * 1024 * 1024;
 		const res: ExecResult = { code: null, stdout: Buffer.alloc(0), stderr: "" };
 		let settled = false;
+		let killTimer: ReturnType<typeof setTimeout> | undefined;
+		let exitTimer: ReturnType<typeof setTimeout> | undefined;
 		let child: ReturnType<typeof spawn>;
 		const finish = () => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			clearTimeout(killTimer);
+			clearTimeout(exitTimer);
 			opts.signal?.removeEventListener("abort", onAbort);
 			res.stdout = Buffer.concat(out);
 			res.stderr = stripSshNoise(err);
@@ -137,7 +152,8 @@ export function exec(t: Target, script: string, opts: ExecOptions = {}): Promise
 		};
 		const kill = () => {
 			child?.kill("SIGTERM");
-			setTimeout(() => child?.kill("SIGKILL"), 2000).unref();
+			if (!killTimer) killTimer = setTimeout(() => child?.kill("SIGKILL"), 2000);
+			killTimer.unref();
 		};
 		const onAbort = () => {
 			res.aborted = true;
@@ -158,19 +174,24 @@ export function exec(t: Target, script: string, opts: ExecOptions = {}): Promise
 			res.spawnError = e.message;
 			finish();
 		});
-		child.stdout!.on("data", (c: Buffer) => {
-			outBytes += c.length;
-			if (outBytes > max) {
+		const accept = (c: Buffer): boolean => {
+			outputBytes += c.length;
+			if (outputBytes > max) {
 				if (!res.truncated) {
 					res.truncated = true;
 					kill();
 				}
-				return;
+				return false;
 			}
+			return true;
+		};
+		child.stdout!.on("data", (c: Buffer) => {
+			if (!accept(c)) return;
 			out.push(c);
 			opts.onData?.(c, "stdout");
 		});
 		child.stderr!.on("data", (c: Buffer) => {
+			if (!accept(c)) return;
 			if (err.length < 1024 * 1024) err += c.toString("utf8");
 			opts.onData?.(c, "stderr");
 		});
@@ -183,7 +204,8 @@ export function exec(t: Target, script: string, opts: ExecOptions = {}): Promise
 		child.on("exit", (code, signal) => {
 			res.code = code;
 			if (signal) res.signal = signal;
-			setTimeout(finish, 300).unref();
+			exitTimer = setTimeout(finish, 300);
+			exitTimer.unref();
 		});
 		if (opts.stdin !== undefined && child.stdin) {
 			child.stdin.on("error", () => {}); // EPIPE when the remote command does not read its input
@@ -220,7 +242,7 @@ export function describeError(kind: SshErrorKind, device: string, user?: string)
 		case "hostkey-changed":
 			return `${device}: the host key changed. If that is expected, run /nb forget ${device} and retry.`;
 		case "jwt-required":
-			return `${device}: NetBird SSH there requires JWT (OIDC) authentication, which this machine cannot do. Turn it off in the NetBird dashboard or use the device directly.`;
+			return `${device}: NetBird SSH requires JWT (OIDC) via netbird ssh proxy and daemon access, unavailable here. Use the device directly or ask the owner to configure supported access; do not disable authentication automatically.`;
 		case "timeout":
 			return `${device}: connection timed out (device offline or NetBird SSH not reachable).`;
 		case "unreachable":
@@ -267,6 +289,30 @@ export async function probe(t: Target): Promise<ProbeInfo> {
 	return info;
 }
 
+/** Resolve file/parent symlinks, including parents of a new file, without Python or GNU realpath.
+ * Best effort only: another process can replace a link between this check and the I/O. */
+export async function canonicalPath(t: Target, abs: string, opts: ExecOptions = {}): Promise<string> {
+	const script = [
+		`p=${shq(abs)}; tail=''; n=0`,
+		'while [ "$n" -lt 80 ]; do',
+		'  n=$((n + 1))',
+		'  if [ -L "$p" ]; then',
+		'    link=$(readlink "$p") || exit 1',
+		'    case "$link" in /*) p="$link";; *) p="$(dirname "$p")/$link";; esac',
+		'  elif [ -d "$p" ]; then',
+		'    cd -P "$p" || exit 1',
+		'    printf "%s%s" "$(pwd -P)" "$tail"; exit 0',
+		'  else',
+		'    tail="/$(basename "$p")$tail"; p=$(dirname "$p")',
+		'  fi',
+		'done; exit 1',
+	].join("\n");
+	const r = assertConnected(await exec(t, script, { timeoutMs: SCRIPT_TIMEOUT, ...opts }), t.hostKeyAlias ?? t.host, t.user);
+	const result = r.stdout.toString("utf8");
+	if (r.code !== 0 || !result.startsWith("/")) throw new SshError("Cannot resolve remote path safely (symlink loop or inaccessible parent)");
+	return result;
+}
+
 export async function readFile(t: Target, abs: string, opts: ExecOptions = {}): Promise<Buffer> {
 	const r = assertConnected(await exec(t, `cat -- ${shq(abs)}`, { timeoutMs: 120_000, ...opts }), t.hostKeyAlias ?? t.host, t.user);
 	if (r.code !== 0) throw fileError(r, abs);
@@ -296,10 +342,10 @@ export async function writeFile(t: Target, abs: string, data: Buffer | string, o
 }
 
 /** Throws (ENOENT / EACCES) when the file does not exist or lacks the permission. */
-export async function access(t: Target, abs: string, mode: "r" | "w" | "rw" = "r"): Promise<void> {
+export async function access(t: Target, abs: string, mode: "r" | "w" | "rw" = "r", opts: ExecOptions = {}): Promise<void> {
 	const p = shq(abs);
 	const checks = [mode.includes("r") ? `[ -r ${p} ] || exit 3` : "", mode.includes("w") ? `[ -w ${p} ] || exit 3` : ""].filter(Boolean).join("; ");
-	const r = assertConnected(await exec(t, `[ -e ${p} ] || exit 2; ${checks || ":"}`, { timeoutMs: SCRIPT_TIMEOUT }), t.hostKeyAlias ?? t.host, t.user);
+	const r = assertConnected(await exec(t, `[ -e ${p} ] || exit 2; ${checks || ":"}`, { timeoutMs: SCRIPT_TIMEOUT, ...opts }), t.hostKeyAlias ?? t.host, t.user);
 	if (r.code === 2) throw new SshError(`${abs}: No such file or directory`, { code: "ENOENT", result: r });
 	if (r.code !== 0) throw new SshError(`${abs}: Permission denied`, { code: "EACCES", result: r });
 }
@@ -316,8 +362,8 @@ export async function stat(t: Target, abs: string): Promise<PathKind> {
 export const isDirectory = async (t: Target, abs: string): Promise<boolean> => (await stat(t, abs)) === "dir";
 
 /** The existing variant of a path (screenshot names with U+202F, NFD/NFC, curly quotes), or undefined. */
-export async function resolveVariant(t: Target, path: string): Promise<string | undefined> {
-	const r = assertConnected(await exec(t, pathVariantsScript(path), { timeoutMs: SCRIPT_TIMEOUT }), t.hostKeyAlias ?? t.host, t.user);
+export async function resolveVariant(t: Target, path: string, opts: ExecOptions = {}): Promise<string | undefined> {
+	const r = assertConnected(await exec(t, pathVariantsScript(path), { timeoutMs: SCRIPT_TIMEOUT, ...opts }), t.hostKeyAlias ?? t.host, t.user);
 	return r.code === 0 ? r.stdout.toString("utf8") : undefined;
 }
 

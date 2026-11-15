@@ -27,6 +27,13 @@ export const CLASSIFIER_SYSTEM = [
 
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}… [${s.length - n} more chars]` : s);
 
+/** A classifier must not allow an action whose executable tail/changes it never saw. */
+export function classifierSeesWholeAction(a: Action): boolean {
+	if (a.kind === "bash") return a.command.length <= 3000;
+	if (a.kind === "read") return true;
+	return a.diff.length <= 3000 && !/\0|… \(\d+ more lines\)|\(\d+ lines -> \d+ lines\)|current content unreadable/.test(a.diff);
+}
+
 export function describeAction(a: Action): string {
 	switch (a.kind) {
 		case "read":

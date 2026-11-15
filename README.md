@@ -88,7 +88,12 @@ Do not install both ways at once, or the extension loads twice.
   `auto` (a classifier model decides; hard rules still ask), `full`. Dialogs: allow once /
   always (this path or command) / switch the device to full / deny. Protected paths
   (`~/.ssh`, `~/.aws`, `.env`, keychains, … plus yours) and dangerous commands always ask.
-  The classifier sees only your messages and the action, never tool output. Mode, approvals
+  The read-only shell allowlist is conservative: embedded programs (`sed`, `awk`, `find`),
+  Git/package-manager commands, unresolved expansions and recursive content searches need
+  authorization (dynamic paths/searches ask even in `full`). The classifier sees only your
+  messages and the pending action, never tool-result messages; clipped action previews ask
+  instead. Its cache follows the device, login and current user intent; approvals never carry
+  across devices or logins. Mode, approvals
   and `/nb here` last for the session; the agent cannot change them. Settings are read from
   the global `~/.pi/agent/settings.json` only (a project's `.pi/settings.json` is ignored):
 
@@ -108,21 +113,33 @@ Do not install both ways at once, or the extension loads twice.
   `/nb log [device] [n]` (default 20), `/nb refresh`, `/nb user <device> <user|auto>`,
   `/nb test-root <device>`, `/nb forget <device>` (host key, cached login, connection).
 
-  Root: a `bash` command starting with `sudo ` asks for the password every time (`sudo -k`,
-  nothing cached). `rootPrompt` per device: `auto` (system dialog on the device when it is
+  Root: a `bash` command starting with `sudo ` uses `sudo -k` (no cached credentials).
+  The wrappers use `/usr/bin/sudo` and a system-only askpass utility PATH (not a writable
+  login PATH). A `NOPASSWD` rule can skip the native password dialog; `ask` therefore also requires a Pi
+  confirmation before root commands. Root is refused without an interactive UI.
+  `rootPrompt` per device: `auto` (system dialog on the device when it is
   the one you are at, else a masked Pi dialog), `native` (dialog on the device; macOS asks
   once to let it control System Events, "Automation"), `pi` (masked dialog, TUI only; the
   password goes to the `sudo -S` stdin over ssh and nowhere else). If the native dialog is
   unavailable, `auto` falls back to Pi. Cancelling returns "cancelled by the user" to the
   agent. The command runs with empty stdin. The footer shows `🔑 пароль root` while waiting.
-  `sudo` elsewhere in a command fails (no tty). Residual risk: another process of the same
-  user on the device could race the temporary askpass helper.
+  Only leading `sudo` uses this password flow; elsewhere it is an ordinary command subject
+  to policy (normally fails without a tty, but can work with `NOPASSWD`). Residual risk:
+  another process of the same user on the device could race the temporary askpass helper.
 
   Files: `~/.pi/agent/netbird-devices/` — `state.json` (users, probe cache, classifier
   choice), `known_hosts` (own, `accept-new`; a changed key is an error until
   `/nb forget`), `log.jsonl` (journal, rotated at ~2 MB: time, session, device, tool, short
   path or command, decision, result; never file contents, output or passwords) and `cm/`
-  (ssh connection sharing).
+  (ssh connection sharing, namespaced per Pi runtime and closed on every session shutdown,
+  including reload).
+
+  File protection folds case and Unicode normalization, and checks resolved file/parent
+  symlinks before I/O (including parents of new files and literal bash argument paths;
+  more than eight shell paths asks rather than skipping checks). This is best effort: hard links,
+  mount aliases, reverse aliases of symlinked protected directories and concurrent symlink
+  replacement are not a sandbox. Add canonical secret-store paths to `protected`; shell
+  path checks cannot resolve arbitrary programs or follow every input file they open.
 
   Security model, honestly: the `ssh` block in `bash` guards against the model's habits, it
   is not a sandbox (any process can open a socket). With NetBird SSH authentication off

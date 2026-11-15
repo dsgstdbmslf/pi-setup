@@ -246,6 +246,20 @@ test("hub.setUser / forget", async () => {
 	}
 });
 
+test("hub.closeAll: waits for an in-flight probe, closes attempted users and rejects further connections", async () => {
+	const f = fixture({ users: ["sergey"] });
+	try {
+		const d = dev(f.hub, "mac");
+		const login = f.hub.connect(d);
+		await f.hub.closeAll();
+		await login;
+		const exits = f.fake.calls().filter((a) => a.includes("-O") && a.includes("exit"));
+		assert.ok(exits.some((a) => a.includes("sergey@100.71.171.69")));
+		assert.ok(exits.some((a) => a.includes("orca@100.71.171.69")), "attempted login tracked too");
+		await assert.rejects(f.hub.connect(d), /session is closed/);
+	} finally { f.cleanup(); }
+});
+
 test("hub.resolveHere: pinned, single inbound device, none, ambiguous, recent choice", async () => {
 	const f = fixture({ online: ["100.71.171.69", "100.71.9.9"], users: ["sergey", "ana"] });
 	try {

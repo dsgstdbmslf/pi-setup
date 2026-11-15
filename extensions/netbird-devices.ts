@@ -29,9 +29,10 @@ import { deviceTargetInCommand, mentionsNetVerb } from "./netbird-devices/guard.
 import { Hub } from "./netbird-devices/hub.ts";
 import { appendJournal, formatLog, readJournal } from "./netbird-devices/journal.ts";
 import { type Paths, resolvePaths } from "./netbird-devices/paths.ts";
-import { type Action, type Decision, resolveRemotePath, splitSudo } from "./netbird-devices/policy.ts";
+import { type Action, type Decision, commandPathCandidates, protectedMatch, resolveRemotePath, splitSudo } from "./netbird-devices/policy.ts";
 import { RootCancelled, runRoot, testRoot } from "./netbird-devices/root.ts";
-import { type BashOps, type BeforeWrite, BASH_DEFAULT_TIMEOUT_S, createBashOps, createEditOps, createReadOps, createWriteOps, type Conn } from "./netbird-devices/remote-ops.ts";
+import { canonicalPath } from "./netbird-devices/ssh.ts";
+import { type BashOps, type BeforeWrite, remoteTimeoutSeconds, createBashOps, createEditOps, createReadOps, createWriteOps, type Conn } from "./netbird-devices/remote-ops.ts";
 import { type ClassifierResult, isMode, MODE_ENTRY, nextMode, SessionPolicy } from "./netbird-devices/session-policy.ts";
 import { loadGlobalSettings, MODES, type Mode, type Settings, parseSettings } from "./netbird-devices/settings.ts";
 import { type ActionInput, DEVICE_PARAM_DESCRIPTION, deviceListHint, deviceRows, displayArgs, earlyRefusal, guardReason, isRemoteArg, osLabel, parseDeviceArg, remoteAction } from "./netbird-devices/tools.ts";
@@ -154,7 +155,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 	// --- footer -----------------------------------------------------------------------------------
 
 	function showLocal(ctx = ctxRef): void {
-		if (!ctx?.hasUI) return;
+		if (!ctx?.hasUI || session.signal.aborted) return;
 		try {
 			ctx.ui.setStatus(STATUS_KEY, footerText({ kind: "local", name: H().localLabel() }));
 		} catch {}
@@ -237,6 +238,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 
 	/** One classifier call (auto mode): the user's messages and the action only, never tool output. Undefined = cannot answer. */
 	async function classify(ctx: ExtensionContext, t: Remote, action: Action, signal?: AbortSignal): Promise<ClassifierResult | undefined> {
+		if (signal?.aborted || session.signal.aborted) return undefined;
 		const id = H().state.classifierModel ?? settings.classifierModel;
 		const slash = id.indexOf("/");
 		if (slash <= 0) return undefined;
@@ -256,7 +258,8 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 				userMessages: userMessagesFromBranch(ctx.sessionManager.getBranch()),
 			});
 			const stream = ctx.modelRegistry.streamSimple(model, { systemPrompt: CLASSIFIER_SYSTEM, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] }, { maxTokens: CLASSIFIER_MAX_TOKENS, signal: ctl.signal });
-			const msg = await stream.result();
+			const msg = await Promise.race([stream.result(), new Promise<undefined>((resolve) => ctl.signal.addEventListener("abort", () => resolve(undefined), { once: true }))]);
+			if (!msg || ctl.signal.aborted) return undefined;
 			if (msg.stopReason === "error" || msg.stopReason === "aborted") return undefined;
 			const parsed = parseClassifierAnswer(assistantText(msg));
 			return parsed ? { ...parsed, model: id, usage: msg.usage } : undefined;
@@ -264,6 +267,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 			return undefined;
 		} finally {
 			clearTimeout(timer);
+			ctl.abort();
 			signal?.removeEventListener("abort", onAbort);
 			session.signal.removeEventListener("abort", onAbort);
 		}
@@ -281,14 +285,31 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 	/** Policy for one action on a device: allowed, or throws the refusal for the agent. Classifier usage goes to `acc`. */
 	async function authorize(ctx: ExtensionContext, t: Remote, input: Omit<ActionInput, "home" | "globs">, signal: AbortSignal | undefined, acc: ClassifierResult[], cacheSalt?: string, j?: Journaled): Promise<void> {
 		const h = H();
-		const { action, protectedHit } = remoteAction({ ...input, home: t.conn.home, globs: h.protectedGlobs(t.device) });
+		if (signal?.aborted || session.signal.aborted) throw new Error("Operation aborted");
+		const globs = h.protectedGlobs(t.device);
+		const { action, protectedHit: lexicalHit } = remoteAction({ ...input, home: t.conn.home, globs });
+		// Check the path the device actually follows, not just its spelling. New
+		// files resolve existing parents too. This remains subject to TOCTOU races.
+		const resolved = input.path ? await canonicalPath(t.conn.target, input.path, { signal }) : undefined;
+		const realHome = resolved ? await canonicalPath(t.conn.target, t.conn.home, { signal }) : t.conn.home;
+		let protectedHit = lexicalHit ?? (resolved ? protectedMatch(resolved, t.conn.home, globs) ?? protectedMatch(resolved, realHome, globs) : undefined);
+		if (action.kind === "bash" && !protectedHit) {
+			const candidates = commandPathCandidates(action.command, t.conn.home);
+			if (candidates.length > 8) protectedHit = "too many shell paths to verify safely";
+			else if (candidates.length) {
+				const [home, ...actual] = await Promise.all([t.conn.home, ...candidates].map((path) => canonicalPath(t.conn.target, path, { signal })));
+				protectedHit = actual.map((path) => protectedMatch(path, t.conn.home, globs) ?? protectedMatch(path, home, globs)).find(Boolean);
+			}
+		}
+		const intent = createHash("sha256").update(JSON.stringify([userMessagesFromBranch(ctx.sessionManager.getBranch()), h.state.classifierModel ?? settings.classifierModel, cacheSalt ?? ""])).digest("hex");
 		const out = await policy.authorize({
 			device: t.device.name,
 			label: label(t.device),
 			baseMode: h.modeOf(t.device),
 			action,
 			protectedHit,
-			cacheSalt,
+			cacheSalt: intent,
+			scope: JSON.stringify([t.conn.target.host, t.conn.user, t.conn.home]),
 			ask: ctx.hasUI ? (d) => confirm(ctx, t, action, d, signal) : undefined,
 			classify: () => classify(ctx, t, action, signal),
 			onModeChange: (m) => persistMode(t.device, m, ctx),
@@ -296,9 +317,10 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 		if (out.classifier) acc.push(out.classifier);
 		if (j) j.how = decisionOf(out.how);
 		if (!out.ok) throw new Error(out.message);
+		if (signal?.aborted || session.signal.aborted) throw new Error("Operation aborted");
 	}
 
-	/** Refusals that need no dialog (ro device, root not available yet); throws. */
+	/** Refusals that need no dialog (ro device); throws. */
 	function early(t: Remote, input: Omit<ActionInput, "home" | "globs">, j?: Journaled): void {
 		const h = H();
 		const why = earlyRefusal({ ...input, home: t.conn.home, globs: h.protectedGlobs(t.device) }, modeOf(t.device), label(t.device));
@@ -343,7 +365,9 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 		const j: Journaled = { how: "auto" };
 		try {
 			const r = await fn(j);
-			journal(ctx, t, tool, summary, j.how, true, detailOf?.(r), started);
+			const ok = !(r as any)?.isError;
+			const exit = (r as any)?.structuredContent?.exit_code;
+			journal(ctx, t, tool, summary, j.how, ok, typeof exit === "number" ? `exit ${exit}` : detailOf?.(r), started);
 			return r;
 		} catch (err) {
 			const exit = /exited with code (\d+)/.exec(msg(err))?.[1];
@@ -386,7 +410,8 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 				if (params?.device === undefined || params.device === null || params.device === "") return local.execute(id, params, signal, onUpdate, ctx);
 				const t = await resolveTarget(params.device, ctx);
 				if (t.kind === "local") return local.execute(id, params, signal, onUpdate, ctx);
-				return remoteExecute(t, params, signal, onUpdate, ctx);
+				const remoteSignal = signal ? AbortSignal.any([session.signal, signal]) : session.signal;
+				return remoteExecute(t, params, remoteSignal, onUpdate, ctx);
 			},
 			renderCall(args: any, theme: any, context: any) {
 				const a = displayArgs(tool, args, isRemote);
@@ -404,6 +429,8 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 	/** The root dialog on the device or in pi (PLAN §8). The password never reaches the model, the journal or a log. */
 	function rootRun(ctx: ExtensionContext, t: Remote, command: string, signal?: AbortSignal) {
 		const name = label(t.device);
+		if (!ctx.hasUI) throw new Error(`root on ${name}: requires an interactive UI; nothing was run`);
+		signal = signal ? AbortSignal.any([session.signal, signal]) : session.signal;
 		return {
 			pref: t.device.settings.rootPrompt,
 			from: H().localLabel(),
@@ -438,7 +465,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 	function createRootOps(ctx: ExtensionContext, t: Remote, inner: string, j: Journaled): BashOps {
 		return {
 			async exec(_command, _cwd, { onData, signal, timeout }) {
-				const limitS = timeout && timeout > 0 ? timeout : BASH_DEFAULT_TIMEOUT_S;
+				const limitS = remoteTimeoutSeconds(timeout);
 				const atDevice = await userIsAt(t);
 				showRemote(t.device, ctx, "root");
 				try {
@@ -466,9 +493,8 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 			const abs = resolveRemotePath(String(params.path ?? ""), t.conn.home);
 			return journaled(ctx, t, "read", abs, async (j) => {
 				const acc: ClassifierResult[] = [];
-				await authorize(ctx, t, { tool: "read", path: abs }, signal, acc, undefined, j);
 				const check = (p: string) => authorize(ctx, t, { tool: "read", path: p }, signal, acc, undefined, j);
-				const def = createReadToolDefinition(ctx.cwd, { operations: createReadOps(t.conn, check) } as any) as any;
+				const def = createReadToolDefinition(ctx.cwd, { operations: createReadOps(t.conn, check, signal, abs) } as any) as any;
 				return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
 			});
 		});
@@ -485,7 +511,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 				async (j) => {
 					early(t, { tool: "write", path: abs }, j);
 					const acc: ClassifierResult[] = [];
-					const def = createWriteToolDefinition(ctx.cwd, { operations: createWriteOps(t.conn, beforeWrite(ctx, t, "write", signal, acc, j)) } as any) as any;
+					const def = createWriteToolDefinition(ctx.cwd, { operations: createWriteOps(t.conn, beforeWrite(ctx, t, "write", signal, acc, j), signal) } as any) as any;
 					return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
 				},
 				() => (typeof params.content === "string" ? formatBytes(Buffer.byteLength(params.content)) : undefined),
@@ -504,7 +530,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 				async (j) => {
 					early(t, { tool: "edit", path: abs }, j);
 					const acc: ClassifierResult[] = [];
-					const def = createEditToolDefinition(ctx.cwd, { operations: createEditOps(t.conn, beforeWrite(ctx, t, "edit", signal, acc, j)) } as any) as any;
+					const def = createEditToolDefinition(ctx.cwd, { operations: createEditOps(t.conn, beforeWrite(ctx, t, "edit", signal, acc, j), (path) => authorize(ctx, t, { tool: "read", path }, signal, acc, undefined, j), signal) } as any) as any;
 					return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
 				},
 				diffStat,
@@ -606,12 +632,12 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 
 	/** Why a bash call is blocked (ssh/scp/curl… to a device without `device`), else undefined. */
 	function guardCheck(command: unknown, device?: unknown): string | undefined {
-		if (!hub) return undefined;
+		const h = H();
 		if (isRemote(device)) return undefined; // runs on the device; what it does there is its own business
 		const cmd = String(command ?? "");
 		if (!mentionsNetVerb(cmd)) return undefined;
-		const devices = hub.devices();
-		const hit = deviceTargetInCommand(cmd, { names: deviceNames(devices), domains: hub.domains(), self: hub.localNames() });
+		const devices = h.devices();
+		const hit = deviceTargetInCommand(cmd, { names: deviceNames(devices), domains: h.domains(), self: h.localNames() });
 		return hit ? guardReason(hit, devices) : undefined;
 	}
 
@@ -630,7 +656,11 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 	// --- lifecycle --------------------------------------------------------------------------------
 
 	pi.on("session_start", async (event, ctx) => {
-		if (session.signal.aborted) session = new AbortController();
+		if (session.signal.aborted) {
+			session = new AbortController();
+			hub = undefined;
+			(globalThis as any)[GUARD_KEY] = guardCheck;
+		}
 		ctxRef = ctx;
 		try {
 			// Global settings only: pi.getSettings() would merge in the project's .pi/settings.json.
@@ -675,7 +705,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 		if (footerTimer) clearTimeout(footerTimer);
 		footerTimer = undefined;
 		ctxRef = undefined;
-		if (event.reason === "quit") await withTimeout(hub?.closeAll() ?? Promise.resolve(), 2500);
+		await withTimeout(hub?.closeAll() ?? Promise.resolve(), 2500);
 	});
 
 	// --- /nb --------------------------------------------------------------------------------------

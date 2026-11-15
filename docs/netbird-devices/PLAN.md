@@ -1,6 +1,8 @@
 # netbird-devices — план расширения Pi
 
 Статус: этапы A–D реализованы и закоммичены в ветке `extensions/netbird-devices` (без пуша); §16 проверен на Mac (Linux — нет).
+После независимого ревью внесены уточнения безопасности: `REVIEW.md` и раздел «Ревью» в `IMPLEMENTATION.md`
+приоритетны над историческим планом ниже (NOPASSWD, белый список bash, кэш, lifecycle).
 Рабочая копия: `/home/orca/orca/workspaces/pi-setup/Netbird-devices` (репозиторий `pi-setup`,
 пакет Pi `git:github.com/dsgstdbmslf/pi-setup`, загружается `extensions/*.ts`).
 

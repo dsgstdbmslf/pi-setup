@@ -62,13 +62,16 @@ export function globToRegExp(glob: string): RegExp {
 		} else if (c === "?") re += "[^/]";
 		else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
 	}
-	return new RegExp(`^${re}$`);
+	return new RegExp(`^${re}$`, "s");
 }
 
 /** The first protected glob that matches the absolute path (a protected directory also covers itself). */
 export function protectedMatch(absPath: string, home: string, globs: readonly string[]): string | undefined {
+	// Conservatively fold case on every OS: macOS volumes commonly ignore case and
+	// Unicode normalization. This only broadens protection on case-sensitive volumes.
+	absPath = normalizePosix(absPath).normalize("NFC").toLowerCase();
 	for (const g of globs) {
-		let pat = expandHome(g, home);
+		let pat = expandHome(g, home).normalize("NFC").toLowerCase();
 		if (!pat.startsWith("/") && !pat.startsWith("**")) pat = `**/${pat}`;
 		const re = globToRegExp(pat);
 		if (re.test(absPath)) return g;
@@ -141,9 +144,9 @@ export function words(simple: string): string[] {
 }
 
 const READ_ONLY = new Set([
-	"ls", "cat", "head", "tail", "wc", "file", "stat", "du", "df", "pwd", "whoami", "id", "groups", "uname", "sw_vers",
+	"ls", "cat", "head", "tail", "wc", "stat", "du", "df", "pwd", "whoami", "id", "groups", "uname", "sw_vers",
 	"uptime", "ps", "pgrep", "which", "type", "echo", "printf", "grep", "egrep", "fgrep",
-	"ag", "cut", "tr", "jq", "column", "basename", "dirname", "realpath", "readlink",
+	"cut", "tr", "jq", "column", "basename", "dirname", "realpath", "readlink",
 	"md5", "md5sum", "shasum", "sha1sum", "sha256sum", "diff", "cmp", "vm_stat", "free", "lsblk",
 	"ioreg", "system_profiler", "mdfind", "mdls", "lsof", "netstat",
 	"nproc", "lscpu", "lsusb", "lspci", "locale", "test", "true", "false", "sleep", "hexdump", "od",
@@ -167,9 +170,9 @@ function positionals(args: readonly string[], valued: readonly string[] = []): s
 	}
 	return out;
 }
-const gitAllOpts = (args: readonly string[]) => !hasLong(args, /^--(output|ext-diff|textconv)\b/);
-
 const READ_ONLY_FN: Record<string, ArgCheck> = {
+	file: (a) => !hasShort(a, "Cf") && !hasLong(a, /^--(compile|files-from)/),
+	printf: (a) => a[0] !== "-v", // builtin printf -v can change PATH before the next command
 	sort: (a) => !hasShort(a, "o") && !hasLong(a, /^--(o|co)/), // -o FILE writes, --compress-program runs a program
 	uniq: (a) => positionals(a, ["-f", "-s", "-w"]).length <= 1, // uniq IN OUT writes OUT
 	xxd: (a) => !hasShort(a, "r") && positionals(a, ["-c", "-g", "-l", "-s", "-o"]).length <= 1, // -r rebuilds a file, `xxd IN OUT` writes
@@ -199,79 +202,40 @@ const READ_ONLY_FN: Record<string, ArgCheck> = {
 		return rest.every((x) => ["-l", "-v", "-V", "-h"].includes(x)); // `mount DEV DIR` mounts
 	},
 	command: (a) => /^-[vV]$/.test(a[0] ?? ""), // `command rm ...` runs rm
-	dmesg: (a) => !hasShort(a, "cCDE") && !hasLong(a, /^--(c|r)/), // clearing the ring buffer
 	ifconfig: (a) => a.every((x) => /^-[aluLdvmrs]+$/.test(x)) || (a.length === 1 && /^[a-z]+\d*$/.test(a[0])), // `ifconfig en0 down`
-	scutil: (a) => /^--(get|dns|proxy|nwi)\b|^-r\b/.test(a[0] ?? ""),
-	networksetup: (a) => /^-(list|get|print|show)\w*/.test(a[0] ?? ""),
-	git: (a) => {
-		const sub = a[0];
-		const rest = a.slice(1);
-		switch (sub) {
-			case "status":
-			case "log":
-			case "show":
-			case "diff":
-			case "rev-parse":
-			case "describe":
-			case "blame":
-			case "ls-files":
-			case "ls-tree":
-			case "shortlog":
-				return gitAllOpts(rest);
-			case "branch": {
-				const flags = rest.filter((x) => x.startsWith("-"));
-				const listing = flags.some((x) => x === "-l" || x === "--list");
-				if (!flags.every((x) => /^(-[alrv]+|--(list|all|remotes|verbose|show-current|no-color|color)(=\S*)?)$/.test(x))) return false;
-				return listing || positionals(rest).length === 0;
-			}
-			case "remote":
-				return rest.length === 0 || (rest.length === 1 && rest[0] === "-v") || (["show", "get-url"].includes(rest[0]) && !rest.slice(1).some((x) => /^-/.test(x) && x !== "-n"));
-			case "tag":
-				return rest.length === 0 || ((rest[0] === "-l" || rest[0] === "--list") && rest.every((x) => !x.startsWith("-") || /^(-l|--list|-n\d*|--sort=\S+|--format=\S+|--contains|--merged|--no-merged)$/.test(x)));
-			case "config":
-				return /^--get/.test(rest[0] ?? "");
-			case "stash":
-				return rest[0] === "list" && gitAllOpts(rest);
-			case "reflog":
-				return rest.length === 0;
-			default:
-				return false;
-		}
-	},
+	scutil: (a) => (a.length === 1 && ["--dns", "--proxy", "--nwi"].includes(a[0])) || (a.length === 2 && ["--get", "-r"].includes(a[0]) && !a[1].startsWith("-")),
+	networksetup: (a) => /^-(list|get|print|show)\w*$/.test(a[0] ?? "") && a.slice(1).every((x) => !x.startsWith("-")),
+	sysctl: (a) => a.every((x) => !x.includes("=") && (!x.startsWith("-") || /^-[aneNqob]+$/.test(x))),
+	plutil: (a) => ["-p", "-lint", "-help"].includes(a[0]) && a.every((x) => !x.startsWith("-") || ["-p", "-lint", "-help", "-s", "--"].includes(x)),
 };
 /** Subcommands that only read, for tools that can also write. */
 const READ_ONLY_SUB: Record<string, RegExp> = {
-	brew: /^(list|ls|info|search|--prefix|--version|config|doctor|outdated|deps|uses|leaves|services\s+list)\b/,
-	npm: /^(ls|list|view|info|outdated|config\s+get|root|prefix|--version|-v)\b/,
 	systemctl: /^(status|list-units|list-unit-files|is-active|is-enabled|is-failed|show|cat|list-timers)\b/,
-	journalctl: /^(?!.*--(vacuum|rotate|flush))/,
 	launchctl: /^(list|print|blame|managername|print-disabled)\b/,
 	defaults: /^(read|domains|read-type|find)\b/,
 	docker: /^(ps|images|logs|inspect|version|info|stats\s+--no-stream)\b/,
 	ip: /^(-\w+\s+)*(a|addr|address|r|route|l|link|n|neigh)(\s+(show|list))?\b(?!.*\b(add|del|delete|flush|set|change|replace)\b)/,
-	sysctl: /^(?!.*(-w\b|=))/,
-	find: /^(?!.*\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b)/,
-	sed: /^(?!.*(\s-i|--in-place))/,
-	awk: /^(?!.*(\bsystem\b|\|\s*&?\s*\S|\bgetline\b|print\s*>|(^|\s)-i\b))/,
 	csrutil: /^status\b/,
 	fdesetup: /^(status|isactive|list)\b/,
-	spctl: /^(--status|-a\b|--assess)/,
-	pmset: /^-g\b/,
-	plutil: /^(-p|-lint|-help)\b/,
 	ping: /^(?=.*-c\s*\d)/,
 };
 
 /** True when every part of the command is a known read-only command without redirections or substitutions. */
 export function isReadOnlyCommand(command: string): boolean {
 	// `2>&1` and redirections to /dev/null are harmless (and their `&` must not look like a background job).
-	const plain = command.replace(/2>&1|>\s*\/dev\/null|2>\s*\/dev\/null/g, " ");
-	if (/[`]|\$\(|>|<\(|>\(/.test(plain)) return false;
+	const plain = command.replace(/2>&1(?=$|[\s;&|])|(?:2)?>\s*\/dev\/null(?=$|[\s;&|])/g, " ");
+	// This is deliberately not a shell parser. Ambiguous expansion, escapes and
+	// embedded programs need approval rather than a growing denylist of flags.
+	const syntax = plain.replace(/\$\{HOME\}|\$HOME\b/g, "HOME");
+	if (/[`$\\><(){}*?\[\]]/.test(syntax)) return false;
+	if (/~[^/\s'";]/.test(plain)) return false; // ~otheruser, ~+, ~-
+
 	const parts = splitCommands(plain);
 	if (!parts?.length) return false;
 	for (const part of parts) {
 		const w = words(part);
-		while (w.length && /^\w+=/.test(w[0])) w.shift(); // VAR=x cmd
-		if (!w.length) return false;
+		if (!w.length || /^\w+=/.test(w[0])) return false; // PATH/LD_PRELOAD/etc. can execute code
+		if (w[0].includes("/") && !/^\/(usr\/)?bin\/[a-z0-9_-]+$/.test(w[0])) return false;
 		const cmd = w[0].replace(/^.*\//, "");
 		if (cmd === "sudo") return false;
 		const fn = READ_ONLY_FN[cmd];
@@ -352,6 +316,11 @@ function expandWord(w: string, home: string): string {
  * globs in the middle of a word (`~/.s*`/id_rsa) and variables other than HOME are not resolved.
  */
 export function protectedInCommand(command: string, home: string, globs: readonly string[], cwd = home): string | undefined {
+	// Unresolved shell expansion could name a protected file. Likewise recursive
+	// content searches can read secrets without spelling out their paths.
+	const syntax = command.replace(/\$\{HOME\}|\$HOME\b/g, "HOME");
+	if (/[`$\\*?\[\]{}]/.test(syntax) || /~[^/\s'";]/.test(command)) return "dynamic shell paths (cannot rule out protected files)";
+	const recursive = /(^|[\s;|&/])(rg|ag)(?=\s|$)|\b(?:grep|egrep|fgrep)\s+[^;|&]*-[^-\s]*[rR]/.test(command);
 	let dir = cwd;
 	for (const part of simpleCommands(command)) {
 		const w = words(part);
@@ -366,7 +335,7 @@ export function protectedInCommand(command: string, home: string, globs: readonl
 			if (eq > 0) cands.add(word.slice(eq + 1)); // --file=~/.ssh/x, VAR=~/.ssh/x
 			for (const c of [...cands]) cands.add(c.replace(/^\d*[<>]+&?/, "")); // 2>~/x, >>file
 			for (const c of cands) {
-				if (!c || c.startsWith("-") || /\s/.test(c)) continue;
+				if (!c || c.startsWith("-")) continue;
 				const e = expandWord(c, home);
 				const abs = normalizePosix(e.startsWith("/") ? e : `${dir}/${e}`);
 				const hit = protectedMatch(abs, home, globs);
@@ -374,7 +343,31 @@ export function protectedInCommand(command: string, home: string, globs: readonl
 			}
 		}
 	}
-	return undefined;
+	return recursive ? "recursive search (may include protected files)" : undefined;
+}
+
+/** Best-effort literal argument paths for remote symlink checks (not an interpreter for programs). */
+export function commandPathCandidates(command: string, home: string): string[] {
+	const paths = new Set<string>();
+	let dir = home;
+	for (const part of simpleCommands(command)) {
+		const w = words(part);
+		for (const word of w.slice(1)) {
+			const eq = word.indexOf("=");
+			const variants = eq > 0 ? [word, word.slice(eq + 1)] : [word];
+			for (let candidate of variants) {
+				candidate = candidate.replace(/^\d*[<>]+&?/, "");
+				if (!candidate || candidate.startsWith("-") || /[`$*?\[\]{}]/.test(candidate.replace(/\$\{HOME\}|\$HOME\b/g, "HOME"))) continue;
+				const expanded = expandWord(candidate, home);
+				paths.add(normalizePosix(expanded.startsWith("/") ? expanded : `${dir}/${expanded}`));
+			}
+		}
+		if (w[0] === "cd" && w[1] && !w[1].startsWith("-")) {
+			const expanded = expandWord(w[1], home);
+			dir = normalizePosix(expanded.startsWith("/") ? expanded : `${dir}/${expanded}`);
+		}
+	}
+	return [...paths];
 }
 
 /** `sudo <command>` at the start (no sudo options) runs the rest as root through a password dialog. */
@@ -418,8 +411,10 @@ export function decide({ mode, action, protectedHit, approved }: PolicyInput): D
 		if (danger) return askDanger();
 		if (protectedHit && !approved) return askProtected();
 		if (mode === "auto") return { verdict: "classify", reason: "root command, mode auto" };
-		// ask/full: the password dialog on the device (or in pi) is the confirmation.
-		return { verdict: "allow", reason: "root: password dialog confirms" };
+		// NOPASSWD can skip sudo's askpass helper entirely. Do not treat a
+		// hypothetical password dialog as confirmation in ask mode.
+		if (mode === "ask") return { verdict: "ask", reason: "root command (sudo may not require a password)" };
+		return { verdict: "allow", reason: "root: mode full" };
 	}
 	// Dangerous commands are always asked: an earlier approval, mode full and the read-only list do not count.
 	if (danger) return askDanger();

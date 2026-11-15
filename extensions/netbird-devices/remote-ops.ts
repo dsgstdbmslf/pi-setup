@@ -43,18 +43,22 @@ export interface BashOps {
  * `check` runs on every path the read actually opens (a name variant found on the device may differ
  * from the one asked for) and throws to refuse.
  */
-export function createReadOps(c: Conn, check?: (abs: string) => void | Promise<void>): ReadOps {
+export function createReadOps(c: Conn, check?: (abs: string) => void | Promise<void>, signal?: AbortSignal, requestedPath?: string): ReadOps {
 	const actual = new Map<string, string>();
-	const real = (p: string) => actual.get(p) ?? p;
+	// Pi's read resolver may pick a name variant by probing the *local* FS.
+	// For remote calls only our remote access/variant check chooses the filename.
+	const wanted = (p: string) => requestedPath ?? p;
+	const real = (p: string) => actual.get(p) ?? wanted(p);
 	return {
 		async access(p) {
+			await check?.(wanted(p));
 			try {
-				await access(c.target, p, "r");
+				await access(c.target, wanted(p), "r", { signal });
 			} catch (e) {
 				if (e instanceof SshError && e.code === "ENOENT") {
 					// macOS screenshot names (U+202F before AM/PM), NFD/NFC forms, curly quotes.
-					const v = await resolveVariant(c.target, p);
-					if (v && v !== p) {
+					const v = await resolveVariant(c.target, wanted(p), { signal });
+					if (v && v !== wanted(p)) {
 						await check?.(v);
 						actual.set(p, v);
 						return;
@@ -63,7 +67,7 @@ export function createReadOps(c: Conn, check?: (abs: string) => void | Promise<v
 				throw e;
 			}
 		},
-		readFile: (p) => readFile(c.target, real(p)),
+		readFile: (p) => readFile(c.target, real(p), { signal }),
 		detectImageMimeType: async (p) => imageMimeFromPath(real(p)),
 	};
 }
@@ -75,7 +79,7 @@ export function createReadOps(c: Conn, check?: (abs: string) => void | Promise<v
 export type BeforeWrite = (info: { path: string; content: string; old?: string; isNew: boolean }) => Promise<void>;
 
 /** `mkdir` does nothing: the write script creates parent directories (so a refused write leaves no directory behind). */
-export function createWriteOps(c: Conn, before?: BeforeWrite): WriteOps {
+export function createWriteOps(c: Conn, before?: BeforeWrite, signal?: AbortSignal): WriteOps {
 	return {
 		mkdir: async () => {},
 		async writeFile(p, content) {
@@ -83,30 +87,33 @@ export function createWriteOps(c: Conn, before?: BeforeWrite): WriteOps {
 				let old: string | undefined;
 				let isNew = false;
 				try {
-					old = (await readFile(c.target, p)).toString("utf8");
+					old = (await readFile(c.target, p, { signal })).toString("utf8");
 				} catch (e) {
 					if (e instanceof SshError && e.code === "ENOENT") isNew = true;
 					else if (e instanceof SshError && e.kind) throw e; // connection problem: do not guess
 				}
 				await before({ path: p, content, old, isNew });
 			}
-			return writeFile(c.target, p, content);
+			return writeFile(c.target, p, content, { signal });
 		},
 	};
 }
 
-export function createEditOps(c: Conn, before?: BeforeWrite): EditOps {
+export function createEditOps(c: Conn, before?: BeforeWrite, checkRead?: (path: string) => Promise<void>, signal?: AbortSignal): EditOps {
 	const seen = new Map<string, string>();
 	return {
-		access: (p) => access(c.target, p, "rw"),
+		async access(p) {
+			await checkRead?.(p);
+			await access(c.target, p, "rw", { signal });
+		},
 		async readFile(p) {
-			const b = await readFile(c.target, p);
+			const b = await readFile(c.target, p, { signal });
 			if (before) seen.set(p, b.toString("utf8"));
 			return b;
 		},
 		async writeFile(p, content) {
 			if (before) await before({ path: p, content, old: seen.get(p), isNew: false });
-			return writeFile(c.target, p, content);
+			return writeFile(c.target, p, content, { signal });
 		},
 	};
 }
@@ -115,6 +122,12 @@ export function createEditOps(c: Conn, before?: BeforeWrite): EditOps {
 export const BASH_DEFAULT_TIMEOUT_S = 30 * 60;
 export const BASH_MAX_BYTES = 64 * 1024 * 1024;
 
+export function remoteTimeoutSeconds(timeout?: number): number {
+	if (timeout === undefined) return BASH_DEFAULT_TIMEOUT_S;
+	if (!Number.isFinite(timeout) || timeout <= 0 || timeout * 1000 > 2_147_483_647) throw new Error("Invalid timeout: must be a finite positive number of seconds, at most 2147483.647");
+	return timeout;
+}
+
 /**
  * The agent's command runs in /bin/bash on the device from the user's home with their login PATH.
  * The directory the tool gets is the local one and means nothing on the device, so it is ignored.
@@ -122,7 +135,7 @@ export const BASH_MAX_BYTES = 64 * 1024 * 1024;
 export function createBashOps(c: Conn): BashOps {
 	return {
 		async exec(command, _cwd, { onData, signal, timeout }) {
-			const limitS = timeout && timeout > 0 ? timeout : BASH_DEFAULT_TIMEOUT_S;
+			const limitS = remoteTimeoutSeconds(timeout);
 			const script = bashWrapper(command, { path: c.probe.path });
 			const r = await exec(c.target, script, {
 				signal,

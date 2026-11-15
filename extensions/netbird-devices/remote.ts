@@ -80,6 +80,7 @@ export const ASKPASS_STATUS_CANCEL = 197;
 export const ASKPASS_STATUS_UNAVAILABLE = 196;
 
 const MAC_ASKPASS = `#!/bin/sh
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 d=$(dirname "$0")
 r=$(/usr/bin/osascript - "$PI_NB_TITLE" "$PI_NB_TEXT" "$1" 2>"$d/err" <<'OSA'
 on run argv
@@ -98,6 +99,7 @@ exit 1
 `;
 
 const LINUX_ASKPASS = `#!/bin/sh
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 d=$(dirname "$0"); uid=$(id -u)
 export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/$uid}"
 [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && [ -S "$XDG_RUNTIME_DIR/bus" ] && export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
@@ -111,11 +113,13 @@ $1"
 if command -v zenity >/dev/null 2>&1; then
 	r=$(zenity --entry --hide-text --title="$PI_NB_TITLE" --text="$text" --timeout=120 2>"$d/err"); rc=$?
 elif command -v kdialog >/dev/null 2>&1; then
-	r=$(kdialog --title "$PI_NB_TITLE" --password "$text" 2>"$d/err"); rc=$?
+	command -v timeout >/dev/null 2>&1 || { echo unavailable > "$d/status"; exit 1; }
+	r=$(timeout 120 kdialog --title "$PI_NB_TITLE" --password "$text" 2>"$d/err"); rc=$?
 else
 	a=""; for p in ksshaskpass /usr/lib/ssh/ssh-askpass /usr/libexec/openssh/gnome-ssh-askpass /usr/lib/openssh/gnome-ssh-askpass /usr/bin/ssh-askpass; do command -v "$p" >/dev/null 2>&1 && { a="$p"; break; }; done
 	if [ -z "$a" ]; then echo unavailable > "$d/status"; exit 1; fi
-	r=$("$a" "$text" 2>"$d/err"); rc=$?
+	command -v timeout >/dev/null 2>&1 || { echo unavailable > "$d/status"; exit 1; }
+	r=$(timeout 120 "$a" "$text" 2>"$d/err"); rc=$?
 fi
 if [ $rc -eq 0 ]; then echo ok > "$d/status"; printf '%s\\n' "$r"; exit 0; fi
 if grep -qiE 'cannot open display|unable to init|failed to connect|could not connect|gtk-warning|qt.qpa' "$d/err"; then echo unavailable; else echo cancel; fi > "$d/status"
@@ -128,24 +132,29 @@ export function askpassScript(os: string): string {
 
 /**
  * Root through a native password dialog on the device: a private temp askpass helper, then
- * `sudo -k -A` (always asks, never uses cached credentials). The password goes from the dialog to
+ * `/usr/bin/sudo -k -A` (ignores cached credentials; NOPASSWD can skip prompting). The password goes from the dialog to
  * sudo on the device and never leaves it. Exit 196/197 when the dialog was unavailable/cancelled.
  */
 export function rootNativeWrapper(command: string, opts: { os: string; cwd?: string; path?: string; title: string; text: string }): string {
 	const script = askpassScript(opts.os);
 	return [
 		"umask 077",
+		"export PATH=/usr/bin:/bin:/usr/sbin:/sbin",
 		't=$(mktemp -d "${TMPDIR:-/tmp}/pinb.XXXXXX") || exit 1',
 		'trap \'rm -rf "$t"\' EXIT',
+		'trap \'exit 197\' HUP INT TERM',
 		`cat > "$t/askpass" <<'PINB_ASKPASS_EOF'\n${script}PINB_ASKPASS_EOF`,
-		'chmod 700 "$t/askpass"',
+		'chmod 700 "$t/askpass" || exit 1',
 		cdStep(opts.cwd),
 		opts.path ? `export PATH=${shq(opts.path)}` : ":",
-		`SUDO_ASKPASS="$t/askpass" PI_NB_TITLE=${shq(opts.title)} PI_NB_TEXT=${shq(opts.text)} sudo -k -A -p 'Password:' -- /bin/bash -c ${shq(agentScript(command))}`,
+		`SUDO_ASKPASS="$t/askpass" PI_NB_TITLE=${shq(opts.title)} PI_NB_TEXT=${shq(opts.text)} /usr/bin/sudo -k -A -p 'Password:' -- /bin/bash -c ${shq(agentScript(command))}`,
 		"rc=$?",
 		'st=$(cat "$t/status" 2>/dev/null)',
 		`[ "$st" = unavailable ] && exit ${ASKPASS_STATUS_UNAVAILABLE}`,
 		`[ "$st" = cancel ] && exit ${ASKPASS_STATUS_CANCEL}`,
+		// Reserved helper codes must not be confused with the agent command's
+		// exit status (which would otherwise trigger a second execution via Pi).
+		`[ "$rc" -eq ${ASKPASS_STATUS_UNAVAILABLE} ] || [ "$rc" -eq ${ASKPASS_STATUS_CANCEL} ] && rc=1`,
 		"exit $rc",
 	].join("\n");
 }
@@ -155,7 +164,7 @@ export function rootStdinWrapper(command: string, opts: { cwd?: string; path?: s
 	return [
 		cdStep(opts.cwd),
 		opts.path ? `export PATH=${shq(opts.path)}` : ":",
-		`exec sudo -S -k -p '' -- /bin/bash -c ${shq(agentScript(command))}`,
+		`exec /usr/bin/sudo -S -k -p '' -- /bin/bash -c ${shq(agentScript(command))}`,
 	].join("\n");
 }
 

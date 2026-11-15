@@ -2,6 +2,7 @@
 // Needs pi's packages to resolve (the entry imports pi-coding-agent and pi-tui at runtime), otherwise
 // skipped. Never touches the real ~/.ssh, ~/.pi or the real vault.
 
+import "./isolated-env.ts";
 import assert from "node:assert/strict";
 import { execFileSync, fork, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -85,6 +86,11 @@ test("extension end to end with a fake pi and a fake bw", { skip: (!available &&
 		}),
 	);
 	writeFileSync(join(binDir, "bw"), FAKE_BW(db), { mode: 0o755 });
+	// ssh -G ignores HOME and normally reads the passwd-home config, whose
+	// Match exec clauses can spawn real commands/askpass. Use only this fixture.
+	const realSsh = spawnSync("sh", ["-c", "command -v ssh"], { encoding: "utf8" }).stdout.trim();
+	const userConfig = join(home, ".ssh", "config");
+	writeFileSync(join(binDir, "ssh"), `#!/bin/sh\nif [ "$1" = -G ] && [ "$2" != -F ]; then shift; exec '${realSsh}' -F '${userConfig}' -G "$@"; fi\nexec '${realSsh}' "$@"\n`, { mode: 0o755 });
 
 	const saved = { ...process.env };
 	process.env.HOME = home;
@@ -213,8 +219,8 @@ test("extension end to end with a fake pi and a fake bw", { skip: (!available &&
 		assert.ok(commands.get("ssh").getArgumentCompletions("test ").some((i: any) => i.value === "test web"));
 
 		// Coordination with netbird-devices: it publishes a guard; bitwarden-ssh asks it before "Load SSH key?" and
-		// skips commands that are blocked anyway. (ssh -G reads the passwd home, not $HOME, so the host's key is
-		// not resolvable in this sandbox: we check the guard is consulted and that nothing is shown.)
+		// skips commands that are blocked anyway. ssh -G is isolated to this fixture;
+		// its key is already loaded, so this also checks no redundant dialog is shown.
 		const asked: Array<[string, unknown]> = [];
 		(globalThis as any).__piNetbirdDevicesGuard = (c: string, device?: unknown) => {
 			asked.push([c, device]);

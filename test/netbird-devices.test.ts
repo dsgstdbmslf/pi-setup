@@ -1,3 +1,4 @@
+import "./isolated-env.ts";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -107,12 +108,11 @@ const RO = (c: string) => isReadOnlyCommand(c);
 
 test("policy: plain read-only commands still pass", () => {
 	for (const c of [
-		"ls -la ~/proj", "cat a.txt | head -n 5", "git status", "git log --oneline -5", "git diff HEAD~1", "grep -r foo . | wc -l",
+		"ls -la ~/proj", "cat a.txt | head -n 5", "grep foo file | wc -l",
 		"sort a.txt | uniq -c", "uniq a.txt", "date", "date +%s", "date -u +%FT%T", "hostname", "hostname -f", "mount", "mount -l", "mount -t nfs",
 		"xxd file.bin | head", "xxd -l 16 file.bin", "base64 file.txt", "base64 -d file.b64", "tree -L 2", "rg -n foo", "codesign -dv /Applications/X.app", "codesign --verify --deep /Applications/X.app",
-		"git branch", "git branch -a", "git branch -r", "git branch -v", "git branch --show-current", "git branch --list 'feat*'", "git remote", "git remote -v", "git remote show origin",
-		"git remote get-url origin", "git tag", "git tag -l 'v*'", "git config --get user.name", "git stash list", "command -v brew", "ifconfig", "ifconfig -a", "ifconfig en0", "dmesg", "scutil --get ComputerName", "networksetup -listallhardwareports",
-		"awk '{print $1}' f", "echo hi 2>&1", "ls /nonexistent 2>/dev/null",
+		"command -v brew", "ifconfig", "ifconfig -a", "ifconfig en0", "scutil --get ComputerName", "networksetup -listallhardwareports",
+		"echo hi 2>&1", "ls /nonexistent 2>/dev/null",
 	]) assert.ok(RO(c), `should be read-only: ${c}`);
 });
 
@@ -183,7 +183,7 @@ test("policy: decide matrix", () => {
 	assert.equal(decide({ mode: "auto", action: bash("make") }).verdict, "classify");
 	assert.equal(decide({ mode: "full", action: bash("make") }).verdict, "allow");
 	assert.equal(decide({ mode: "ro", action: bash("ls", true) }).verdict, "deny");
-	assert.equal(decide({ mode: "ask", action: bash("ls", true) }).verdict, "allow");
+	assert.equal(decide({ mode: "ask", action: bash("ls", true) }).verdict, "ask");
 	assert.equal(decide({ mode: "auto", action: bash("ls", true) }).verdict, "classify");
 	assert.equal(approvalKey(bash(" ls ", true)), "bash:root:ls");
 	assert.equal(approvalKey(write), "write:/h/a.txt");
@@ -350,7 +350,7 @@ test("remote: root wrappers redirect the command's stdin (change 1)", () => {
 	try {
 		writeFileSync(join(dir, "sudo"), `#!/bin/sh\nwhile [ $# -gt 0 ]; do case "$1" in --) shift; break;; *) shift;; esac; done\nexec "$@"\n`);
 		chmodSync(join(dir, "sudo"), 0o755);
-		const r = sh(rootStdinWrapper("cat", {}), { input: "SECRET-PASSWORD\n", env: { PATH: `${dir}:/usr/bin:/bin` } });
+		const r = sh(rootStdinWrapper("cat", {}).replaceAll("/usr/bin/sudo", join(dir, "sudo")), { input: "SECRET-PASSWORD\n", env: { PATH: `${dir}:/usr/bin:/bin` } });
 		assert.equal(r.stdout, "", `password leaked: ${r.stdout}`);
 		assert.equal(r.status, 0);
 	} finally {

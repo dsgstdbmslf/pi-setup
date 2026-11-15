@@ -93,6 +93,10 @@ test("exec: stdin, binary output, onData, truncation", async () => {
 		const big = await exec(f.target, "head -c 100000 /dev/zero", { maxBytes: 1000 });
 		assert.equal(big.truncated, true);
 		assert.ok(big.stdout.length <= 1000);
+		let streamed = 0;
+		const noisy = await exec(f.target, "head -c 100000 /dev/zero >&2", { maxBytes: 1000, onData: (b) => { streamed += b.length; } });
+		assert.equal(noisy.truncated, true);
+		assert.ok(streamed <= 1000, "stderr obeys the same bound before streaming/spooling");
 	} finally {
 		f.cleanup();
 	}

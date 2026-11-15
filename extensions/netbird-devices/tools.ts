@@ -108,7 +108,7 @@ export function displayArgs<T>(tool: "read" | "write" | "edit" | "bash", args: T
 	const d = String(a.device).trim();
 	if (tool === "bash") return { ...a, command: typeof a.command === "string" ? `[${d}] ${a.command}` : a.command } as T;
 	const path = typeof a.path === "string" ? `${d}:${a.path}` : a.path;
-	if (tool === "edit") return { ...a, path, edits: undefined } as T;
+	if (tool === "edit") return { ...a, path, edits: undefined, oldText: undefined, newText: undefined, file_path: undefined } as T;
 	return { ...a, path } as T;
 }
 

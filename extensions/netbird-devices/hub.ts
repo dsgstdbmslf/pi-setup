@@ -3,6 +3,7 @@
 // dependency can be replaced for tests.
 
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { hostname as osHostname } from "node:os";
 import { buildDevices, type Device, userCandidates } from "./devices.ts";
@@ -79,6 +80,9 @@ export class Hub {
 	private inbound = new Map<string, number>();
 	private conns = new Map<string, Conn & { at: number }>();
 	private inflight = new Map<string, Promise<Conn>>();
+	private openedTargets = new Map<string, Target>();
+	private closed = false;
+	private controlId = randomBytes(16).toString("hex");
 	private refreshing?: Promise<void>;
 	private sshBin?: string;
 	private now: () => number;
@@ -242,7 +246,7 @@ export class Hub {
 
 	private baseTarget(d: Device): Omit<Target, "user"> {
 		const host = ipv4First(d.ips)[0] ?? d.fqdn ?? d.peer;
-		return { host, port: d.settings.port, hostKeyAlias: d.fqdn ?? d.peer, paths: { knownHosts: this.d.paths.knownHosts, cmDir: this.d.paths.cmDir }, sshBin: this.sshBin };
+		return { host, port: d.settings.port, hostKeyAlias: d.fqdn ?? d.peer, controlId: this.controlId, paths: { knownHosts: this.d.paths.knownHosts, cmDir: this.d.paths.cmDir }, sshBin: this.sshBin };
 	}
 
 	private toConn(d: Device, user: string, info: NonNullable<DeviceState["probe"]>): Conn {
@@ -271,6 +275,7 @@ export class Hub {
 	 * Concurrent calls share one login.
 	 */
 	connect(d: Device, opts: { ask?: AskUser } = {}): Promise<Conn> {
+		if (this.closed) return Promise.reject(new Error("Device session is closed"));
 		let p = this.inflight.get(d.name);
 		if (!p) {
 			p = this.doConnect(d, opts.ask).finally(() => this.inflight.delete(d.name));
@@ -291,17 +296,25 @@ export class Hub {
 			return c;
 		}
 		const base = this.baseTarget(d);
-		if (fixed) return this.save(d, fixed.user, fixed.source, await probe({ ...base, user: fixed.user }));
+		const track = (user: string) => {
+			const t = { ...base, user };
+			this.openedTargets.set(JSON.stringify([t.host, t.port, t.user]), t);
+			return t;
+		};
+		if (fixed) return this.save(d, fixed.user, fixed.source, await probe(track(fixed.user)));
 		const candidates = userCandidates(d.peer, undefined, ds?.user, this.d.vmUser);
+		for (const user of candidates) track(user);
 		try {
 			const r = await detectUser(base, candidates, d.name);
+			track(r.user);
+			for (const user of r.tried) track(user);
 			return this.save(d, r.user, "detected", r.probe);
 		} catch (e) {
 			if (!(e instanceof SshError) || e.kind !== "auth" || !ask) throw e;
 			const user = (await ask(d, e.message))?.trim();
 			if (!user) throw e;
 			if (!/^[\w][\w.@-]*$/.test(user) || user === "root") throw new SshError(`${d.name}: "${user}" is not a usable login user`, { kind: "auth" });
-			return this.save(d, user, "asked", await probe({ ...base, user }));
+			return this.save(d, user, "asked", await probe(track(user)));
 		}
 	}
 
@@ -326,7 +339,7 @@ export class Hub {
 	async forget(d: Device): Promise<void> {
 		const conn = this.conns.get(d.name);
 		this.conns.delete(d.name);
-		// A master may be left by an earlier process or another login of this device: close every user it could have.
+		// Close this runtime's possible logins; other Pi sessions have their own namespace.
 		const users = new Set([conn?.user, this.state.devices[d.name]?.user, ...userCandidates(d.peer, d.settings.user, undefined, this.d.vmUser)].filter((u): u is string => !!u));
 		await Promise.all([...users].map((user) => stopMaster({ ...this.baseTarget(d), user })));
 		this.updateState((s) => {
@@ -335,11 +348,14 @@ export class Hub {
 		await this.run("ssh-keygen", ["-R", d.fqdn ?? d.peer, "-f", this.d.paths.knownHosts]);
 	}
 
-	/** Close the connections we opened (session quit). */
+	/** Close all attempted logins, including probes still finishing during reload. */
 	async closeAll(): Promise<void> {
-		const conns = [...this.conns.values()];
+		this.closed = true;
+		await Promise.allSettled([...this.inflight.values()]);
+		const targets = [...this.openedTargets.values(), ...[...this.conns.values()].map((c) => c.target)];
 		this.conns.clear();
-		await Promise.all(conns.map((c) => stopMaster(c.target)));
+		this.openedTargets.clear();
+		await Promise.all(targets.map((t) => stopMaster(t)));
 	}
 
 	// --- where is the user -------------------------------------------------------------------------

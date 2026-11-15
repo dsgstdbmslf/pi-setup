@@ -66,7 +66,7 @@ test("authorize: table of PLAN §9 (no dialog needed)", async () => {
 		["ro", bash("ls ~"), true, false],
 		["ro", bash("touch x"), true, true],
 		["ask", write(), true, true],
-		["ask", bash("git status"), true, false],
+		["ask", bash("git status"), true, true],
 		["full", write(), true, false],
 		["full", bash("make"), true, false],
 	];
@@ -125,9 +125,9 @@ test("authorize: dialog answers — once, always (exact key only), full (session
 	assert.equal(d2.ok, false);
 	assert.match((d2 as any).message, /denied by user/);
 	// the approval was for a path of the mac only through the key
-	assert.equal(p.isApproved(write("/h/a")), true);
-	assert.equal(p.isApproved(write("/h/zzz")), false);
-	assert.equal(p.isApproved(bash("/h/a")), false);
+	assert.equal(p.isApproved(write("/h/a"), "mac"), true);
+	assert.equal(p.isApproved(write("/h/zzz"), "mac"), false);
+	assert.equal(p.isApproved(bash("/h/a"), "mac"), false);
 });
 
 test("authorize: dangerous commands are asked every time and cannot be approved or switch to full", async () => {
@@ -142,7 +142,7 @@ test("authorize: dangerous commands are asked every time and cannot be approved 
 	for (let k = 0; k < 3; k++) assert.equal((await p.authorize({ device: "mac", baseMode: "full", action: danger, ask })).ok, true);
 	assert.equal(n, 3, "asked each time, also in full");
 	assert.equal(p.modeFor("mac", "ask"), "ask", "full was not applied");
-	assert.equal(p.isApproved(danger), false);
+	assert.equal(p.isApproved(danger, "mac"), false);
 	assert.deepEqual(confirmOptions(danger, "mac", { verdict: "ask", reason: "x", danger: true }).map((o) => o.id), ["once", "deny"]);
 });
 
@@ -247,11 +247,11 @@ test("auto: the classifier cannot weaken hard rules: protected paths and danger 
 test("reset forgets modes, approvals, cache and streak", async () => {
 	const p = new SessionPolicy();
 	p.setMode("mac", "full");
-	p.approve(write("/h/a"));
+	p.approve(write("/h/a"), "mac");
 	await p.authorize({ device: "mac", baseMode: "auto", action: bash("a"), classify: async () => verdict("deny"), ask: async () => "deny" });
 	p.reset();
 	assert.equal(p.modeFor("mac", "ask"), "ask");
-	assert.equal(p.isApproved(write("/h/a")), false);
+	assert.equal(p.isApproved(write("/h/a"), "mac"), false);
 	assert.equal(p.streak, 0);
 });
 
@@ -280,7 +280,7 @@ function conn() {
 	const f = fakeSsh({ users: ["sergey"] });
 	const home = mkdtempSync(join(tmpdir(), "nbd-home-"));
 	const c: Conn = { device: "mac", target: f.target, user: "sergey", home, probe: { os: "Linux", user: "sergey", home, sudo: false } };
-	return { c, home, cleanup: () => rmSync(home, { recursive: true, force: true }) };
+	return { c, home, cleanup: () => { rmSync(home, { recursive: true, force: true }); rmSync(f.dir, { recursive: true, force: true }); } };
 }
 
 test("write ops: the hook sees the exact content and the old text; a refusal leaves no file and no directory", async () => {

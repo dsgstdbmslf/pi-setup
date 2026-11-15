@@ -2,7 +2,7 @@
 //  - native: a password dialog on the device itself (`rootNativeWrapper`); the password never leaves the device.
 //  - pi: a masked dialog in pi; the password goes to ssh stdin of `rootStdinWrapper` only and is never logged,
 //    returned or kept (the buffer is zeroed after the call).
-// sudo always asks (-k): nothing is cached. No pi imports; ssh is injectable for tests.
+// sudo -k ignores cached credentials (NOPASSWD may skip prompting). No pi imports; ssh is injectable for tests.
 
 import type { Conn } from "./remote-ops.ts";
 import { ASKPASS_STATUS_CANCEL, ASKPASS_STATUS_UNAVAILABLE, rootDialogText, rootNativeWrapper, rootStdinWrapper } from "./remote.ts";
@@ -52,6 +52,7 @@ export class RootCancelled extends Error {}
 
 /** Runs `sudo <command>` on the device. Throws RootCancelled (user said no) or Error; resolves the exit code. */
 export async function runRoot(c: Conn, r: RootRun): Promise<{ exitCode: number | null; path: string }> {
+	if (r.signal?.aborted) throw new Error("aborted");
 	const run = r.run ?? exec;
 	const base: ExecOptions = { signal: r.signal, timeoutMs: r.timeoutMs, maxBytes: 64 * 1024 * 1024, onData: cleanChunk(r.onData) };
 	const finish = (res: ExecResult, path: string) => {
@@ -72,6 +73,7 @@ export async function runRoot(c: Conn, r: RootRun): Promise<{ exitCode: number |
 		// The dialog lives on the device for up to its own 120 s; keep the call alive that long at least.
 		const res = await run(c.target, script, { ...base, timeoutMs: Math.max(r.timeoutMs, 150_000) });
 		r.onPath?.("native");
+		if (res.aborted || res.timedOut) return finish(res, "native");
 		if (res.code === ASKPASS_STATUS_CANCEL) throw new RootCancelled(`cancelled by the user on ${c.device}`);
 		if (res.code !== ASKPASS_STATUS_UNAVAILABLE) return finish(res, "native");
 		if (r.pref === "native") throw new Error(`${c.device}: the native password dialog is not available there (rootPrompt is "native")`);
@@ -85,9 +87,16 @@ export async function runRoot(c: Conn, r: RootRun): Promise<{ exitCode: number |
 		r.onWaiting?.(false);
 	}
 	if (!pw) throw new RootCancelled(`cancelled: no root password entered in pi for ${c.device}`);
-	const stdin = Buffer.from(`${pw}\n`, "utf8");
+	if (/[\r\n\0]/.test(pw)) {
+		pw = undefined;
+		throw new Error("Root password must be a single line");
+	}
+	const stdin = Buffer.alloc(Buffer.byteLength(pw) + 1);
+	stdin.write(pw, "utf8");
+	stdin[stdin.length - 1] = 10;
 	pw = undefined;
 	try {
+		if (r.signal?.aborted) throw new Error("aborted");
 		const script = rootStdinWrapper(r.command, { path: c.probe.path });
 		const res = await run(c.target, script, { ...base, stdin });
 		r.onPath?.(path);

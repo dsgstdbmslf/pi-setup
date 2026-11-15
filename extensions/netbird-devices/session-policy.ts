@@ -2,7 +2,7 @@
 // approvals, the classifier verdict cache and the deny streak. Pure: no pi imports; the dialog and the
 // classifier call are injected. Unit-tested.
 
-import type { ClassifierVerdict } from "./classifier.ts";
+import { classifierSeesWholeAction, type ClassifierVerdict } from "./classifier.ts";
 import { type Action, approvalKey, type Decision, decide } from "./policy.ts";
 import { MODES, type Mode } from "./settings.ts";
 import type { ConfirmChoice } from "./ui-text.ts";
@@ -65,11 +65,11 @@ export class SessionPolicy {
 
 	// --- approvals and classifier cache --------------------------------------------------------
 
-	isApproved(action: Action): boolean {
-		return this.approved.has(approvalKey(action));
+	isApproved(action: Action, device: string, scope = ""): boolean {
+		return this.approved.has(JSON.stringify([device, scope, approvalKey(action)]));
 	}
-	approve(action: Action): void {
-		this.approved.add(approvalKey(action));
+	approve(action: Action, device: string, scope = ""): void {
+		this.approved.add(JSON.stringify([device, scope, approvalKey(action)]));
 	}
 	get streak(): number {
 		return this.denyStreak;
@@ -82,9 +82,9 @@ export class SessionPolicy {
 	async authorize(i: AuthorizeInput): Promise<Outcome> {
 		const { device, action } = i;
 		const mode = this.modeFor(device, i.baseMode);
-		let d = decide({ mode, action, protectedHit: i.protectedHit, approved: this.isApproved(action) });
+		let d = decide({ mode, action, protectedHit: i.protectedHit, approved: this.isApproved(action, device, i.scope) });
 		// Classifier verdicts are cached per action; a write is identified by its exact content too.
-		const key = i.cacheSalt ? `${approvalKey(action)}\n${i.cacheSalt}` : approvalKey(action);
+		const key = JSON.stringify([device, i.scope ?? "", approvalKey(action), i.cacheSalt ?? ""]);
 		const who = i.label ?? device;
 		const refuse = (why: string, how: Outcome["how"]): Outcome => ({ ok: false, how, message: `${who}: ${why}` });
 		let classified: ClassifierResult | undefined;
@@ -92,6 +92,9 @@ export class SessionPolicy {
 		if (d.verdict === "deny") return refuse(`${describe(action)} refused: ${d.reason}.`, "policy");
 		if (d.verdict === "allow") return { ok: true, how: d.reason.startsWith("allowed earlier") ? "approved" : "auto" };
 
+		if (d.verdict === "classify" && !classifierSeesWholeAction(action)) {
+			d = { verdict: "ask", reason: "action exceeds the classifier preview; user confirmation required" };
+		}
 		if (d.verdict === "classify") {
 			const cached = this.cache.get(key);
 			if (cached) classified = { ...cached };
@@ -129,7 +132,7 @@ export class SessionPolicy {
 		}
 		if (this.denyStreak >= MAX_DENY_STREAK) this.denyStreak = 0;
 		if (!choice || choice === "deny") return { ...refuse(`${describe(action)} denied by user.`, "denied"), classifier: classified };
-		if (choice === "always" && !d.danger) this.approve(action);
+		if (choice === "always" && !d.danger) this.approve(action, device, i.scope);
 		if (choice === "full" && !d.danger) {
 			this.setMode(device, "full");
 			i.onModeChange?.("full");
@@ -149,6 +152,8 @@ export interface AuthorizeInput {
 	protectedHit?: string;
 	/** Identifies the exact content of a write (hash) for the classifier cache. */
 	cacheSalt?: string;
+	/** Login/endpoint identity: approvals cannot follow a change of remote account. */
+	scope?: string;
 	/** Shows the confirm dialog; undefined = no UI. Undefined result = dismissed (counts as deny). */
 	ask?: (d: Decision) => Promise<ConfirmChoice | undefined>;
 	classify?: () => Promise<ClassifierResult | undefined>;

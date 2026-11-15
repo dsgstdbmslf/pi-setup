@@ -136,7 +136,7 @@ function conn(over: { path?: string } = {}) {
 	const f = fakeSsh({ users: ["sergey"] });
 	const home = mkdtempSync(join(tmpdir(), "nbd-home-"));
 	const c: Conn = { device: "mac", target: f.target, user: "sergey", home, probe: { os: "Linux", user: "sergey", home, sudo: false, path: over.path } };
-	return { f, c, home, cleanup: () => rmSync(home, { recursive: true, force: true }) };
+	return { f, c, home, cleanup: () => { rmSync(home, { recursive: true, force: true }); rmSync(f.dir, { recursive: true, force: true }); } };
 }
 
 test("read ops: file, missing file, name variants (U+202F before PM) with the check applied to the real name", async () => {
@@ -156,9 +156,13 @@ test("read ops: file, missing file, name variants (U+202F before PM) with the ch
 		const seen: string[] = [];
 		const withCheck = createReadOps(c, (p) => seen.push(p));
 		await withCheck.access(asked);
-		assert.deepEqual(seen, [shot]);
+		assert.deepEqual(seen, [asked, shot]);
 		assert.equal((await withCheck.readFile(asked)).toString(), "PNGDATA");
 		assert.equal(await withCheck.detectImageMimeType(asked), "image/png");
+
+		const pinned = createReadOps(c, undefined, undefined, join(home, "a.txt"));
+		await pinned.access(join(home, "local-only-variant.txt"));
+		assert.equal((await pinned.readFile(join(home, "local-only-variant.txt"))).toString(), "hello\n", "local fallback cannot change the requested remote filename");
 
 		const refusing = createReadOps(c, () => {
 			throw new Error("protected");

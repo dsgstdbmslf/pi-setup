@@ -1,6 +1,7 @@
 // Integration tests in temp dirs: config-store, state, the shared ssh-agent (skipped without OpenSSH),
 // the askpass bridge and the bw wrapper against a fake `bw`. Never touches ~/.ssh or the real vault.
 
+import "./isolated-env.ts";
 import assert from "node:assert/strict";
 import { execFileSync, fork, spawn, spawnSync } from "node:child_process";
 import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
