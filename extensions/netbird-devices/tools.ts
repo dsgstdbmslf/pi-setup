@@ -1,4 +1,4 @@
-// Pure helpers of the device tools: `device` argument parsing, the stage-B gate, display arguments
+// Pure helpers of the device tools: `device` argument parsing, policy actions for tool calls, display arguments
 // for the built-in renderers, image MIME by extension, device table rows. No pi imports, unit-tested.
 
 import { type Device, findDevice } from "./devices.ts";
@@ -52,54 +52,47 @@ export function isRemoteArg(arg: unknown, localNames: ReadonlySet<string>): arg 
 	return !!q && !LOCAL_WORDS.has(q) && !localNames.has(q);
 }
 
-// --- device mode and the stage-B gate -------------------------------------------------------------
+// --- actions for the policy -----------------------------------------------------------------------
 
-export const STAGE_C_NOTE = "confirmations are not implemented yet (stage C)";
-
-export type Gate = { ok: true } | { ok: false; message: string };
-
-export interface GateInput {
+export interface ActionInput {
 	tool: "read" | "write" | "edit" | "bash";
-	device: string;
-	mode: Mode;
 	home: string;
-	/** Absolute path (read/write/edit). */
+	/** Absolute device path (read/write/edit). */
 	path?: string;
 	command?: string;
-	/** Protected path globs (defaults + settings). */
+	/** write/edit: the exact change (line diff) and whether the file is new. */
+	diff?: string;
+	isNew?: boolean;
+	/** Protected path globs (defaults + settings; global settings only). */
 	globs: readonly string[];
 }
 
 /**
- * Stage B has no confirmation dialogs, so only what needs none runs: `read` of unprotected paths, and
- * write/edit/bash on devices in mode `full` (except protected paths, dangerous commands and root,
- * which would need a dialog or the root flow). Everything else is refused with a reason for the agent.
+ * The policy action for a tool call, plus the protected glob it touches. `sudo <cmd>` becomes a root
+ * action for `<cmd>`; for bash the protected paths are found among the words of the command.
  */
-export function remoteGate(i: GateInput): Gate {
-	const refuse = (why: string): Gate => ({ ok: false, message: `${i.device}: ${why}` });
-	if (i.tool === "read") {
-		const hit = i.path ? protectedMatch(i.path, i.home, i.globs) : undefined;
-		if (hit) return refuse(`reading ${i.path} is refused: protected path (${hit}); ${STAGE_C_NOTE}.`);
-		return { ok: true };
-	}
-	if (i.mode !== "full") {
-		return refuse(`${i.tool} needs confirmation in mode "${i.mode}", but ${STAGE_C_NOTE}. Only devices in mode "full" accept ${i.tool} for now; the user can set the mode in settings.`);
-	}
-	let action: Action;
-	let hit: string | undefined;
+export function remoteAction(i: ActionInput): { action: Action; protectedHit?: string } {
 	if (i.tool === "bash") {
 		const command = i.command ?? "";
-		if (splitSudo(command) !== undefined) return refuse("commands starting with sudo (root) are not implemented yet (stage D).");
-		action = { kind: "bash", command, root: false };
-		hit = protectedInCommand(command, i.home, i.globs, i.home);
-	} else {
-		action = { kind: "write", path: i.path ?? "", diff: "", isNew: false };
-		hit = i.path ? protectedMatch(i.path, i.home, i.globs) : undefined;
+		const inner = splitSudo(command);
+		const cmd = inner ?? command;
+		return { action: { kind: "bash", command: cmd, root: inner !== undefined }, protectedHit: protectedInCommand(cmd, i.home, i.globs, i.home) };
 	}
-	const d = decide({ mode: i.mode, action, protectedHit: hit });
-	if (d.verdict === "allow") return { ok: true };
-	if (d.verdict === "deny") return refuse(`${i.tool} refused: ${d.reason}.`);
-	return refuse(`${i.tool} refused: ${d.reason}${d.warning ? ` (${d.warning})` : ""} needs confirmation, but ${STAGE_C_NOTE}.`);
+	const path = i.path ?? "";
+	const protectedHit = path ? protectedMatch(path, i.home, i.globs) : undefined;
+	if (i.tool === "read") return { action: { kind: "read", path }, protectedHit };
+	return { action: { kind: "write", path, diff: i.diff ?? "", isNew: i.isNew ?? false }, protectedHit };
+}
+
+/** Why a call is refused before anything is asked or touched (ro device, root not available yet), else undefined. */
+export function earlyRefusal(i: ActionInput, mode: Mode, device: string): string | undefined {
+	const { action, protectedHit } = remoteAction(i);
+	if (action.kind === "read") return undefined;
+	if (action.kind === "bash" && !action.root) return undefined;
+	const d = decide({ mode, action, protectedHit });
+	if (d.verdict === "deny") return `${device}: ${i.tool === "bash" ? "root command" : i.tool} refused: ${d.reason}.`;
+	if (action.kind === "bash" && action.root) return `${device}: commands starting with sudo (root) are not implemented yet (stage D); run the command without sudo if it does not need root.`;
+	return undefined;
 }
 
 // --- rendering ------------------------------------------------------------------------------------

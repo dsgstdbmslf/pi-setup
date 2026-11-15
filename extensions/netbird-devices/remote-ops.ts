@@ -43,7 +43,7 @@ export interface BashOps {
  * `check` runs on every path the read actually opens (a name variant found on the device may differ
  * from the one asked for) and throws to refuse.
  */
-export function createReadOps(c: Conn, check?: (abs: string) => void): ReadOps {
+export function createReadOps(c: Conn, check?: (abs: string) => void | Promise<void>): ReadOps {
 	const actual = new Map<string, string>();
 	const real = (p: string) => actual.get(p) ?? p;
 	return {
@@ -55,7 +55,7 @@ export function createReadOps(c: Conn, check?: (abs: string) => void): ReadOps {
 					// macOS screenshot names (U+202F before AM/PM), NFD/NFC forms, curly quotes.
 					const v = await resolveVariant(c.target, p);
 					if (v && v !== p) {
-						check?.(v);
+						await check?.(v);
 						actual.set(p, v);
 						return;
 					}
@@ -68,19 +68,46 @@ export function createReadOps(c: Conn, check?: (abs: string) => void): ReadOps {
 	};
 }
 
+/**
+ * Called with the exact new content right before it is written; throws to refuse (nothing is written,
+ * no directory is created). `old` is the current content (undefined for a new file).
+ */
+export type BeforeWrite = (info: { path: string; content: string; old?: string; isNew: boolean }) => Promise<void>;
+
 /** `mkdir` does nothing: the write script creates parent directories (so a refused write leaves no directory behind). */
-export function createWriteOps(c: Conn): WriteOps {
+export function createWriteOps(c: Conn, before?: BeforeWrite): WriteOps {
 	return {
 		mkdir: async () => {},
-		writeFile: (p, content) => writeFile(c.target, p, content),
+		async writeFile(p, content) {
+			if (before) {
+				let old: string | undefined;
+				let isNew = false;
+				try {
+					old = (await readFile(c.target, p)).toString("utf8");
+				} catch (e) {
+					if (e instanceof SshError && e.code === "ENOENT") isNew = true;
+					else if (e instanceof SshError && e.kind) throw e; // connection problem: do not guess
+				}
+				await before({ path: p, content, old, isNew });
+			}
+			return writeFile(c.target, p, content);
+		},
 	};
 }
 
-export function createEditOps(c: Conn): EditOps {
+export function createEditOps(c: Conn, before?: BeforeWrite): EditOps {
+	const seen = new Map<string, string>();
 	return {
 		access: (p) => access(c.target, p, "rw"),
-		readFile: (p) => readFile(c.target, p),
-		writeFile: (p, content) => writeFile(c.target, p, content),
+		async readFile(p) {
+			const b = await readFile(c.target, p);
+			if (before) seen.set(p, b.toString("utf8"));
+			return b;
+		},
+		async writeFile(p, content) {
+			if (before) await before({ path: p, content, old: seen.get(p), isNew: false });
+			return writeFile(c.target, p, content);
+		},
 	};
 }
 

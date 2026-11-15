@@ -3,9 +3,12 @@
 // through the `device` parameter of the built-in tools (OpenSSH over NetBird SSH). Nothing changes for
 // calls without `device`. Modules live in extensions/netbird-devices/.
 //
-// Stage B: no confirmation dialogs yet. Remote write/edit/bash run only on devices in mode "full";
-// remote read works except for protected paths. See docs/netbird-devices/IMPLEMENTATION.md.
+// Access: every remote action goes through policy.decide() (modes ro/ask/auto/full per device, protected
+// paths, dangerous commands). Confirmations are ctx.ui.select dialogs under the shared UI lock; write/edit
+// ask inside the write operation, with the exact diff. Mode and approvals are per session. Settings come
+// from the GLOBAL settings.json only. See docs/netbird-devices/IMPLEMENTATION.md.
 
+import { createHash } from "node:crypto";
 import { userInfo } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -20,18 +23,23 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { loadKeys } from "./tavily/keys.ts";
 import { deviceNames, type Device, findDevice } from "./netbird-devices/devices.ts";
+import { assistantText, buildClassifierPrompt, CLASSIFIER_SYSTEM, parseClassifierAnswer, userMessagesFromBranch } from "./netbird-devices/classifier.ts";
 import { deviceTargetInCommand, mentionsNetVerb } from "./netbird-devices/guard.ts";
 import { Hub } from "./netbird-devices/hub.ts";
 import { resolvePaths } from "./netbird-devices/paths.ts";
-import { resolveRemotePath } from "./netbird-devices/policy.ts";
-import { createBashOps, createEditOps, createReadOps, createWriteOps, type Conn } from "./netbird-devices/remote-ops.ts";
-import { parseSettings, type Settings } from "./netbird-devices/settings.ts";
-import { DEVICE_PARAM_DESCRIPTION, deviceListHint, deviceRows, displayArgs, guardReason, isRemoteArg, parseDeviceArg, remoteGate } from "./netbird-devices/tools.ts";
-import { footerText, formatDeviceTable, type HereInfo } from "./netbird-devices/ui-text.ts";
+import { type Action, type Decision, resolveRemotePath } from "./netbird-devices/policy.ts";
+import { type BeforeWrite, createBashOps, createEditOps, createReadOps, createWriteOps, type Conn } from "./netbird-devices/remote-ops.ts";
+import { type ClassifierResult, isMode, MODE_ENTRY, nextMode, SessionPolicy } from "./netbird-devices/session-policy.ts";
+import { loadGlobalSettings, MODES, type Mode, type Settings, parseSettings } from "./netbird-devices/settings.ts";
+import { type ActionInput, DEVICE_PARAM_DESCRIPTION, deviceListHint, deviceRows, displayArgs, earlyRefusal, guardReason, isRemoteArg, osLabel, parseDeviceArg, remoteAction } from "./netbird-devices/tools.ts";
+import { type ConfirmChoice, confirmBody, confirmOptions, confirmTitle, footerText, formatDeviceTable, type HereInfo, lineDiff } from "./netbird-devices/ui-text.ts";
 
 const STATUS_KEY = "netbird-devices";
 /** The footer returns to this machine this long after the agent settles. */
 const FOOTER_RESET_MS = 8000;
+const CLASSIFIER_TIMEOUT_MS = 20_000;
+const CLASSIFIER_MAX_TOKENS = 300;
+const MODE_SHORTCUT = "alt+m";
 
 // One dialog at a time, shared with other extensions' popups (see ask-user-question.ts).
 const LOCK_KEY = "__piSharedUiLock";
@@ -80,6 +88,10 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 	let ctxRef: ExtensionContext | undefined;
 	/** Pinned with `/nb here <device>` until the session ends (device name). */
 	let pinnedHere: string | undefined;
+	/** Mode overrides, approvals and classifier state of this session. */
+	const policy = new SessionPolicy();
+	/** The device the agent worked on last (alt+m and /nb mode act on it). */
+	let lastDevice: string | undefined;
 	let footerTimer: ReturnType<typeof setTimeout> | undefined;
 	// session_shutdown (any reason) aborts this: open and queued dialogs of the old session settle.
 	let session = new AbortController();
@@ -102,14 +114,16 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 			return undefined;
 		}
 	};
+	/** Effective mode: the session override, else settings. */
+	const modeOf = (d: Device): Mode => policy.modeFor(d.name, H().modeOf(d));
 	const localNames = (): ReadonlySet<string> => (hub ? hub.localNames() : new Set());
 	/** The short name the agent should use for a device. */
 	const label = (d: Device): string => (d.configured ? d.name : (d.aliases[0] ?? d.name));
 
 	// --- dialogs ----------------------------------------------------------------------------------
 
-	const dialog = <T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T | undefined> => {
-		const signal = session.signal;
+	const dialog = <T>(fn: (signal: AbortSignal) => Promise<T>, extra?: AbortSignal): Promise<T | undefined> => {
+		const signal = extra ? AbortSignal.any([session.signal, extra]) : session.signal;
 		return withUILock(async () => {
 			if (signal.aborted) return undefined;
 			let onAbort: (() => void) | undefined;
@@ -140,12 +154,12 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 		} catch {}
 	}
 
-	function showRemote(d: Device, ctx = ctxRef): void {
+	function showRemote(d: Device, ctx = ctxRef, waiting?: "confirm"): void {
 		if (footerTimer) clearTimeout(footerTimer);
 		footerTimer = undefined;
 		if (!ctx?.hasUI) return;
 		try {
-			ctx.ui.setStatus(STATUS_KEY, footerText({ kind: "remote", device: label(d), mode: H().modeOf(d) }));
+			ctx.ui.setStatus(STATUS_KEY, footerText({ kind: "remote", device: label(d), mode: modeOf(d), waiting }));
 		} catch {}
 	}
 
@@ -189,24 +203,122 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 		if (p.kind === "error") throw new Error(p.message);
 		const device = p.kind === "here" ? await hereDevice(ctx) : p.device;
 		if (!device.sshEnabled) throw new Error(`${label(device)}: NetBird SSH is not enabled on this device. Known devices: ${deviceListHint(h.devices())}.`);
+		lastDevice = device.name;
 		showRemote(device, ctx);
 		const conn = await h.connect(device, { ask: askUser(ctx) });
 		return { kind: "remote", device, conn };
 	}
 
-	/** Gate for a path or command on a device; throws the refusal as the tool error. */
-	function gate(tool: ToolName, t: Extract<Target, { kind: "remote" }>, extra: { path?: string; command?: string }): void {
-		const h = H();
-		const g = remoteGate({ tool, device: label(t.device), mode: h.modeOf(t.device), home: t.conn.home, globs: h.protectedGlobs(t.device), ...extra });
-		if (!g.ok) throw new Error(g.message);
+	type Remote = Extract<Target, { kind: "remote" }>;
+
+	/** The confirmation dialog (select) for an action; the footer shows "waits for you" while it is open. */
+	async function confirm(ctx: ExtensionContext, t: Remote, action: Action, d: Decision, signal?: AbortSignal): Promise<ConfirmChoice | undefined> {
+		const name = label(t.device);
+		let opts = confirmOptions(action, name, d);
+		if (d.reason.startsWith("protected path")) opts = opts.filter((o) => o.id !== "full"); // full does not lift protected paths
+		const title = `${confirmTitle(action, name, d, t.conn.home)}\n\n${confirmBody(action, name, d)}`;
+		const labels = opts.map((o) => o.label);
+		const pick = await dialog(async (sig) => {
+			showRemote(t.device, ctx, "confirm");
+			try {
+				return await ctx.ui.select(title, labels, { signal: sig });
+			} finally {
+				if (!session.signal.aborted) showRemote(t.device, ctx);
+			}
+		}, signal);
+		return pick === undefined ? undefined : opts[labels.indexOf(pick)]?.id;
 	}
+
+	/** One classifier call (auto mode): the user's messages and the action only, never tool output. Undefined = cannot answer. */
+	async function classify(ctx: ExtensionContext, t: Remote, action: Action, signal?: AbortSignal): Promise<ClassifierResult | undefined> {
+		const id = H().state.classifierModel ?? settings.classifierModel;
+		const slash = id.indexOf("/");
+		if (slash <= 0) return undefined;
+		const model = ctx.modelRegistry.find(id.slice(0, slash), id.slice(slash + 1));
+		if (!model) return undefined;
+		const ctl = new AbortController();
+		const timer = setTimeout(() => ctl.abort(), CLASSIFIER_TIMEOUT_MS);
+		const onAbort = () => ctl.abort();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		session.signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			const prompt = buildClassifierPrompt({
+				device: label(t.device),
+				os: osLabel(t.conn.probe),
+				user: t.conn.user,
+				action,
+				userMessages: userMessagesFromBranch(ctx.sessionManager.getBranch()),
+			});
+			const stream = ctx.modelRegistry.streamSimple(model, { systemPrompt: CLASSIFIER_SYSTEM, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] }, { maxTokens: CLASSIFIER_MAX_TOKENS, signal: ctl.signal });
+			const msg = await stream.result();
+			if (msg.stopReason === "error" || msg.stopReason === "aborted") return undefined;
+			const parsed = parseClassifierAnswer(assistantText(msg));
+			return parsed ? { ...parsed, model: id, usage: msg.usage } : undefined;
+		} catch {
+			return undefined;
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			session.signal.removeEventListener("abort", onAbort);
+		}
+	}
+
+	/** Mode change from the dialog ("switch to full"): kept in the session and shown in the footer. */
+	function persistMode(d: Device, mode: Mode, ctx: ExtensionContext): void {
+		policy.setMode(d.name, mode);
+		try {
+			pi.appendEntry(MODE_ENTRY, { device: d.name, mode });
+		} catch {}
+		showRemote(d, ctx);
+	}
+
+	/** Policy for one action on a device: allowed, or throws the refusal for the agent. Classifier usage goes to `acc`. */
+	async function authorize(ctx: ExtensionContext, t: Remote, input: Omit<ActionInput, "home" | "globs">, signal: AbortSignal | undefined, acc: ClassifierResult[], cacheSalt?: string): Promise<void> {
+		const h = H();
+		const { action, protectedHit } = remoteAction({ ...input, home: t.conn.home, globs: h.protectedGlobs(t.device) });
+		const out = await policy.authorize({
+			device: t.device.name,
+			label: label(t.device),
+			baseMode: h.modeOf(t.device),
+			action,
+			protectedHit,
+			cacheSalt,
+			ask: ctx.hasUI ? (d) => confirm(ctx, t, action, d, signal) : undefined,
+			classify: () => classify(ctx, t, action, signal),
+			onModeChange: (m) => persistMode(t.device, m, ctx),
+		});
+		if (out.classifier) acc.push(out.classifier);
+		if (!out.ok) throw new Error(out.message);
+	}
+
+	/** Refusals that need no dialog (ro device, root not available yet); throws. */
+	function early(t: Remote, input: Omit<ActionInput, "home" | "globs">): void {
+		const h = H();
+		const why = earlyRefusal({ ...input, home: t.conn.home, globs: h.protectedGlobs(t.device) }, modeOf(t.device), label(t.device));
+		if (why) throw new Error(why);
+	}
+
+	/** Hook of the write operations: the exact new content (and the old one) is confirmed before anything is written. */
+	function beforeWrite(ctx: ExtensionContext, t: Remote, tool: "write" | "edit", signal: AbortSignal | undefined, acc: ClassifierResult[]): BeforeWrite {
+		return async ({ path, content, old, isNew }) => {
+			const diff = isNew ? lineDiff("", content) : old === undefined ? `(current content unreadable)\n${lineDiff("", content)}` : lineDiff(old, content);
+			const salt = createHash("sha256").update(content).digest("hex");
+			await authorize(ctx, t, { tool, path, diff, isNew }, signal, acc, salt);
+		};
+	}
+
+	/** Adds the classifier usage of this call to the result details. */
+	const withUsage = (result: any, acc: ClassifierResult[]): any => {
+		if (!acc.length || !result) return result;
+		return { ...result, details: { ...(result.details ?? {}), netbirdClassifier: acc.map(({ decision, reason, model, usage }) => ({ decision, reason, model, usage })) } };
+	};
 
 	const isRemote = (d: unknown): boolean => isRemoteArg(d, localNames());
 
 	const deviceProp = () => Type.Optional(Type.String({ description: DEVICE_PARAM_DESCRIPTION }));
 
 	/** The built-in tool, plus `device`: without it (or for this machine) the built-in implementation runs unchanged. */
-	function override(tool: ToolName, local: any, remoteExecute: (t: Extract<Target, { kind: "remote" }>, params: any, signal: any, onUpdate: any, ctx: any) => Promise<any>) {
+	function override(tool: ToolName, local: any, remoteExecute: (t: Remote, params: any, signal: any, onUpdate: any, ctx: any) => Promise<any>) {
 		const parameters = Type.Object({ ...(local.parameters as any).properties, device: deviceProp() });
 		pi.registerTool({
 			...local,
@@ -234,37 +346,43 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 		const local = createReadToolDefinition(cwd0) as any;
 		override("read", local, async (t, params, signal, onUpdate, ctx) => {
 			const abs = resolveRemotePath(String(params.path ?? ""), t.conn.home);
-			gate("read", t, { path: abs });
-			const check = (p: string) => gate("read", t, { path: p });
+			const acc: ClassifierResult[] = [];
+			await authorize(ctx, t, { tool: "read", path: abs }, signal, acc);
+			const check = (p: string) => authorize(ctx, t, { tool: "read", path: p }, signal, acc);
 			const def = createReadToolDefinition(ctx.cwd, { operations: createReadOps(t.conn, check) } as any) as any;
-			return def.execute("", { ...params, path: abs }, signal, onUpdate, ctx);
+			return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
 		});
 	}
 	{
 		const local = createWriteToolDefinition(cwd0) as any;
 		override("write", local, async (t, params, signal, onUpdate, ctx) => {
 			const abs = resolveRemotePath(String(params.path ?? ""), t.conn.home);
-			gate("write", t, { path: abs });
-			const def = createWriteToolDefinition(ctx.cwd, { operations: createWriteOps(t.conn) } as any) as any;
-			return def.execute("", { ...params, path: abs }, signal, onUpdate, ctx);
+			early(t, { tool: "write", path: abs });
+			const acc: ClassifierResult[] = [];
+			const def = createWriteToolDefinition(ctx.cwd, { operations: createWriteOps(t.conn, beforeWrite(ctx, t, "write", signal, acc)) } as any) as any;
+			return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
 		});
 	}
 	{
 		const local = createEditToolDefinition(cwd0) as any;
 		override("edit", local, async (t, params, signal, onUpdate, ctx) => {
 			const abs = resolveRemotePath(String(params.path ?? ""), t.conn.home);
-			gate("edit", t, { path: abs });
-			const def = createEditToolDefinition(ctx.cwd, { operations: createEditOps(t.conn) } as any) as any;
-			return def.execute("", { ...params, path: abs }, signal, onUpdate, ctx);
+			early(t, { tool: "edit", path: abs });
+			const acc: ClassifierResult[] = [];
+			const def = createEditToolDefinition(ctx.cwd, { operations: createEditOps(t.conn, beforeWrite(ctx, t, "edit", signal, acc)) } as any) as any;
+			return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
 		});
 	}
 	{
 		const local = createBashToolDefinition(cwd0) as any;
 		override("bash", local, async (t, params, signal, onUpdate, ctx) => {
-			gate("bash", t, { command: String(params.command ?? "") });
+			const command = String(params.command ?? "");
+			early(t, { tool: "bash", command });
+			const acc: ClassifierResult[] = [];
+			await authorize(ctx, t, { tool: "bash", command }, signal, acc);
 			// Do not leak the local session environment (PI_SESSION_FILE...) into the device command.
 			const def = createBashToolDefinition(ctx.cwd, { operations: createBashOps(t.conn), exposeSessionEnvironment: false } as any) as any;
-			return def.execute("", params, signal, onUpdate, ctx);
+			return withUsage(await def.execute("", params, signal, onUpdate, ctx), acc);
 		});
 	}
 
@@ -284,7 +402,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 			probes[d.name] = h.state.devices[d.name]?.probe;
 			users[d.name] = h.state.devices[d.name]?.user ?? d.settings.user;
 		}
-		const rows = deviceRows({ devices, probes, users, online, modeOf: (d) => h.modeOf(d), localName: h.localLabel(), labelOf: label });
+		const rows = deviceRows({ devices, probes, users, online, modeOf, localName: h.localLabel(), labelOf: label });
 		let here: HereInfo;
 		try {
 			const r = await h.resolveHere(pinnedHere);
@@ -354,10 +472,16 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 		if (session.signal.aborted) session = new AbortController();
 		ctxRef = ctx;
 		try {
-			const parsed = parseSettings((pi.getSettings() as any)?.netbirdDevices);
+			// Global settings only: pi.getSettings() would merge in the project's .pi/settings.json.
+			const parsed = loadGlobalSettings(join(getAgentDir(), "settings.json"));
 			settings = parsed.settings;
 			for (const w of parsed.warnings) ctx.ui.notify(`netbird-devices: ${w}`, "warning");
-			if (event.reason !== "reload") pinnedHere = undefined;
+			if (event.reason !== "reload") {
+				pinnedHere = undefined;
+				lastDevice = undefined;
+				policy.reset();
+			}
+			policy.restoreModes(ctx.sessionManager.getBranch());
 			const h = H();
 			for (const w of h.warnings.splice(0)) ctx.ui.notify(`netbird-devices: ${w}`, "warning");
 			showLocal(ctx);
@@ -367,6 +491,10 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 				ctx.ui.notify(`netbird-devices: ${msg(err)}`, "warning");
 			} catch {}
 		}
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		policy.restoreModes(ctx.sessionManager.getBranch());
 	});
 
 	pi.on("agent_start", async () => {
@@ -390,8 +518,88 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 
 	// --- /nb --------------------------------------------------------------------------------------
 
-	const SUBS = ["list", "here", "refresh", "user", "forget"];
-	const USAGE = "Usage: /nb [list] | here [device|auto] | refresh | user <device> <user|auto> | forget <device>";
+	const SUBS = ["list", "mode", "here", "classifier", "refresh", "user", "forget"];
+	const USAGE = "Usage: /nb [list] | mode [device] [ro|ask|auto|full] | here [device|auto] | classifier [provider/model|default] | refresh | user <device> <user|auto> | forget <device>";
+
+	/** The device mode changes act on: the one the agent worked on last, else the one "here" stands for. */
+	async function currentDevice(ctx: ExtensionContext): Promise<Device> {
+		const h = H();
+		await h.refresh();
+		const last = lastDevice ? h.devices().find((d) => d.name === lastDevice) : undefined;
+		return last ?? (await hereDevice(ctx, false));
+	}
+
+	/** Sets a device mode for this session (kept in the session file) and shows it in the footer. */
+	function setDeviceMode(d: Device, mode: Mode, ctx: ExtensionContext): void {
+		policy.setMode(d.name, mode);
+		pi.appendEntry(MODE_ENTRY, { device: d.name, mode });
+		showRemote(d, ctx);
+		footerTimer = setTimeout(() => showLocal(ctx), FOOTER_RESET_MS);
+		footerTimer.unref?.();
+	}
+
+	const modeLine = (d: Device) => `${label(d)}: mode ${modeOf(d)}${policy.overridden(d.name) ? " (this session)" : ""}`;
+
+	async function modeCommand(a1: string | undefined, a2: string | undefined, ctx: ExtensionContext): Promise<string> {
+		const h = H();
+		await h.refresh();
+		let d: Device | undefined;
+		let mode: string | undefined = a2;
+		if (a1 && isMode(a1) && !a2) mode = a1; // /nb mode ro
+		else if (a1) d = findOrThrow(a1);
+		if (!d) {
+			try {
+				d = await currentDevice(ctx);
+			} catch (e) {
+				const ssh = h.devices().filter((x) => x.sshEnabled);
+				if (ssh.length === 1) d = ssh[0];
+				else if (ctx.hasUI && ssh.length > 1) {
+					const names = ssh.map(label);
+					const pick = await dialog((signal) => ctx.ui.select("Which device?", names, { signal }));
+					if (!pick) return "cancelled";
+					d = ssh[names.indexOf(pick)];
+				} else return `${msg(e)}\nUse /nb mode <device> [ro|ask|auto|full].`;
+			}
+		}
+		if (!mode) {
+			if (!ctx.hasUI) return `${modeLine(d)}. Modes: ${MODES.join(", ")}`;
+			const choices = MODES.map((m) => (m === modeOf(d!) ? `${m}  (current)` : m));
+			const pick = await dialog((signal) => ctx.ui.select(`Access mode for ${label(d!)}`, choices, { signal }));
+			if (!pick) return modeLine(d);
+			mode = pick.split(" ")[0];
+		}
+		if (!isMode(mode)) return `Unknown mode "${mode}". Modes: ${MODES.join(", ")}`;
+		setDeviceMode(d, mode, ctx);
+		return `${modeLine(d)}`;
+	}
+
+	async function classifierCommand(arg: string | undefined, ctx: ExtensionContext): Promise<string> {
+		const h = H();
+		const current = h.state.classifierModel ?? settings.classifierModel;
+		let id = arg;
+		if (!id) {
+			const models = ctx.modelRegistry.getAvailable().map((m: any) => `${m.provider}/${m.id}`);
+			if (!ctx.hasUI) return `classifier model: ${current}${h.state.classifierModel ? " (set with /nb classifier)" : " (settings)"}. Available: ${models.join(", ") || "none"}`;
+			if (!models.length) return "No models are available in pi.";
+			const choices = models.map((m: string) => (m === current ? `${m}  (current)` : m));
+			const pick = await dialog((signal) => ctx.ui.select(`Classifier model for auto mode (now ${current})`, choices, { signal }));
+			if (!pick) return `classifier model unchanged: ${current}`;
+			id = pick.replace(/ {2}\(current\)$/, "");
+		}
+		if (id === "default" || id === "reset") {
+			h.updateState((s) => {
+				delete s.classifierModel;
+			});
+			return `classifier model: ${settings.classifierModel} (from settings)`;
+		}
+		const slash = id.indexOf("/");
+		if (slash <= 0 || !ctx.modelRegistry.find(id.slice(0, slash), id.slice(slash + 1))) return `Unknown model "${id}" (use provider/model; /nb classifier lists the available ones)`;
+		const chosen = id;
+		h.updateState((s) => {
+			s.classifierModel = chosen;
+		});
+		return `classifier model: ${chosen} (saved)`;
+	}
 
 	function findOrThrow(name: string): Device {
 		const h = H();
@@ -412,6 +620,10 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 			case "refresh":
 				await h.refresh(true);
 				return (await deviceTable(ctx)) + warnings();
+			case "mode":
+				return modeCommand(a1, a2, ctx);
+			case "classifier":
+				return classifierCommand(a1, ctx);
 			case "here": {
 				if (!a1) return `${await hereText(ctx)}${pinnedHere ? " (pinned)" : ""}`;
 				if (a1 === "auto") {
@@ -450,7 +662,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("nb", {
-		description: "NetBird devices: list (default), here [device|auto], refresh, user <device> <user|auto>, forget <device>",
+		description: "NetBird devices: list (default), mode [device] [ro|ask|auto|full], classifier [provider/model], here [device|auto], refresh, user <device> <user|auto>, forget <device>",
 		getArgumentCompletions: (prefix: string) => {
 			const parts = prefix.split(/\s+/);
 			if (parts.length <= 1) {
@@ -458,11 +670,19 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 				return items.length ? items : null;
 			}
 			const sub = parts[0];
-			if (parts.length === 2 && ["here", "user", "forget"].includes(sub)) {
+			if (parts.length === 2 && ["here", "user", "forget", "mode"].includes(sub)) {
 				const names = hub ? hub.devices().map((d) => label(d)) : [];
 				if (sub === "here") names.push("auto");
+				if (sub === "mode") names.push(...MODES);
 				const items = names.filter((n) => n.startsWith(parts[1] ?? "")).map((n) => ({ value: `${sub} ${n}`, label: n }));
 				return items.length ? items : null;
+			}
+			if (parts.length === 3 && sub === "mode") {
+				const items = MODES.filter((m) => m.startsWith(parts[2] ?? "")).map((m) => ({ value: `mode ${parts[1]} ${m}`, label: m }));
+				return items.length ? items : null;
+			}
+			if (parts.length === 2 && sub === "classifier") {
+				return "default".startsWith(parts[1] ?? "") ? [{ value: "classifier default", label: "default" }] : null;
 			}
 			if (parts.length === 3 && sub === "user") return "auto".startsWith(parts[2] ?? "") ? [{ value: `user ${parts[1]} auto`, label: "auto" }] : null;
 			return null;
@@ -472,6 +692,21 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 				ctx.ui.notify(await nbCommand(args ?? "", ctx), "info");
 			} catch (err) {
 				ctx.ui.notify(`netbird-devices: ${msg(err)}`, "error");
+			}
+		},
+	});
+
+	pi.registerShortcut(MODE_SHORTCUT, {
+		description: "NetBird devices: cycle the access mode (ro → ask → auto → full) of the current device",
+		handler: async (ctx) => {
+			ctxRef = ctx;
+			try {
+				const d = await currentDevice(ctx);
+				const m = nextMode(modeOf(d));
+				setDeviceMode(d, m, ctx);
+				ctx.ui.notify(modeLine(d), "info");
+			} catch (err) {
+				ctx.ui.notify(`netbird-devices: ${msg(err)}. Use /nb mode <device>.`, "warning");
 			}
 		},
 	});

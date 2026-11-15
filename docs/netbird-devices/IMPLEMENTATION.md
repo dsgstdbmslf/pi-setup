@@ -183,6 +183,40 @@
 Готово: unit-тесты логики режимов/кэша одобрений (вынести в pure `session-policy.ts`); ручная проверка на Mac в
 `~/pi-nb-test/`: `ask` → диалог с диффом, `ro` → отказ, `auto` → классификатор; коммит.
 
+### Этап C — выполнено: интерфейсы, отклонения, ограничения
+
+Файлы: `extensions/netbird-devices.ts` (entry), новый `extensions/netbird-devices/session-policy.ts`; правки `remote-ops.ts`, `tools.ts`, `classifier.ts`, `settings.ts`;
+тесты `test/netbird-devices-session.test.ts` (+ правки `netbird-devices-tools.test.ts`).
+
+- **`session-policy.ts`** (pure): `SessionPolicy` — режимы сессии (`modeFor/setMode/overridden/restoreModes(entries)`; `MODE_ENTRY = "netbird-devices-mode"`, данные `{device, mode}`,
+  последнее по устройству побеждает, восстановление с нуля из `getBranch()`), одобрения «всегда» (`isApproved/approve`, ключ — `policy.approvalKey`), кэш вердиктов классификатора, серия deny.
+  `authorize({device, label, baseMode, action, protectedHit, cacheSalt, ask?, classify?, onModeChange?})` → `{ok:true, how, classifier?}` | `{ok:false, how, message, classifier?}`: `decide()` →
+  allow / deny (сообщение агенту) / classify (кэш → серия ≥3 → `classify()`; `undefined`/исключение → ask) / ask (`ask` undefined = нет UI → отказ с причиной; `deny`/закрытый диалог → «denied by user»).
+  `always` не применяется к опасному, `full` тоже (и опасное не кэшируется — `decide` игнорирует `approved`). После вопроса пользователю серия deny обнуляется. `nextMode` — цикл ro→ask→auto→full.
+  Кэш классификатора для write включает sha256 содержимого (`cacheSalt`), а не только путь.
+- **`tools.ts`**: `remoteGate` и `STAGE_C_NOTE` удалены. Вместо них `remoteAction(input)` → `{action, protectedHit}` (`sudo cmd` → root-действие для `cmd`; для bash защищённые пути — `protectedInCommand`) и
+  `earlyRefusal(input, mode, device)` — отказы без диалога (write/edit/root в `ro`; root пока всегда отказ: этап D — `decide` для root вызывается, поэтому `ro` даёт «read-only», остальное «not implemented yet (stage D)»).
+- **`remote-ops.ts`**: `createWriteOps(c, before?)`/`createEditOps(c, before?)` с хуком `BeforeWrite({path, content, old?, isNew})`, вызываемым перед записью (бросает → ничего не пишется, каталоги не создаются);
+  у write старое содержимое читается отдельным `readFile` (ENOENT → `isNew`), у edit берётся из `readFile` инструмента. `createReadOps(c, check)` — `check` может быть async (проверка найденного варианта имени).
+- **Entry**: вызов `authorize` перед каждым удалённым read/bash и в хуке `writeFile`; `early()` до чтения/записи. Диалог `confirm`: `ctx.ui.select(заголовок+дифф/команда+причина, варианты из `confirmOptions`)` под `withUILock`,
+  сигнал = `session_shutdown` + сигнал вызова инструмента (`AbortSignal.any`), футер `→ mac · ask · ⏸ ждёт тебя` пока открыт. Для защищённых путей вариант «full» убран (full их не снимает). Режим «full» из диалога
+  и `/nb mode` сохраняются `pi.appendEntry("netbird-devices-mode", {device, mode})`; `session_start`/`session_tree` восстанавливают из `getBranch()`; при новой сессии (не reload) одобрения и кэш сбрасываются.
+- **Режимы**: `/nb mode [device] [ro|ask|auto|full]` (без аргументов — `ui.select`: устройство, если текущее неизвестно; затем режим; `/nb mode ro` — для текущего), `alt+m` (`registerShortcut`; в `keybindings.md`
+  и в других расширениях репо не занята) — по кругу для текущего устройства = последнее, с которым работал агент, иначе «here» (без окна выбора). Агент менять режимы не может (инструмента нет).
+  Устройство в записях — `Device.name` (например `sergeys-macbook-pro`, не алиас).
+- **Безопасность настроек**: `settings.loadGlobalSettings(file)` читает `netbirdDevices` только из `~/.pi/agent/settings.json`; `pi.getSettings()` (сливает проектный `.pi/settings.json`) больше не используется
+  (тест-страж по исходнику entry + тест загрузчика). Режимы/protected/rootPrompt/defaultMode/classifierModel из проекта не действуют. Известное отличие: `getAgentDir()` учитывает `PI_CODING_AGENT_DIR`.
+- **Классификатор**: модель `state.classifierModel` → `settings.classifierModel`; `modelRegistry.find(provider, id)` + `modelRegistry.streamSimple(model, {systemPrompt, messages:[user]}, {maxTokens: 300, signal})`,
+  `await stream.result()`; таймаут 20 с (+ отмена вызова и `session_shutdown`); `stopReason` error/aborted, нет модели, непарсящийся ответ → `undefined` → ask. Вход: `classifier.ts` `buildClassifierPrompt` + новый
+  `userMessagesFromBranch(getBranch(), 8)` (только `role:"user"`, без ответов ассистента и вывода инструментов). `usage` каждого вызова — в `details.netbirdClassifier[]` результата инструмента
+  (`{decision, reason, model, usage}`; при бросающем инструменте теряется). `/nb classifier [provider/model|default]` (без аргумента — выбор из `getAvailable()`; `default` — вернуть настройку), хранится в `state.json`.
+- **Отклонения/ограничения**: `usage` классификатора только в `details`, в итоги сессии Pi сам не суммируется; для `write` старый файл читается целиком для диффа (большой/бинарный файл — дифф сводкой); в `edit`
+  локальный предпросмотр у Pi берёт дифф из `details.diff` после выполнения; режим `full` из диалога сохраняется в сессии и поэтому возвращается при `--resume` (как и обычный `/nb mode`); диалог показывает до 3000 символов диффа
+  (`lineDiff` ≤ 40 строк, остальное свёрнуто); причина классификатора обрезана до 200 символов; журнал (`journal.ts`) пока не подключён — этап D.
+- **Ручная проверка** (Mac, `~/pi-nb-test/`, `pi -ne -e ./extensions/netbird-devices.ts`): `ask` write/edit → диалог с диффом, «Отклонить» → «denied by user», файл не изменён; `bash cat` без диалога;
+  `alt+m` ask→auto→full→ro, футер `→ mac · auto`…; `ro` → write отклонён; `/nb mode` → окно выбора; `auto` → классификатор `anthropic/claude-haiku-5-5` разрешил явную просьбу (usage в details сессии),
+  противоречивую — вернул ask → диалог; `--resume` восстановил режим из сессии; `/nb classifier` — список 457 моделей, сохранение/сброс в `state.json`.
+
 ## Этап D — root, журнал, README, финальная проверка (воркер 4)
 
 - Root (§8): `splitSudo`; `rootPrompt` auto/native/pi; нативный путь `rootNativeWrapper`, 196 → окно Pi

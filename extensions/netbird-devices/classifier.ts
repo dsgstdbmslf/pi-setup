@@ -73,3 +73,25 @@ export function parseClassifierAnswer(text: string): { decision: ClassifierVerdi
 		return undefined;
 	}
 }
+
+/**
+ * The user's own messages from session entries (`sessionManager.getBranch()`), oldest first, at most `max`.
+ * Only `role: "user"` text: assistant text and tool results (file contents, command output) never get in.
+ */
+export function userMessagesFromBranch(entries: readonly unknown[], max = 8): string[] {
+	const out: string[] = [];
+	for (const e of entries) {
+		const m = (e as { type?: string; message?: { role?: string; content?: unknown } } | undefined);
+		if (m?.type !== "message" || m.message?.role !== "user") continue;
+		const c = m.message.content;
+		const text = typeof c === "string" ? c : Array.isArray(c) ? c.filter((p) => p && (p as { type?: string }).type === "text").map((p) => String((p as { text?: unknown }).text ?? "")).join("\n") : "";
+		if (text.trim()) out.push(text);
+	}
+	return out.slice(-max);
+}
+
+/** The text of an assistant message (concatenated text blocks). */
+export function assistantText(message: { content?: unknown }): string {
+	const c = message.content;
+	return Array.isArray(c) ? c.map((p) => (p && (p as { type?: string }).type === "text" ? String((p as { text?: unknown }).text ?? "") : "")).join("") : "";
+}

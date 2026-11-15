@@ -1,4 +1,7 @@
-// `netbirdDevices` settings from pi's settings.json. Pure: no pi imports, unit-tested.
+// `netbirdDevices` settings from pi's GLOBAL settings.json (never the project's .pi/settings.json:
+// a repository must not be able to loosen modes, protected paths or the root prompt). No pi imports, unit-tested.
+
+import { readFileSync } from "node:fs";
 
 export type Mode = "ro" | "ask" | "auto" | "full";
 export const MODES: readonly Mode[] = ["ro", "ask", "auto", "full"];
@@ -153,4 +156,22 @@ function parseDevice(name: string, raw: unknown, warnings: string[]): DeviceSett
 		else warnings.push(`${p}.port must be a TCP port number`);
 	}
 	return d;
+}
+
+/**
+ * Reads `netbirdDevices` from the global settings file only (`~/.pi/agent/settings.json`). `pi.getSettings()`
+ * merges in the project's `.pi/settings.json`, which can come from an untrusted checkout, so it is not used.
+ */
+export function loadGlobalSettings(file: string): { settings: Settings; warnings: string[] } {
+	let raw: unknown;
+	try {
+		raw = (JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown> | null)?.netbirdDevices;
+	} catch (e) {
+		const code = (e as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return parseSettings(undefined);
+		const r = parseSettings(undefined);
+		r.warnings.push(`cannot read ${file}: ${(e as Error).message}; using defaults`);
+		return r;
+	}
+	return parseSettings(raw);
 }

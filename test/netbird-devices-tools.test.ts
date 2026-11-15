@@ -9,7 +9,7 @@ import { parseNetbirdSshConfig } from "../extensions/netbird-devices/discovery.t
 import { BASH_DEFAULT_TIMEOUT_S, type Conn, createBashOps, createEditOps, createReadOps, createWriteOps } from "../extensions/netbird-devices/remote-ops.ts";
 import { parseSettings } from "../extensions/netbird-devices/settings.ts";
 import { SshError } from "../extensions/netbird-devices/ssh.ts";
-import { deviceListHint, deviceRows, displayArgs, guardReason, imageMimeFromPath, isRemoteArg, osLabel, parseDeviceArg, remoteGate, STAGE_C_NOTE } from "../extensions/netbird-devices/tools.ts";
+import { deviceListHint, deviceRows, displayArgs, guardReason, imageMimeFromPath, isRemoteArg, osLabel, parseDeviceArg, earlyRefusal, remoteAction } from "../extensions/netbird-devices/tools.ts";
 import { fakeSsh } from "./netbird-devices-fake-ssh.ts";
 
 const CONF = `Match host "100.71.171.69,sergeys-macbook-pro.netbird.cloud,sergeys-macbook-pro"
@@ -47,45 +47,31 @@ test("isRemoteArg: only a non-empty name that is not this machine", () => {
 	for (const a of [undefined, null, "", " ", "local", "cloudcli", 5]) assert.equal(isRemoteArg(a, LOCAL), false, String(a));
 });
 
-// --- the stage-B gate ----------------------------------------------------------------------------
+// --- actions and early refusals -------------------------------------------------------------------
 
-const G = (over: Record<string, unknown>) => remoteGate({ tool: "bash", device: "mac", mode: "full", home: "/Users/sergey", globs: ["~/.ssh/**", "**/.env"], ...over } as any);
+const AI = (over: Record<string, unknown>) => ({ tool: "bash", home: "/Users/sergey", globs: ["~/.ssh/**", "**/.env"], ...over }) as any;
 
-test("remoteGate: read is free except protected paths", () => {
-	for (const mode of ["ro", "ask", "auto", "full"] as const) assert.deepEqual(G({ tool: "read", mode, path: "/Users/sergey/pi-nb-test/a.txt" }), { ok: true });
-	const g = G({ tool: "read", mode: "full", path: "/Users/sergey/.ssh/id_rsa" });
-	assert.equal(g.ok, false);
-	assert.match((g as any).message, /^mac: reading .*protected path \(~\/\.ssh\/\*\*\)/);
-	assert.match((g as any).message, new RegExp(STAGE_C_NOTE.replace(/[()]/g, "\\$&")));
-	assert.equal(G({ tool: "read", mode: "ask", path: "/Users/sergey/proj/.env" }).ok, false);
+test("remoteAction: read/write/bash actions with the protected glob they touch", () => {
+	assert.deepEqual(remoteAction(AI({ tool: "read", path: "/Users/sergey/a" })), { action: { kind: "read", path: "/Users/sergey/a" }, protectedHit: undefined });
+	assert.equal(remoteAction(AI({ tool: "read", path: "/Users/sergey/.ssh/id_rsa" })).protectedHit, "~/.ssh/**");
+	const w = remoteAction(AI({ tool: "edit", path: "/Users/sergey/p/.env", diff: "+x", isNew: false }));
+	assert.deepEqual(w.action, { kind: "write", path: "/Users/sergey/p/.env", diff: "+x", isNew: false });
+	assert.equal(w.protectedHit, "**/.env");
+	const b = remoteAction(AI({ command: "cat $HOME/.ssh/id_rsa" }));
+	assert.equal(b.protectedHit, "~/.ssh/**");
+	assert.deepEqual(remoteAction(AI({ command: "sudo systemctl restart nginx" })).action, { kind: "bash", command: "systemctl restart nginx", root: true });
 });
 
-test("remoteGate: write/edit/bash only in mode full", () => {
-	for (const tool of ["write", "edit", "bash"] as const) {
-		for (const mode of ["ro", "ask", "auto"] as const) {
-			const g = G({ tool, mode, path: "/Users/sergey/pi-nb-test/a", command: "ls" });
-			assert.equal(g.ok, false, `${tool} ${mode}`);
-			assert.match((g as any).message, /confirmations are not implemented yet \(stage C\)/);
-			assert.match((g as any).message, new RegExp(`mode "${mode}"`));
-		}
-		assert.deepEqual(G({ tool, mode: "full", path: "/Users/sergey/pi-nb-test/a", command: "ls" }), { ok: true }, tool);
+test("earlyRefusal: ro refuses write/edit/root; root is not available yet; the rest goes on to the dialogs", () => {
+	assert.match(earlyRefusal(AI({ tool: "write", path: "/Users/sergey/a" }), "ro", "mac")!, /^mac: write refused: device is read-only/);
+	assert.match(earlyRefusal(AI({ tool: "edit", path: "/Users/sergey/a" }), "ro", "mac")!, /edit refused/);
+	assert.match(earlyRefusal(AI({ command: "sudo ls" }), "ro", "mac")!, /root command refused: .*read-only/);
+	assert.match(earlyRefusal(AI({ command: "sudo ls" }), "ask", "mac")!, /sudo \(root\).*stage D/);
+	for (const mode of ["ro", "ask", "auto", "full"] as const) {
+		assert.equal(earlyRefusal(AI({ tool: "read", path: "/Users/sergey/.ssh/id_rsa" }), mode, "mac"), undefined);
+		assert.equal(earlyRefusal(AI({ command: "ls ~" }), mode, "mac"), undefined);
 	}
-	// even a read-only command needs full for now
-	assert.equal(G({ tool: "bash", mode: "ask", command: "ls ~" }).ok, false);
-});
-
-test("remoteGate: in full, protected paths, dangerous commands and root still need a dialog -> refused", () => {
-	assert.equal(G({ tool: "write", path: "/Users/sergey/.ssh/authorized_keys" }).ok, false);
-	assert.equal(G({ tool: "edit", path: "/Users/sergey/app/.env" }).ok, false);
-	assert.equal(G({ command: "cat ~/.ssh/id_rsa" }).ok, false);
-	assert.equal(G({ command: "cat $HOME/.ssh/id_rsa" }).ok, false);
-	const danger = G({ command: "rm -rf /" });
-	assert.equal(danger.ok, false);
-	assert.match((danger as any).message, /needs confirmation/);
-	const root = G({ command: "sudo systemctl restart nginx" });
-	assert.equal(root.ok, false);
-	assert.match((root as any).message, /sudo \(root\).*stage D/);
-	assert.deepEqual(G({ command: "echo hi > ~/pi-nb-test/x.txt" }), { ok: true });
+	assert.equal(earlyRefusal(AI({ tool: "write", path: "/Users/sergey/a" }), "ask", "mac"), undefined);
 });
 
 // --- rendering / files -----------------------------------------------------------------------------
