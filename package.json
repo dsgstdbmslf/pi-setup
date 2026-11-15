@@ -6,6 +6,7 @@
   "keywords": ["pi-package"],
   "pi": {
     "extensions": ["./extensions/*.ts"],
+    "skills": ["./skills"],
     "changelogPath": ""
   },
   "scripts": {
