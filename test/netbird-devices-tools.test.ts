@@ -62,11 +62,11 @@ test("remoteAction: read/write/bash actions with the protected glob they touch",
 	assert.deepEqual(remoteAction(AI({ command: "sudo systemctl restart nginx" })).action, { kind: "bash", command: "systemctl restart nginx", root: true });
 });
 
-test("earlyRefusal: ro refuses write/edit/root; root is not available yet; the rest goes on to the dialogs", () => {
+test("earlyRefusal: ro refuses write/edit/root; the rest goes on to the dialogs", () => {
 	assert.match(earlyRefusal(AI({ tool: "write", path: "/Users/sergey/a" }), "ro", "mac")!, /^mac: write refused: device is read-only/);
 	assert.match(earlyRefusal(AI({ tool: "edit", path: "/Users/sergey/a" }), "ro", "mac")!, /edit refused/);
 	assert.match(earlyRefusal(AI({ command: "sudo ls" }), "ro", "mac")!, /root command refused: .*read-only/);
-	assert.match(earlyRefusal(AI({ command: "sudo ls" }), "ask", "mac")!, /sudo \(root\).*stage D/);
+	assert.equal(earlyRefusal(AI({ command: "sudo ls" }), "ask", "mac"), undefined);
 	for (const mode of ["ro", "ask", "auto", "full"] as const) {
 		assert.equal(earlyRefusal(AI({ tool: "read", path: "/Users/sergey/.ssh/id_rsa" }), mode, "mac"), undefined);
 		assert.equal(earlyRefusal(AI({ command: "ls ~" }), mode, "mac"), undefined);

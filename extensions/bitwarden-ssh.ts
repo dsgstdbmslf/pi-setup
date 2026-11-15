@@ -840,10 +840,22 @@ export default function bitwardenSsh(pi: ExtensionAPI) {
 		}
 	});
 
+	// netbird-devices (loaded after us) blocks ssh/scp/curl to its devices in agent bash commands. It publishes a
+	// guard function; for such commands we do not open "Load SSH key?" since the command will not run.
+	function blockedElsewhere(command: string, device: unknown): boolean {
+		try {
+			const guard = (globalThis as any).__piNetbirdDevicesGuard;
+			return typeof guard === "function" && !!guard(command, device);
+		} catch {
+			return false;
+		}
+	}
+
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return;
 		const command = String((event.input as any)?.command ?? "");
 		if (!ctx.hasUI || !mentionsNetworkCommand(command)) return;
+		if (blockedElsewhere(command, (event.input as any)?.device)) return;
 		try {
 			await offerHostKeys(ctx, hostsInCommand(command, hostNames(parseConfig(readSource(P()) ?? ""))));
 		} catch {}

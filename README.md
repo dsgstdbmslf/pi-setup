@@ -72,6 +72,70 @@ Do not install both ways at once, or the extension loads twice.
   (used only without a UI) and `timeoutSeconds` (on timeout the run stops); the UI is English or Russian (system locale, or `PI_ASK_LANG=en|ru`).
   Logic lives in `extensions/ask-user-question/`; tests: `npm test`
 
+- `netbird-devices.ts` — your other computers on NetBird as tools for the agent. The
+  `devices` tool lists them (online, NetBird SSH, OS, login user, mode) and names the one
+  you are working at ("here"); `read`, `write`, `edit` and `bash` get an optional
+  `device` parameter (`mac`, `here`, …) and run there over OpenSSH through NetBird SSH,
+  with proper diffs and screenshots readable as images. Calls without `device` are
+  unchanged. Agent `bash` commands that use `ssh`, `scp`, `curl`… to a device are blocked
+  with a hint to use `device`; `bitwarden-ssh` then does not open "Load SSH key?" for them.
+  Devices come from `/etc/ssh/ssh_config.d/99-netbird.conf` plus open ports, optionally the
+  NetBird API (`"netbird": "nbp_…"` read-only token in `~/.pi/agent/api-keys.json`). The
+  login user is detected (settings, then names like `sergeys-macbook-pro` → `sergey`, then
+  the console user); if nothing fits, Pi asks once.
+
+  Modes per device: `ro` (read only), `ask` (default: dialogs with the diff or command),
+  `auto` (a classifier model decides; hard rules still ask), `full`. Dialogs: allow once /
+  always (this path or command) / switch the device to full / deny. Protected paths
+  (`~/.ssh`, `~/.aws`, `.env`, keychains, … plus yours) and dangerous commands always ask.
+  The classifier sees only your messages and the action, never tool output. Mode, approvals
+  and `/nb here` last for the session; the agent cannot change them. Settings are read from
+  the global `~/.pi/agent/settings.json` only (a project's `.pi/settings.json` is ignored):
+
+  ```json
+  "netbirdDevices": {
+    "defaultMode": "ask",
+    "classifierModel": "anthropic/claude-haiku-5-5",
+    "apiUrl": "https://api.netbird.io",
+    "localName": "",
+    "protected": [],
+    "devices": { "mac": { "peer": "sergeys-macbook-pro", "aliases": ["мак"], "mode": "auto", "rootPrompt": "auto", "user": "sergey" } }
+  }
+  ```
+
+  Commands: `/nb` (devices), `/nb mode [device] [ro|ask|auto|full]` (`alt+m` cycles the
+  current device), `/nb here [device|auto]`, `/nb classifier [provider/model|default]`,
+  `/nb log [device] [n]` (default 20), `/nb refresh`, `/nb user <device> <user|auto>`,
+  `/nb test-root <device>`, `/nb forget <device>` (host key, cached login, connection).
+
+  Root: a `bash` command starting with `sudo ` asks for the password every time (`sudo -k`,
+  nothing cached). `rootPrompt` per device: `auto` (system dialog on the device when it is
+  the one you are at, else a masked Pi dialog), `native` (dialog on the device; macOS asks
+  once to let it control System Events, "Automation"), `pi` (masked dialog, TUI only; the
+  password goes to the `sudo -S` stdin over ssh and nowhere else). If the native dialog is
+  unavailable, `auto` falls back to Pi. Cancelling returns "cancelled by the user" to the
+  agent. The command runs with empty stdin. The footer shows `🔑 пароль root` while waiting.
+  `sudo` elsewhere in a command fails (no tty). Residual risk: another process of the same
+  user on the device could race the temporary askpass helper.
+
+  Files: `~/.pi/agent/netbird-devices/` — `state.json` (users, probe cache, classifier
+  choice), `known_hosts` (own, `accept-new`; a changed key is an error until
+  `/nb forget`), `log.jsonl` (journal, rotated at ~2 MB: time, session, device, tool, short
+  path or command, decision, result; never file contents, output or passwords) and `cm/`
+  (ssh connection sharing).
+
+  Security model, honestly: the `ssh` block in `bash` guards against the model's habits, it
+  is not a sandbox (any process can open a socket). With NetBird SSH authentication off
+  (no `NetBird-JWT-Required` banner) the Mac accepts a login from **any process on this
+  VM** as any existing user, so the real boundary is NetBird: use an ACL that allows only
+  this VM to reach the Mac on port 22, and ideally a separate non-admin user for it. JWT
+  (SSO) mode is not supported (it needs `netbird ssh proxy` and the root-only daemon
+  socket); the error says so. Typed root passwords never reach the model or logs; mode
+  `full` and `auto` still let the agent act without asking. Linux-device dialogs
+  (zenity/kdialog) are best effort and not verified. Logic and tests:
+  `extensions/netbird-devices/`, `test/netbird-devices*.test.ts`; plan and status:
+  `docs/netbird-devices/`.
+
 - `tavily-keys.ts` — `/search-keys` command for the [Tavily](https://tavily.com) API
   keys used by the web extensions: `/search-keys` (status) checks each key and its
   remaining credits and clears marks of keys that have credits again, `reset` forgets

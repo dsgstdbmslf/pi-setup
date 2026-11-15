@@ -212,6 +212,25 @@ test("extension end to end with a fake pi and a fake bw", { skip: (!available &&
 		assert.ok(commands.get("ssh").getArgumentCompletions("config p").some((i: any) => i.value === "config pull"));
 		assert.ok(commands.get("ssh").getArgumentCompletions("test ").some((i: any) => i.value === "test web"));
 
+		// Coordination with netbird-devices: it publishes a guard; bitwarden-ssh asks it before "Load SSH key?" and
+		// skips commands that are blocked anyway. (ssh -G reads the passwd home, not $HOME, so the host's key is
+		// not resolvable in this sandbox: we check the guard is consulted and that nothing is shown.)
+		const asked: Array<[string, unknown]> = [];
+		(globalThis as any).__piNetbirdDevicesGuard = (c: string, device?: unknown) => {
+			asked.push([c, device]);
+			return c.includes("web") && !device ? "blocked" : undefined;
+		};
+		try {
+			const before = confirms.length;
+			assert.equal(await fire("tool_call", { toolName: "bash", input: { command: "ssh web true" } }), undefined);
+			await fire("tool_call", { toolName: "bash", input: { command: "ssh web true", device: "mac" } });
+			await fire("tool_call", { toolName: "bash", input: { command: "ls" } });
+			assert.deepEqual(asked, [["ssh web true", undefined], ["ssh web true", "mac"]]); // "ls" is no network command: guard not consulted
+			assert.equal(confirms.length, before);
+		} finally {
+			delete (globalThis as any).__piNetbirdDevicesGuard;
+		}
+
 		// Lock: forgets the session and empties the agent.
 		assert.match(await cmd("bw", "lock"), /locked; ssh-agent keys removed/);
 		r = await tool("ssh_keys", { action: "list" });

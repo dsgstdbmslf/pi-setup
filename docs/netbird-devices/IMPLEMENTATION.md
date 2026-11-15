@@ -228,6 +228,29 @@
 
 Готово: всё из §16 пройдено (кроме Linux), тесты зелёные, коммит.
 
+### Этап D — выполнено: интерфейсы, проверка, ограничения
+
+Файлы: новый `extensions/netbird-devices/root.ts`, правки `extensions/netbird-devices.ts`, `tools.ts` (убран временный отказ root в `earlyRefusal`),
+`extensions/bitwarden-ssh.ts` (только `blockedElsewhere` + одна проверка в `tool_call`), `README.md`; тесты `test/netbird-devices-root.test.ts`, дополнение `test/bitwarden-ssh-load.test.ts`.
+
+- **`root.ts`** (без Pi): `chooseRootPath(pref, userIsAtDevice)`, `runRoot(conn, {command, pref, userIsAtDevice, from, askPassword, onWaiting, signal, timeoutMs, onData, run?})` →
+  `{exitCode, path: "native"|"pi"|"native→pi"}`; `RootCancelled` (197 → «cancelled by the user on <device>»; пустой пароль/отмена в Pi). 196 → окно Pi (при `rootPrompt: "native"` — ошибка).
+  Пароль только в `stdin` ssh для `rootStdinWrapper` (`Buffer`, обнуляется `fill(0)` после вызова; строка в замыкании обнуляется), не логируется и не возвращается; без TUI `askPassword` бросает `SECRET_INPUT_NEEDS_TUI`.
+  `testRoot` — `sudo -k -A true` тем же путём. Нативный вызов живёт ≥150 с (окно ждёт 120 с).
+- **Entry**: `bash` с `sudo <cmd>` (`splitSudo`) → `decide` (root) → `createRootOps` (подменяет операции bash), `userIsAt` (`resolveHere` без вопросов: «активно» = устройство найдено как here) выбирает native/pi при `auto`.
+  Футер `🔑 пароль root` на время вызова. `/nb test-root <device>`, `/nb log [device] [n]` (по умолчанию 20).
+- **Журнал**: `journaled(...)` оборачивает каждый удалённый read/write/edit/bash/sudo: устройство (короткое имя), пользователь, инструмент, путь/команда ≤200, решение (`auto`/`approved`/`asked→allowed`/`asked→denied`/`classifier:*`/`denied`),
+  результат (`✓/✗`, `exit N`, `+a −b`, размер записи), длительность. Содержимое, вывод и пароли не пишутся; для ошибок вывода команды не сохраняется (только код выхода). Ошибка записи журнала — один `notify`, дальше тихо.
+- **Координация с bitwarden-ssh**: entry публикует `globalThis.__piNetbirdDevicesGuard(command, device?) → string|undefined` (та же проверка, что и блок в `tool_call`; снимается на `session_shutdown`);
+  `bitwarden-ssh` перед «Load SSH key?» вызывает её и пропускает команду, которую netbird-devices заблокирует. Тест в `bitwarden-ssh-load.test.ts` (проверяет, что функция опрашивается и окна нет;
+  `ssh -G` читает passwd-home, поэтому положительный контроль «окно открывается» в песочнице невозможен).
+- **Окружение**: для e2e-тестов bitwarden-ssh в `node_modules` (в `.gitignore`) добавлен симлинк `typebox` (без него 7 тестов были `skip`); с ним `npm test` выполняет все тесты.
+- **Проверка §16 на Mac (sergeys-macbook-pro, `pi -ne -e bitwarden-ssh.ts -e netbird-devices.ts` в tmux)**: `/nb` и `devices list` — mac online, iphone/ipad/nl offline; `here` → mac;
+  `bash device:"here"` `ls` — работает; `read` `device:"here"` `~/pi-nb-test/red.png` — картинка прочитана («red»); `edit` в `ask` — диалог с диффом, «Разрешить один раз» → записано;
+  `/nb test-root mac` — нативное окно macOS, пароль введён → «root works on mac (password dialog: native)»; `bash` `sudo true` (device mac) — окно, exit 0 за 11 с; `bash` `ssh sergeys-macbook-pro true` без device — блок с подсказкой.
+  `/nb log` показал все действия; в `log.jsonl` нет паролей. Ветка отмены (197) и путь Pi проверены только юнит-тестами.
+- **Известное**: путь Pi (`rootPrompt: "pi"`) на устройстве не проверялся вживую; «Load SSH key?» от bitwarden-ssh вживую не проверялся (хранилище было залочено, ключей нет) — только тестом; Linux-окна не проверялись.
+
 ## Тест-план (сводно)
 
 Unit (`node --test`): все pure-модули, включая регресс-кейсы из таблицы правок. Ручной (§16 PLAN) — на Mac, папка

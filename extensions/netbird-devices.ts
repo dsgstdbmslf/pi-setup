@@ -21,18 +21,21 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { askSecret, SECRET_INPUT_NEEDS_TUI, secretInputAvailable } from "./bitwarden-ssh/secret-input.ts";
 import { loadKeys } from "./tavily/keys.ts";
 import { deviceNames, type Device, findDevice } from "./netbird-devices/devices.ts";
 import { assistantText, buildClassifierPrompt, CLASSIFIER_SYSTEM, parseClassifierAnswer, userMessagesFromBranch } from "./netbird-devices/classifier.ts";
 import { deviceTargetInCommand, mentionsNetVerb } from "./netbird-devices/guard.ts";
 import { Hub } from "./netbird-devices/hub.ts";
-import { resolvePaths } from "./netbird-devices/paths.ts";
-import { type Action, type Decision, resolveRemotePath } from "./netbird-devices/policy.ts";
-import { type BeforeWrite, createBashOps, createEditOps, createReadOps, createWriteOps, type Conn } from "./netbird-devices/remote-ops.ts";
+import { appendJournal, formatLog, readJournal } from "./netbird-devices/journal.ts";
+import { type Paths, resolvePaths } from "./netbird-devices/paths.ts";
+import { type Action, type Decision, resolveRemotePath, splitSudo } from "./netbird-devices/policy.ts";
+import { RootCancelled, runRoot, testRoot } from "./netbird-devices/root.ts";
+import { type BashOps, type BeforeWrite, BASH_DEFAULT_TIMEOUT_S, createBashOps, createEditOps, createReadOps, createWriteOps, type Conn } from "./netbird-devices/remote-ops.ts";
 import { type ClassifierResult, isMode, MODE_ENTRY, nextMode, SessionPolicy } from "./netbird-devices/session-policy.ts";
 import { loadGlobalSettings, MODES, type Mode, type Settings, parseSettings } from "./netbird-devices/settings.ts";
 import { type ActionInput, DEVICE_PARAM_DESCRIPTION, deviceListHint, deviceRows, displayArgs, earlyRefusal, guardReason, isRemoteArg, osLabel, parseDeviceArg, remoteAction } from "./netbird-devices/tools.ts";
-import { type ConfirmChoice, confirmBody, confirmOptions, confirmTitle, footerText, formatDeviceTable, type HereInfo, lineDiff } from "./netbird-devices/ui-text.ts";
+import { type ConfirmChoice, formatBytes, confirmBody, confirmOptions, confirmTitle, footerText, formatDeviceTable, type HereInfo, lineDiff } from "./netbird-devices/ui-text.ts";
 
 const STATUS_KEY = "netbird-devices";
 /** The footer returns to this machine this long after the agent settles. */
@@ -85,6 +88,8 @@ type ToolName = "read" | "write" | "edit" | "bash";
 export default function netbirdDevices(pi: ExtensionAPI) {
 	let settings: Settings = parseSettings(undefined).settings;
 	let hub: Hub | undefined;
+	let paths: Paths | undefined;
+	let journalWarned = false;
 	let ctxRef: ExtensionContext | undefined;
 	/** Pinned with `/nb here <device>` until the session ends (device name). */
 	let pinnedHere: string | undefined;
@@ -98,8 +103,9 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 
 	const H = (): Hub => {
 		if (!hub) {
+			paths = resolvePaths({ agentDir: getAgentDir(), uid: process.getuid?.() ?? 0 });
 			hub = new Hub({
-				paths: resolvePaths({ agentDir: getAgentDir(), uid: process.getuid?.() ?? 0 }),
+				paths,
 				settings: () => settings,
 				vmUser: safeUser(),
 				apiToken: async () => (await loadKeys(join(getAgentDir(), "api-keys.json"), "netbird")).entries[0]?.key,
@@ -154,7 +160,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 		} catch {}
 	}
 
-	function showRemote(d: Device, ctx = ctxRef, waiting?: "confirm"): void {
+	function showRemote(d: Device, ctx = ctxRef, waiting?: "confirm" | "root"): void {
 		if (footerTimer) clearTimeout(footerTimer);
 		footerTimer = undefined;
 		if (!ctx?.hasUI) return;
@@ -273,7 +279,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 	}
 
 	/** Policy for one action on a device: allowed, or throws the refusal for the agent. Classifier usage goes to `acc`. */
-	async function authorize(ctx: ExtensionContext, t: Remote, input: Omit<ActionInput, "home" | "globs">, signal: AbortSignal | undefined, acc: ClassifierResult[], cacheSalt?: string): Promise<void> {
+	async function authorize(ctx: ExtensionContext, t: Remote, input: Omit<ActionInput, "home" | "globs">, signal: AbortSignal | undefined, acc: ClassifierResult[], cacheSalt?: string, j?: Journaled): Promise<void> {
 		const h = H();
 		const { action, protectedHit } = remoteAction({ ...input, home: t.conn.home, globs: h.protectedGlobs(t.device) });
 		const out = await policy.authorize({
@@ -288,24 +294,77 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 			onModeChange: (m) => persistMode(t.device, m, ctx),
 		});
 		if (out.classifier) acc.push(out.classifier);
+		if (j) j.how = decisionOf(out.how);
 		if (!out.ok) throw new Error(out.message);
 	}
 
 	/** Refusals that need no dialog (ro device, root not available yet); throws. */
-	function early(t: Remote, input: Omit<ActionInput, "home" | "globs">): void {
+	function early(t: Remote, input: Omit<ActionInput, "home" | "globs">, j?: Journaled): void {
 		const h = H();
 		const why = earlyRefusal({ ...input, home: t.conn.home, globs: h.protectedGlobs(t.device) }, modeOf(t.device), label(t.device));
-		if (why) throw new Error(why);
+		if (why) {
+			if (j) j.how = "denied";
+			throw new Error(why);
+		}
 	}
 
 	/** Hook of the write operations: the exact new content (and the old one) is confirmed before anything is written. */
-	function beforeWrite(ctx: ExtensionContext, t: Remote, tool: "write" | "edit", signal: AbortSignal | undefined, acc: ClassifierResult[]): BeforeWrite {
+	function beforeWrite(ctx: ExtensionContext, t: Remote, tool: "write" | "edit", signal: AbortSignal | undefined, acc: ClassifierResult[], j?: Journaled): BeforeWrite {
 		return async ({ path, content, old, isNew }) => {
 			const diff = isNew ? lineDiff("", content) : old === undefined ? `(current content unreadable)\n${lineDiff("", content)}` : lineDiff(old, content);
 			const salt = createHash("sha256").update(content).digest("hex");
-			await authorize(ctx, t, { tool, path, diff, isNew }, signal, acc, salt);
+			await authorize(ctx, t, { tool, path, diff, isNew }, signal, acc, salt, j);
 		};
 	}
+
+	// --- journal ----------------------------------------------------------------------------------
+
+	type Journaled = { how: string };
+	/** Journal decision label of an authorize outcome. */
+	const decisionOf = (how: string): string => (how === "asked" ? "asked→allowed" : how === "denied" ? "asked→denied" : how === "policy" || how === "no-ui" ? "denied" : how);
+
+	/** One journal line (never content, output or passwords); a failing journal is reported once and ignored. */
+	function journal(ctx: ExtensionContext, t: Remote, tool: string, summary: string, how: string, ok: boolean, detail: string | undefined, started: number): void {
+		try {
+			if (!paths) return;
+			appendJournal(paths.journalFile, { ts: Date.now(), session: ctx.sessionManager.getSessionId(), device: label(t.device), user: t.conn.user, tool, summary, decision: how, ok, detail, ms: Date.now() - started });
+		} catch (err) {
+			if (journalWarned) return;
+			journalWarned = true;
+			try {
+				ctx.ui.notify(`netbird-devices: cannot write the journal (${msg(err)}); further journal errors are not shown`, "warning");
+			} catch {}
+		}
+	}
+
+	/** Runs one remote action and journals it: tool, short summary, decision, result, duration. */
+	async function journaled<T>(ctx: ExtensionContext, t: Remote, tool: string, summary: string, fn: (j: Journaled) => Promise<T>, detailOf?: (r: T) => string | undefined): Promise<T> {
+		const started = Date.now();
+		const j: Journaled = { how: "auto" };
+		try {
+			const r = await fn(j);
+			journal(ctx, t, tool, summary, j.how, true, detailOf?.(r), started);
+			return r;
+		} catch (err) {
+			const exit = /exited with code (\d+)/.exec(msg(err))?.[1];
+			const refused = j.how === "denied" || j.how === "asked→denied" || j.how === "classifier:deny";
+			const cancelled = err instanceof RootCancelled;
+			journal(ctx, t, tool, summary, cancelled ? "asked→denied" : j.how, false, exit ? `exit ${exit}` : refused || cancelled ? undefined : "error", started);
+			throw err;
+		}
+	}
+
+	const diffStat = (r: any): string | undefined => {
+		const diff = r?.details?.diff;
+		if (typeof diff !== "string") return undefined;
+		let plus = 0;
+		let minus = 0;
+		for (const l of diff.split("\n")) {
+			if (/^\+\s*\d*\s/.test(l)) plus++;
+			else if (/^-\s*\d*\s/.test(l)) minus++;
+		}
+		return `+${plus} −${minus}`;
+	};
 
 	/** Adds the classifier usage of this call to the result details. */
 	const withUsage = (result: any, acc: ClassifierResult[]): any => {
@@ -340,49 +399,139 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 		} as any);
 	}
 
+	// --- root -------------------------------------------------------------------------------------
+
+	/** The root dialog on the device or in pi (PLAN §8). The password never reaches the model, the journal or a log. */
+	function rootRun(ctx: ExtensionContext, t: Remote, command: string, signal?: AbortSignal) {
+		const name = label(t.device);
+		return {
+			pref: t.device.settings.rootPrompt,
+			from: H().localLabel(),
+			askPassword: async (): Promise<string | undefined> => {
+				if (!secretInputAvailable(ctx)) throw new Error(`root on ${name}: ${SECRET_INPUT_NEEDS_TUI}`);
+				return dialog(
+					(sig) =>
+						askSecret(ctx, {
+							title: `Root password for ${name}`,
+							message: `Pi agent asks to run as root on ${name}:\n${command.length > 300 ? `${command.slice(0, 300)}…` : command}`,
+							warning: "Enter your password only if you expect this.",
+							signal: sig,
+						}),
+					signal,
+				);
+			},
+			signal,
+		};
+	}
+
+	/** Is the user at this device right now (decides native dialog vs pi dialog for rootPrompt "auto")? */
+	async function userIsAt(t: Remote): Promise<boolean> {
+		try {
+			const r = await H().resolveHere(pinnedHere);
+			return r.kind === "found" && r.device === t.device.name;
+		} catch {
+			return false;
+		}
+	}
+
+	/** bash operations that run `sudo <inner>`: password through the dialog, sudo -k (asks every time). */
+	function createRootOps(ctx: ExtensionContext, t: Remote, inner: string, j: Journaled): BashOps {
+		return {
+			async exec(_command, _cwd, { onData, signal, timeout }) {
+				const limitS = timeout && timeout > 0 ? timeout : BASH_DEFAULT_TIMEOUT_S;
+				const atDevice = await userIsAt(t);
+				showRemote(t.device, ctx, "root");
+				try {
+					const r = await runRoot({ ...t.conn, device: label(t.device) }, {
+						...rootRun(ctx, t, inner, signal),
+						command: inner,
+						userIsAtDevice: atDevice,
+						onWaiting: (w) => showRemote(t.device, ctx, w ? "root" : undefined),
+						timeoutMs: limitS * 1000,
+						onData: (chunk) => onData(chunk),
+					});
+					return { exitCode: r.exitCode };
+				} finally {
+					if (!session.signal.aborted) showRemote(t.device, ctx);
+				}
+			},
+		};
+	}
+
 	const cwd0 = process.cwd();
 
 	{
 		const local = createReadToolDefinition(cwd0) as any;
 		override("read", local, async (t, params, signal, onUpdate, ctx) => {
 			const abs = resolveRemotePath(String(params.path ?? ""), t.conn.home);
-			const acc: ClassifierResult[] = [];
-			await authorize(ctx, t, { tool: "read", path: abs }, signal, acc);
-			const check = (p: string) => authorize(ctx, t, { tool: "read", path: p }, signal, acc);
-			const def = createReadToolDefinition(ctx.cwd, { operations: createReadOps(t.conn, check) } as any) as any;
-			return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
+			return journaled(ctx, t, "read", abs, async (j) => {
+				const acc: ClassifierResult[] = [];
+				await authorize(ctx, t, { tool: "read", path: abs }, signal, acc, undefined, j);
+				const check = (p: string) => authorize(ctx, t, { tool: "read", path: p }, signal, acc, undefined, j);
+				const def = createReadToolDefinition(ctx.cwd, { operations: createReadOps(t.conn, check) } as any) as any;
+				return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
+			});
 		});
 	}
 	{
 		const local = createWriteToolDefinition(cwd0) as any;
 		override("write", local, async (t, params, signal, onUpdate, ctx) => {
 			const abs = resolveRemotePath(String(params.path ?? ""), t.conn.home);
-			early(t, { tool: "write", path: abs });
-			const acc: ClassifierResult[] = [];
-			const def = createWriteToolDefinition(ctx.cwd, { operations: createWriteOps(t.conn, beforeWrite(ctx, t, "write", signal, acc)) } as any) as any;
-			return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
+			return journaled(
+				ctx,
+				t,
+				"write",
+				abs,
+				async (j) => {
+					early(t, { tool: "write", path: abs }, j);
+					const acc: ClassifierResult[] = [];
+					const def = createWriteToolDefinition(ctx.cwd, { operations: createWriteOps(t.conn, beforeWrite(ctx, t, "write", signal, acc, j)) } as any) as any;
+					return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
+				},
+				() => (typeof params.content === "string" ? formatBytes(Buffer.byteLength(params.content)) : undefined),
+			);
 		});
 	}
 	{
 		const local = createEditToolDefinition(cwd0) as any;
 		override("edit", local, async (t, params, signal, onUpdate, ctx) => {
 			const abs = resolveRemotePath(String(params.path ?? ""), t.conn.home);
-			early(t, { tool: "edit", path: abs });
-			const acc: ClassifierResult[] = [];
-			const def = createEditToolDefinition(ctx.cwd, { operations: createEditOps(t.conn, beforeWrite(ctx, t, "edit", signal, acc)) } as any) as any;
-			return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
+			return journaled(
+				ctx,
+				t,
+				"edit",
+				abs,
+				async (j) => {
+					early(t, { tool: "edit", path: abs }, j);
+					const acc: ClassifierResult[] = [];
+					const def = createEditToolDefinition(ctx.cwd, { operations: createEditOps(t.conn, beforeWrite(ctx, t, "edit", signal, acc, j)) } as any) as any;
+					return withUsage(await def.execute("", { ...params, path: abs }, signal, onUpdate, ctx), acc);
+				},
+				diffStat,
+			);
 		});
 	}
 	{
 		const local = createBashToolDefinition(cwd0) as any;
 		override("bash", local, async (t, params, signal, onUpdate, ctx) => {
 			const command = String(params.command ?? "");
-			early(t, { tool: "bash", command });
-			const acc: ClassifierResult[] = [];
-			await authorize(ctx, t, { tool: "bash", command }, signal, acc);
-			// Do not leak the local session environment (PI_SESSION_FILE...) into the device command.
-			const def = createBashToolDefinition(ctx.cwd, { operations: createBashOps(t.conn), exposeSessionEnvironment: false } as any) as any;
-			return withUsage(await def.execute("", params, signal, onUpdate, ctx), acc);
+			const inner = splitSudo(command);
+			return journaled(
+				ctx,
+				t,
+				inner !== undefined ? "sudo" : "bash",
+				inner ?? command,
+				async (j) => {
+					early(t, { tool: "bash", command }, j);
+					const acc: ClassifierResult[] = [];
+					await authorize(ctx, t, { tool: "bash", command }, signal, acc, undefined, j);
+					const operations = inner !== undefined ? createRootOps(ctx, t, inner, j) : createBashOps(t.conn);
+					// Do not leak the local session environment (PI_SESSION_FILE...) into the device command.
+					const def = createBashToolDefinition(ctx.cwd, { operations, exposeSessionEnvironment: false } as any) as any;
+					return withUsage(await def.execute("", params, signal, onUpdate, ctx), acc);
+				},
+				() => "exit 0",
+			);
 		});
 	}
 
@@ -455,15 +604,27 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 
 	// --- ssh guard --------------------------------------------------------------------------------
 
-	pi.on("tool_call", async (event) => {
-		if (event.toolName !== "bash" || !hub) return;
-		const input = event.input as { command?: unknown; device?: unknown };
-		if (isRemote(input?.device)) return; // runs on the device; what it does there is its own business
-		const command = String(input?.command ?? "");
-		if (!mentionsNetVerb(command)) return;
+	/** Why a bash call is blocked (ssh/scp/curl… to a device without `device`), else undefined. */
+	function guardCheck(command: unknown, device?: unknown): string | undefined {
+		if (!hub) return undefined;
+		if (isRemote(device)) return undefined; // runs on the device; what it does there is its own business
+		const cmd = String(command ?? "");
+		if (!mentionsNetVerb(cmd)) return undefined;
 		const devices = hub.devices();
-		const hit = deviceTargetInCommand(command, { names: deviceNames(devices), domains: hub.domains(), self: hub.localNames() });
-		if (hit) return { block: true, reason: guardReason(hit, devices) };
+		const hit = deviceTargetInCommand(cmd, { names: deviceNames(devices), domains: hub.domains(), self: hub.localNames() });
+		return hit ? guardReason(hit, devices) : undefined;
+	}
+
+	// bitwarden-ssh loads first (alphabetical) and would open "Load SSH key?" for such a command before our
+	// block runs; it asks this function and skips commands that are blocked anyway.
+	const GUARD_KEY = "__piNetbirdDevicesGuard";
+	(globalThis as any)[GUARD_KEY] = guardCheck;
+
+	pi.on("tool_call", async (event) => {
+		if (event.toolName !== "bash") return;
+		const input = event.input as { command?: unknown; device?: unknown };
+		const reason = guardCheck(input?.command, input?.device);
+		if (reason) return { block: true, reason };
 	});
 
 	// --- lifecycle --------------------------------------------------------------------------------
@@ -510,6 +671,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (event) => {
 		session.abort();
+		if ((globalThis as any)[GUARD_KEY] === guardCheck) delete (globalThis as any)[GUARD_KEY];
 		if (footerTimer) clearTimeout(footerTimer);
 		footerTimer = undefined;
 		ctxRef = undefined;
@@ -518,8 +680,8 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 
 	// --- /nb --------------------------------------------------------------------------------------
 
-	const SUBS = ["list", "mode", "here", "classifier", "refresh", "user", "forget"];
-	const USAGE = "Usage: /nb [list] | mode [device] [ro|ask|auto|full] | here [device|auto] | classifier [provider/model|default] | refresh | user <device> <user|auto> | forget <device>";
+	const SUBS = ["list", "mode", "here", "classifier", "log", "refresh", "user", "test-root", "forget"];
+	const USAGE = "Usage: /nb [list] | mode [device] [ro|ask|auto|full] | here [device|auto] | classifier [provider/model|default] | log [device] [n] | refresh | user <device> <user|auto> | test-root <device> | forget <device>";
 
 	/** The device mode changes act on: the one the agent worked on last, else the one "here" stands for. */
 	async function currentDevice(ctx: ExtensionContext): Promise<Device> {
@@ -624,6 +786,32 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 				return modeCommand(a1, a2, ctx);
 			case "classifier":
 				return classifierCommand(a1, ctx);
+			case "log": {
+				await h.refresh();
+				const numeric = a1 !== undefined && /^\d+$/.test(a1);
+				const n = Number(numeric ? a1 : a2) || 20;
+				const dev = numeric || !a1 ? undefined : (findDevice(h.devices(), a1) ? label(findDevice(h.devices(), a1)!) : a1);
+				const entries = readJournal(paths!.journalFile, 5000);
+				return formatLog(entries, { device: dev, n });
+			}
+			case "test-root": {
+				if (!a1) return "Usage: /nb test-root <device>";
+				const d = findOrThrow(a1);
+				if (!d.sshEnabled) return `${label(d)}: NetBird SSH is not enabled on this device`;
+				const conn = await h.connect(d, { ask: askUser(ctx) });
+				const t: Remote = { kind: "remote", device: d, conn };
+				const name = label(d);
+				showRemote(d, ctx, "root");
+				try {
+					return await testRoot({ ...conn, device: name }, { ...rootRun(ctx, t, "true"), pref: d.settings.rootPrompt, userIsAtDevice: await userIsAt(t), onWaiting: (w) => showRemote(d, ctx, w ? "root" : undefined) });
+				} catch (e) {
+					return e instanceof RootCancelled ? `${name}: ${e.message}` : `${name}: ${msg(e)}`;
+				} finally {
+					showRemote(d, ctx);
+					footerTimer = setTimeout(() => showLocal(ctx), FOOTER_RESET_MS);
+					footerTimer.unref?.();
+				}
+			}
 			case "here": {
 				if (!a1) return `${await hereText(ctx)}${pinnedHere ? " (pinned)" : ""}`;
 				if (a1 === "auto") {
@@ -662,7 +850,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("nb", {
-		description: "NetBird devices: list (default), mode [device] [ro|ask|auto|full], classifier [provider/model], here [device|auto], refresh, user <device> <user|auto>, forget <device>",
+		description: "NetBird devices: list (default), mode [device] [ro|ask|auto|full], classifier [provider/model], here [device|auto], log [device] [n], refresh, user <device> <user|auto>, test-root <device>, forget <device>",
 		getArgumentCompletions: (prefix: string) => {
 			const parts = prefix.split(/\s+/);
 			if (parts.length <= 1) {
@@ -670,7 +858,7 @@ export default function netbirdDevices(pi: ExtensionAPI) {
 				return items.length ? items : null;
 			}
 			const sub = parts[0];
-			if (parts.length === 2 && ["here", "user", "forget", "mode"].includes(sub)) {
+			if (parts.length === 2 && ["here", "user", "forget", "mode", "log", "test-root"].includes(sub)) {
 				const names = hub ? hub.devices().map((d) => label(d)) : [];
 				if (sub === "here") names.push("auto");
 				if (sub === "mode") names.push(...MODES);

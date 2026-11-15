@@ -1,6 +1,6 @@
 # netbird-devices — план расширения Pi
 
-Статус: черновик реализации, ничего не подключено и не закоммичено.
+Статус: этапы A–D реализованы и закоммичены в ветке `extensions/netbird-devices` (без пуша); §16 проверен на Mac (Linux — нет).
 Рабочая копия: `/home/orca/orca/workspaces/pi-setup/Netbird-devices` (репозиторий `pi-setup`,
 пакет Pi `git:github.com/dsgstdbmslf/pi-setup`, загружается `extensions/*.ts`).
 
@@ -111,12 +111,13 @@ extensions/netbird-devices/
   presence.ts     ✅ «где пользователь»: resolveHere(), IDLE_PROBE (pure)
   classifier.ts   ✅ промпт и разбор ответа классификатора (pure)
   remote.ts       ✅ скрипты: probe, bash-обёртка, askpass macOS/Linux, root-обёртки, варианты путей (pure)
-  ssh.ts          ⏳ запуск ssh с ControlMaster, exec/stream/stdin, операции read/write/edit/bash
-  state.ts        ⏳ ~/.pi/agent/netbird-devices/state.json (пользователи, probe-кэш, модель классификатора)
-  journal.ts      ⏳ журнал JSONL, ротация, форматирование
-  ui-text.ts      ⏳ футер, таблица устройств, текст диалогов (pure)
-test/netbird-devices*.test.ts           ⏳
-README.md (раздел расширения)          ⏳
+  ssh.ts          ✅ запуск ssh с ControlMaster, exec/stream/stdin, операции read/write/edit/bash
+  state.ts        ✅ ~/.pi/agent/netbird-devices/state.json (пользователи, probe-кэш, модель классификатора)
+  journal.ts      ✅ журнал JSONL, ротация, форматирование
+  ui-text.ts      ✅ футер, таблица устройств, текст диалогов (pure)
+  root.ts         ✅ root: native/pi окно пароля, `/nb test-root` (этап D)
+test/netbird-devices*.test.ts           ✅
+README.md (раздел расширения)          ✅
 ```
 
 ### Транспорт
@@ -266,14 +267,14 @@ ncat socat curl wget git netbird autossh ssh-copy-id`) и цель — имя/FQ
 
 ## 15. Этапы
 
-1. ✅ Pure-модули (settings, discovery, policy, guard, presence, classifier, remote).
-2. ssh.ts + state.ts + список устройств + «where» + футер + блок ssh в bash + инструмент `devices`.
-3. Удалённые `read/write/edit/bash` с `device`, рендер, подбор путей скриншотов.
-4. Режимы, диалоги, одобрения в сессии, `/nb mode`, `alt+m`, защищённые пути.
-5. Классификатор + `/nb classifier`.
-6. Root: нативные окна + окно Pi + `/nb test-root`.
-7. Журнал + `/nb log`.
-8. Тесты (`test/netbird-devices.test.ts`), README, проверка `pi -e ./extensions/netbird-devices.ts`.
+1. ✅ ✅ Pure-модули (settings, discovery, policy, guard, presence, classifier, remote).
+2. ✅ ssh.ts + state.ts + список устройств + «where» + футер + блок ssh в bash + инструмент `devices`.
+3. ✅ Удалённые `read/write/edit/bash` с `device`, рендер, подбор путей скриншотов.
+4. ✅ Режимы, диалоги, одобрения в сессии, `/nb mode`, `alt+m`, защищённые пути.
+5. ✅ Классификатор + `/nb classifier`.
+6. ✅ Root: нативные окна + окно Pi + `/nb test-root`.
+7. ✅ Журнал + `/nb log`.
+8. ✅ Тесты (`test/netbird-devices.test.ts`), README, проверка `pi -e ./extensions/netbird-devices.ts`.
 
 ## 16. Проверка на устройствах (только с согласия пользователя)
 

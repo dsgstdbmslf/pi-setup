@@ -84,14 +84,13 @@ export function remoteAction(i: ActionInput): { action: Action; protectedHit?: s
 	return { action: { kind: "write", path, diff: i.diff ?? "", isNew: i.isNew ?? false }, protectedHit };
 }
 
-/** Why a call is refused before anything is asked or touched (ro device, root not available yet), else undefined. */
+/** Why a call is refused before anything is asked or touched (ro device), else undefined. */
 export function earlyRefusal(i: ActionInput, mode: Mode, device: string): string | undefined {
 	const { action, protectedHit } = remoteAction(i);
 	if (action.kind === "read") return undefined;
 	if (action.kind === "bash" && !action.root) return undefined;
 	const d = decide({ mode, action, protectedHit });
 	if (d.verdict === "deny") return `${device}: ${i.tool === "bash" ? "root command" : i.tool} refused: ${d.reason}.`;
-	if (action.kind === "bash" && action.root) return `${device}: commands starting with sudo (root) are not implemented yet (stage D); run the command without sudo if it does not need root.`;
 	return undefined;
 }
 
